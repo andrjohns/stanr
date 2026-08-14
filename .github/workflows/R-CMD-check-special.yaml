@@ -20,7 +20,7 @@ jobs:
           - { name: "clang-ubsan" }
           - { name: "gcc-asan" }
           - { name: "valgrind" }
-          - { name: "rehl9" }
+          - { name: "rhel9" }
 
     env:
       MAKEFLAGS: -j2
