@@ -1,6 +1,6 @@
 on:
   push:
-    branches: [main, tbb-vendor]
+    branches: alt-spec
   pull_request:
     branches: main
 
@@ -20,7 +20,8 @@ jobs:
           - { name: "clang-ubsan" }
           - { name: "gcc-asan" }
           - { name: "valgrind" }
-          - { name: "rchk" }
+          - { name: "centos7" }
+          - { name: "s390x" }
 
     env:
       MAKEFLAGS: -j2
