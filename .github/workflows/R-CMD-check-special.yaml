@@ -20,13 +20,17 @@ jobs:
           - { name: "clang-ubsan" }
           - { name: "gcc-asan" }
           - { name: "valgrind" }
-          - { name: "centos7" }
-          - { name: "s390x" }
+          - { name: "rehl9" }
 
     env:
       MAKEFLAGS: -j2
       TESTTHAT_CPUS: 4
     steps:
+      - uses: r-hub/actions/register-redhat@main
+        if: matrix.config.name == 'rhel9'
+        env:
+          REDHAT_ORG: ${{ secrets.REDHAT_ORG }}
+          REDHAT_KEY: ${{ secrets.REDHAT_KEY }}
       - uses: r-hub/actions/checkout@main
         with:
           submodules: true
