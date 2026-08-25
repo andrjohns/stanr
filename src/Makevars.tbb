@@ -20,23 +20,25 @@ ifeq ($(TBB_WASM),1)
   TBB_SONAME_TBBMALLOC =
   TBB_RPATH_FLAG =
 else ifeq ($(UNAME_S),Darwin)
-  TBB_LIB_NAMES = libtbb.dylib libtbbmalloc.dylib
+  TBB_LIB_NAMES = libstanr_tbb.dylib libstanr_tbbmalloc.dylib
   TBB_PIC_FLAG = -fPIC
   TBB_PLATFORM_CXXFLAGS = -D_XOPEN_SOURCE -D__TBB_RESUMABLE_TASKS_USE_THREADS=1 -O2
   TBB_PLATFORM_LDFLAGS = -pthread
-  TBB_SONAME_TBB = -Wl,-install_name,@rpath/libtbb.dylib
-  TBB_SONAME_TBBMALLOC = -Wl,-install_name,@rpath/libtbbmalloc.dylib
-  TBB_RPATH_FLAG = -Wl,-rpath,@loader_path/../lib
+  TBB_SONAME_TBB = -Wl,-install_name,@rpath/libstanr_tbb.dylib
+  TBB_SONAME_TBBMALLOC = -Wl,-install_name,@rpath/libstanr_tbbmalloc.dylib
+  # Installed DLLs live in package/libs and TBB in package/lib. The second
+  # path supports loading src/stanr.so directly (for example, load_all()).
+  TBB_RPATH_FLAG = -Wl,-rpath,@loader_path/../lib -Wl,-rpath,@loader_path/../inst/lib
 else ifeq ($(UNAME_S),Linux)
-  TBB_LIB_NAMES = libtbb.so.2 libtbbmalloc.so.2
+  TBB_LIB_NAMES = libstanr_tbb.so.2 libstanr_tbbmalloc.so.2
   TBB_PIC_FLAG = -fPIC
   TBB_PLATFORM_CXXFLAGS = -D_XOPEN_SOURCE -O2
   TBB_PLATFORM_LDFLAGS = -pthread -ldl
-  TBB_SONAME_TBB = -Wl,-soname,libtbb.so.2
-  TBB_SONAME_TBBMALLOC = -Wl,-soname,libtbbmalloc.so.2
-  TBB_RPATH_FLAG = -Wl,-rpath,'$$ORIGIN/../lib'
+  TBB_SONAME_TBB = -Wl,-soname,libstanr_tbb.so.2
+  TBB_SONAME_TBBMALLOC = -Wl,-soname,libstanr_tbbmalloc.so.2
+  TBB_RPATH_FLAG = -Wl,-rpath,'$$ORIGIN/../lib' -Wl,-rpath,'$$ORIGIN/../inst/lib'
 else
-  TBB_LIB_NAMES = tbb.dll tbbmalloc.dll
+  TBB_LIB_NAMES = stanr_tbb.dll stanr_tbbmalloc.dll
   TBB_PIC_FLAG =
   TBB_PLATFORM_CXXFLAGS = -O2
   TBB_PLATFORM_LDFLAGS =
@@ -59,7 +61,7 @@ $(TBB_BUILD_DIR)/tbbmalloc/%.o: tbbmalloc/%.cpp
 ifeq ($(TBB_WASM),1)
   TBB_LIBS = $(TBB_LIB_DIR)/libtbb.a
 else
-  TBB_LIBS = -L"$(TBB_LIB_DIR)" $(TBB_RPATH_FLAG) -ltbb -ltbbmalloc
+  TBB_LIBS = -L"$(TBB_LIB_DIR)" $(TBB_RPATH_FLAG) -lstanr_tbb -lstanr_tbbmalloc
 endif
 
 $(TBB_LIB_DIR)/$(firstword $(TBB_LIB_NAMES)): $(TBB_OBJECTS) $(TBBMALLOC_OBJECTS)
@@ -72,8 +74,8 @@ else
 	env $(CXX) -shared -o $(TBB_LIB_DIR)/$(word 2,$(TBB_LIB_NAMES)) $(TBBMALLOC_OBJECTS) \
 	  $(TBB_SONAME_TBBMALLOC) $(TBB_PLATFORM_LDFLAGS)
 ifeq ($(UNAME_S),Linux)
-	ln -sf libtbb.so.2 $(TBB_LIB_DIR)/libtbb.so
-	ln -sf libtbbmalloc.so.2 $(TBB_LIB_DIR)/libtbbmalloc.so
+	ln -sf libstanr_tbb.so.2 $(TBB_LIB_DIR)/libstanr_tbb.so
+	ln -sf libstanr_tbbmalloc.so.2 $(TBB_LIB_DIR)/libstanr_tbbmalloc.so
 endif
 endif
 	rm -rf $(TBB_BUILD_DIR)

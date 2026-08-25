@@ -88,7 +88,7 @@
     shQuote(tbb_lib_dir),
     " -Wl,-rpath,",
     shQuote(tbb_lib_dir),
-    " -ltbb -ltbbmalloc"
+    " -lstanr_tbb -lstanr_tbbmalloc"
   )
 }
 

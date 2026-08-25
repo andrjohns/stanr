@@ -4,22 +4,6 @@ private <- self <- NULL
 # Session memo: compiled model envs, stanc context, stan version.
 .stanr_memo <- new.env(parent = emptyenv())
 
-# No useDynLib (see stanr-package.R): .onLoad loads TBB before stanr.so
-# itself, so its rpath resolves under devtools::load_all(). Mirrors RcppParallel.
-.stanr_tbb_lib_names <- function() {
-  if (R.version$os == "emscripten") {
-    return(character())
-  }
-  sysname <- Sys.info()[["sysname"]]
-  if (sysname == "Darwin") {
-    c("libtbb.dylib", "libtbbmalloc.dylib")
-  } else if (sysname == "Windows") {
-    c("tbb.dll", "tbbmalloc.dll")
-  } else {
-    c("libtbb.so.2", "libtbbmalloc.so.2")
-  }
-}
-
 .stanr_dll_path <- function(libname, pkgname) {
   ext <- .Platform$dynlib.ext
   arch <- .Platform$r_arch
@@ -40,20 +24,12 @@ private <- self <- NULL
 }
 
 .stanr_dll <- NULL
-.stanr_tbb_dlls <- list()
 
 .onLoad <- function(libname, pkgname) {
-  lib_dir <- system.file("lib", .Platform$r_arch, package = pkgname)
-  if (nzchar(lib_dir) && dir.exists(lib_dir)) {
-    for (name in .stanr_tbb_lib_names()) {
-      path <- file.path(lib_dir, name)
-      if (file.exists(path)) {
-        .stanr_tbb_dlls[[name]] <<- dyn.load(path, local = FALSE, now = TRUE)
-      }
-    }
-  }
-
-  dll <- dyn.load(.stanr_dll_path(libname, pkgname), local = FALSE, now = TRUE)
+  # TBB is a regular dependency with a package-private library identity and is
+  # resolved through stanr.so's rpath. Keep the DLL and its dependencies local
+  # so their symbols are not added to the process-wide lookup scope.
+  dll <- dyn.load(.stanr_dll_path(libname, pkgname), local = TRUE, now = TRUE)
   .stanr_dll <<- dll
 
   # No useDynLib -- bind routines by hand.
@@ -79,9 +55,6 @@ private <- self <- NULL
 .onUnload <- function(libpath) {
   if (!is.null(.stanr_dll)) {
     try(dyn.unload(.stanr_dll[["path"]]), silent = TRUE)
-  }
-  for (dll in .stanr_tbb_dlls) {
-    try(dyn.unload(dll[["path"]]), silent = TRUE)
   }
   invisible(NULL)
 }

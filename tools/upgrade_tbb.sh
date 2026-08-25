@@ -51,6 +51,17 @@ rm -f "$INST_INCLUDE/oneapi/tbb/detail/_config.h.bak"
 rm -f "$SRC/tbb/itt_notify.cpp"
 rm -rf "$SRC/tbb/tools_api"
 
+# Keep stanr's dynamically linked TBB private from other R packages. These
+# names must agree with src/Makevars.tbb on every supported native platform.
+for file in "$SRC/tbb/allocator.cpp" "$SRC/tbbmalloc/tbbmalloc.cpp"; do
+  sed -i.bak \
+    -e 's/"tbbmalloc" DEBUG_SUFFIX "\.dll"/"stanr_tbbmalloc" DEBUG_SUFFIX ".dll"/' \
+    -e 's/"libtbbmalloc"/"libstanr_tbbmalloc"/g' \
+    -e 's/DEBUG_SUFFIX "\.2\.dylib"/DEBUG_SUFFIX ".dylib"/' \
+    "$file"
+  rm -f "$file.bak"
+done
+
 
 sed -i.bak 's#\.\./src/tbb/environment\.h#../tbb/environment.h#' "$SRC/tbbmalloc/large_objects.cpp"
 rm -f "$SRC/tbbmalloc/large_objects.cpp.bak"
