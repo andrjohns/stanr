@@ -266,21 +266,49 @@ test_that("complex data is rejected", {
   )
 })
 
-test_that("data.frame data is rejected", {
+test_that("numeric data.frame data round-trips as a matrix", {
+  mod <- stan_model(
+    code = "
+      data { matrix[2, 2] m; }
+      transformed data { real check = m[2, 1]; }
+      parameters { real theta; }
+      model { theta ~ normal(0, 1); }
+      generated quantities { real out = check; }
+    ",
+    backend = "stanli"
+  )
+  frame <- data.frame(
+    first = c(1.5, 2.5),
+    second = c(3.5, 4.5)
+  )
+  fit <- mod$sample(
+    data = list(m = frame),
+    chains = 1,
+    iter_warmup = 5,
+    iter_sampling = 1,
+    seed = 1,
+    show_messages = FALSE,
+    fixed_param = TRUE
+  )
+  s <- fit$summary()
+  expect_equal(s$mean[s$variable == "out"], frame[2, 1])
+})
+
+test_that("non-numeric data.frame columns are rejected", {
   mod <- stan_model(
     code = "data { real x; } parameters { real theta; } model { theta ~ normal(0, 1); }",
     backend = "stanli"
   )
   expect_error(
     mod$sample(
-      data = list(x = data.frame(a = 1)),
+      data = list(x = data.frame(value = c(1, 2), label = c("a", "b"))),
       chains = 1,
       iter_warmup = 5,
       iter_sampling = 5,
       seed = 1,
       show_messages = FALSE
     ),
-    "stanli data does not support data.frames yet"
+    "stanli data frames must contain only integer or numeric columns"
   )
 })
 
@@ -302,38 +330,40 @@ test_that("tuple-typed (list) data is rejected", {
   )
 })
 
-test_that("arrays with more than 3 dimensions are rejected, real and int", {
-  mod_real <- stan_model(
-    code = "data { array[2, 2, 2, 2] real a; } parameters { real theta; } model { theta ~ normal(0, 1); }",
+test_that("four-dimensional real and int arrays round-trip", {
+  mod <- stan_model(
+    code = "
+      data {
+        array[2, 2, 2, 2] real a;
+        array[2, 2, 2, 2] int ia;
+      }
+      transformed data {
+        real a_check = a[2, 1, 2, 2];
+        int ia_check = ia[1, 2, 1, 2];
+      }
+      parameters { real theta; }
+      model { theta ~ normal(0, 1); }
+      generated quantities {
+        real a_out = a_check;
+        int ia_out = ia_check;
+      }
+    ",
     backend = "stanli"
   )
-  expect_error(
-    mod_real$sample(
-      data = list(a = array(1, dim = c(2, 2, 2, 2))),
-      chains = 1,
-      iter_warmup = 5,
-      iter_sampling = 5,
-      seed = 1,
-      show_messages = FALSE
-    ),
-    "more than 3 dimensions"
+  a <- array(seq(100, by = 1, length.out = 16), dim = c(2, 2, 2, 2))
+  ia <- array(seq(1L, by = 1L, length.out = 16), dim = c(2, 2, 2, 2))
+  fit <- mod$sample(
+    data = list(a = a, ia = ia),
+    chains = 1,
+    iter_warmup = 5,
+    iter_sampling = 1,
+    seed = 1,
+    show_messages = FALSE,
+    fixed_param = TRUE
   )
-
-  mod_int <- stan_model(
-    code = "data { array[2, 2, 2, 2] int a; } parameters { real theta; } model { theta ~ normal(0, 1); }",
-    backend = "stanli"
-  )
-  expect_error(
-    mod_int$sample(
-      data = list(a = array(1L, dim = c(2, 2, 2, 2))),
-      chains = 1,
-      iter_warmup = 5,
-      iter_sampling = 5,
-      seed = 1,
-      show_messages = FALSE
-    ),
-    "more than 3 dimensions"
-  )
+  s <- fit$summary()
+  expect_equal(s$mean[s$variable == "a_out"], a[2, 1, 2, 2])
+  expect_equal(s$mean[s$variable == "ia_out"], ia[1, 2, 1, 2])
 })
 
 # ---------------------------------------------------------------------------

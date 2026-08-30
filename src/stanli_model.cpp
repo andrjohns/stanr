@@ -26,27 +26,31 @@
 namespace stanr {
 namespace {
 
-// R's REAL()/INTEGER() buffers are already column-major for up to 3 dims,
-// the same layout stan::io::var_context (and stanli::DataMap::Entry) expect
-// -- so this restriction is stanr's own, not stanli's or r_data_context's.
-void check_dims(const std::string& name, SEXP value) {
-  SEXP dim = Rf_getAttrib(value, R_DimSymbol);
-  if (Rf_length(dim) > 3)
-    throw std::runtime_error(
-        "stanli data arrays with more than 3 dimensions are not supported: " +
-        name);
-}
-
 // stanli restricts data to what DataMap::from_var_context() below can
-// actually represent: no tuples (no from_var_context caller has declared
-// types to guide flattening), and no complex (from_var_context reads only
-// vals_r()/vals_i(), so a complex-only r_data_context entry would silently
-// come through empty rather than erroring).
+// actually represent: no tuples (the runtime still has no tuple lowering),
+// and no complex (from_var_context reads only vals_r()/vals_i(), so a
+// complex-only r_data_context entry would silently come through empty rather
+// than erroring). Numeric data.frames are normalized to matrices by
+// r_data_context and are supported here as long as all columns are real or
+// integer.
 void check_supported(const std::string& name, SEXP value) {
   if (Rf_isNull(value))
     throw std::runtime_error("stanli data value cannot be NULL: " + name);
-  if (Rf_inherits(value, "data.frame"))
-    throw std::runtime_error("stanli data does not support data.frames yet");
+  if (Rf_inherits(value, "data.frame")) {
+    SEXP columns = value;
+    for (R_xlen_t i = 0; i < XLENGTH(columns); ++i) {
+      SEXP column = VECTOR_ELT(columns, i);
+      if (TYPEOF(column) == CPLXSXP)
+        throw std::runtime_error(
+            "stanli data does not support complex values yet: " + name);
+      if (TYPEOF(column) != INTSXP && TYPEOF(column) != REALSXP)
+        throw std::runtime_error(
+            "stanli data frames must contain only integer or numeric "
+            "columns: " +
+            name);
+    }
+    return;
+  }
   if (TYPEOF(value) == CPLXSXP)
     throw std::runtime_error("stanli data does not support complex values yet");
   if (TYPEOF(value) != INTSXP && TYPEOF(value) != LGLSXP &&
@@ -55,13 +59,20 @@ void check_supported(const std::string& name, SEXP value) {
         "stanli data must be numeric, logical, or an array (tuple-typed "
         "data is not yet supported): " + name);
   }
-  check_dims(name, value);
 }
 
-// stanli has no sink for r_data_context's NaN-only check (it silently
-// treats Inf as a valid real), so NA/NaN/Inf get their own stricter,
-// stanli-flavored pass here before that context ever sees the value.
+// stanli has no sink for r_data_context's NaN-only check (it silently treats
+// Inf as a valid real), so NA/NaN/Inf get their own stricter, stanli-flavored
+// pass here before that context ever sees the value. Data frames need to be
+// checked column by column because their outer SEXP is a VECSXP.
 void check_finite(const std::string& name, SEXP value) {
+  if (Rf_inherits(value, "data.frame")) {
+    for (R_xlen_t i = 0; i < XLENGTH(value); ++i) {
+      check_finite(name + "[[" + std::to_string(i + 1) + "]]",
+                   VECTOR_ELT(value, i));
+    }
+    return;
+  }
   const R_xlen_t n = XLENGTH(value);
   if (TYPEOF(value) == REALSXP) {
     for (R_xlen_t i = 0; i < n; ++i) {
@@ -80,12 +91,12 @@ void check_finite(const std::string& name, SEXP value) {
 }
 
 // SEXP -> stanli::DataMap. stanli-specific restrictions (no tuples, no
-// complex, no NA/NaN/Inf, at most 3 array dims) are checked up front with
-// stanli's own error messages; once a list clears that, it is exactly what
-// stanr::r_data_context (the same var_context the compiled backend builds
-// from R data) already knows how to read, so DataMap::from_var_context()
-// -- stanli's adapter for a caller that already has a var_context, rather
-// than JSON text -- does the actual conversion.
+// complex, no NA/NaN/Inf) are checked up front with stanli's own error
+// messages; once a list clears that, it is exactly what stanr::r_data_context
+// (the same var_context the compiled backend builds from R data) already
+// knows how to read, so DataMap::from_var_context() -- stanli's adapter for a
+// caller that already has a var_context, rather than JSON text -- does the
+// actual conversion.
 stanli::DataMap sexp_to_data_map(SEXP data) {
   if (Rf_isNull(data) || XLENGTH(data) == 0) return stanli::DataMap();
   SEXP names = Rf_getAttrib(data, R_NamesSymbol);
