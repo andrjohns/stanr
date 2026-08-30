@@ -13,7 +13,9 @@ compile_commands.json
 libs
 lib
 tools/cmdstan-*
+tools/math-*
 tools/oneTBB-*
+tools/stan-*
 tools/stanli-*
 **.stanrc
 .posit

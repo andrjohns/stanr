@@ -36,17 +36,17 @@ namespace {
 
 constexpr int64_t kMinIslandOps = 32;
 constexpr int kMaxLiveIns = 6;
-// What one register costs against one element of graph traffic. The file is
-// written by the forward and read by the backward, and the backward's
-// adjoint file is zeroed once per call besides -- so three passes over a
-// register against one element moved.
+// What one value register costs against one element of graph traffic. The
+// value file is written by the forward and read by the backward. The compact
+// adjoint file is charged separately below: copied registers share a cell,
+// and checkpoint registers have no adjoint cell at all.
 //
 // It was 4 while the backward replayed the program under var, where a
 // register meant an allocated vari and a virtual chain() call. That term
 // dominated the estimate and is what refused thirteen of the fourteen
 // regions the carver could compile; the generated adjoint (adjoint.hpp)
 // is what makes it a memory cost again.
-constexpr int kRegWeight = 3;
+constexpr int kValueRegWeight = 2;
 // And what one graph op costs against one element. An op that writes a
 // scalar still pays a dispatch, a context load and a scratch-partials
 // backward; measured at ~5 ns against ~1 ns for an island instruction
@@ -101,6 +101,9 @@ bool callable(const Graph& g, const Op& op) {
   switch (op.opcode) {
     case OP_ISLAND:
     case OP_ODE:
+    case OP_RNG:
+    case OP_PROD_VEC:
+    case OP_EXTREMA_VEC:
     case OP_PRINT:
     case OP_REJECT:
       return false;
@@ -110,7 +113,7 @@ bool callable(const Graph& g, const Op& op) {
   if (op.udata != nullptr || op.out2 >= 0) return false;
   if (op.variant & 0x80u) return false;
   if (g.slots[op.out].len != 1) return false;
-  return find_kernel(op.opcode) != nullptr;
+  return op.opcode != OP_NONE_ && find_kernel(op.opcode) != nullptr;
 }
 
 // Structural vocabulary test. Shape/idata details are re-checked during
@@ -133,6 +136,7 @@ bool in_vocab(const Graph& g, const Op& op) {
     case OP_SET_INDEX_INPLACE:
     case OP_SLICE:
     case OP_SET_SLICE:
+    case OP_SET_SLICE_INPLACE:
       return op.n_idata == 1;
     case OP_DOT:
       return op.n_in == 2 && g.slots[op.in[0]].len == g.slots[op.in[1]].len;
@@ -163,8 +167,9 @@ struct Compiler {
   std::vector<int> live_in_slots;
   size_t op_index = 0;  // graph index of the op being compiled
   // Scratch registers CALLs allocated: working memory the graph op also
-  // had, free in the estimate's eyes, so the estimate counts these at
-  // weight 1 rather than kRegWeight.
+  // had, free in the estimate's eyes. They are subtracted from the two
+  // value-file passes and retain only their identity cell in the compact
+  // adjoint count below: effective weight 1.
   int64_t n_call_scratch = 0;
   bool ok = true;
 
@@ -366,10 +371,14 @@ struct Compiler {
         emit(Program::MOV, d + idx, val);
         return ok;
       }
-      case OP_SET_SLICE: {
+      case OP_SET_SLICE:
+      case OP_SET_SLICE_INPLACE: {
         const int start = op.idata[0];
         const int64_t vlen = g.slots[op.in[1]].len;
         if (op.n_in != 2 || start < 0 || start + vlen > out_len) return false;
+        if (op.opcode == OP_SET_SLICE_INPLACE &&
+            (op.out != op.in[0] || op.in[0] == op.in[1]))
+          return false;
         const int base = read_reg(op.in[0]);
         const int val = read_reg(op.in[1]);
         if (base_dead_here(op.in[0])) reg_of[op.out] = base;
@@ -432,7 +441,38 @@ struct Compiler {
   }
 };
 
+// Retaining the raw program lets an accepted island receive destination
+// forwarding after the legacy program has been priced, but copying every
+// candidate would add avoidable preparation work. Every legal rewrite has
+// this adjacent producer/copy syntax. The full pass remains the authority for
+// opcode, range, liveness, overlap, and branch safety, so false positives here
+// are harmless while this deliberately coarse probe cannot suppress a legal
+// rewrite.
+bool may_forward_adjacent_copy_destination(const Program& p) {
+  for (size_t i = 0; i + 1 < p.code.size(); ++i) {
+    const Program::Instr& producer = p.code[i];
+    const Program::Instr& copy = p.code[i + 1];
+    if ((copy.code == Program::MOV || copy.code == Program::MOVR) &&
+        copy.a == producer.dst)
+      return true;
+  }
+  return false;
+}
+
 }  // namespace
+
+void compact_island(IslandProg& p) { (void)compact_island_gated(p, true); }
+
+bool compact_island_gated(IslandProg& p, bool enable_destination_forwarding) {
+  if (std::getenv("STANLI_NO_ISLAND_COMPACT")) return false;
+  std::vector<std::pair<int, int>> seeded;
+  seeded.reserve(p.ins.size());
+  for (const auto& li : p.ins) seeded.emplace_back(li.reg, li.len);
+  const bool destination_forwarded =
+      compact_program_gated(p, seeded, enable_destination_forwarding);
+  for (size_t k = 0; k < p.ins.size(); ++k) p.ins[k].reg = seeded[k].first;
+  return destination_forwarded;
+}
 
 int carve_islands(Graph& g,
                   const std::vector<std::pair<int, std::vector<double>>>& fills,
@@ -458,6 +498,21 @@ int carve_islands(Graph& g,
   for (const auto& f : fills)
     if (!written.count(f.first)) const_slots[f.first] = &f.second;
 
+  // Which slots carry a parameter. The adjoint generator turns this into
+  // per-argument masks on the densities it differentiates; slots added
+  // below are active until something says otherwise.
+  std::vector<char> slot_active(g.slots.size(), 0);
+  for (size_t s = 0; s < g.slots.size(); ++s)
+    slot_active[s] = g.slots[s].is_param ? 1 : 0;
+  for (const Op& op : g.ops) {
+    bool any = false;
+    for (int j = 0; j < op.n_in && !any; ++j)
+      if (op.in[j] >= 0 && slot_active[(size_t)op.in[j]]) any = true;
+    if (!any) continue;
+    if (op.out >= 0) slot_active[(size_t)op.out] = 1;
+    if (op.out2 >= 0) slot_active[(size_t)op.out2] = 1;
+  }
+
   std::vector<Op> result;
   result.reserve(g.ops.size());
   int carved = 0;
@@ -481,15 +536,59 @@ int carve_islands(Graph& g,
       cc.op_index = u;
       compiled = cc.compile(g.ops[u]) && cc.ok;
     }
-    // Generate the backward before estimating, because generating it is
-    // what the estimate is about: it appends the checkpoint saves the
-    // adjoint needs, so both the register count and the instruction count
-    // below are the ones the island will actually run. STANLI_NO_NATIVE_ADJ
-    // does not skip this -- it only stops the kernel USING the result, so
-    // the two backwards can be compared over the same islands.
+    // Live-outs: written in the region and visible after it, in first-write
+    // order for a deterministic packing. Settled before compaction, because
+    // the program's live-outs are registers and compaction renumbers them.
+    std::vector<int> live_outs;
+    std::unordered_set<int> in_set(cc.live_in_slots.begin(),
+                                   cc.live_in_slots.end());
     if (compiled) {
-      const bool gen = gen_adjoint(cc.prog);
-      cc.prog.native_adj = gen && !std::getenv("STANLI_NO_NATIVE_ADJ");
+      std::unordered_set<int> seen;
+      for (size_t u = i; u < j; ++u) {
+        const int o = g.ops[u].out;
+        if (seen.count(o)) continue;
+        seen.insert(o);
+        auto lit = last_use.find(o);
+        const bool read_after = lit != last_use.end() && lit->second >= j;
+        if (read_after || root_set.count(o) || term_set.count(o))
+          live_outs.push_back(o);
+      }
+      // A slot that is BOTH a live-in and a live-out (an in-place chain
+      // whose template the region reads first and overwrites last) cannot
+      // keep its id on the output side: the island reads the arena buffer
+      // in the forward, and an extraction writing the same buffer would
+      // feed the NEXT gradient's forward its own previous output. The
+      // extraction gets a fresh slot and later references are renamed --
+      // unless the slot is read from outside the graph, where the id is
+      // the contract, and then the run stays as ops.
+      bool aliased_pinned = false;
+      for (int o : live_outs)
+        if (in_set.count(o) && pinned.count(o)) aliased_pinned = true;
+      if (live_outs.empty() || aliased_pinned) compiled = false;
+    }
+    if (compiled)
+      for (int o : live_outs)
+        for (int e = 0; e < (int)g.slots[o].len; ++e)
+          cc.prog.out_regs.push_back(cc.reg_of.at(o) + e);
+
+    // Price the pre-destination-forwarding program. This deliberately keeps
+    // activation identical to the established cost model: copy coalescing may
+    // make an island that was already selected faster, but it cannot use its
+    // own savings to pull a new island across the line. A raw copy is retained
+    // only when the optimization is enabled, and is compacted after the cost
+    // decision below.
+    std::unique_ptr<IslandProg> destination_source;
+    bool priced_gen = false;
+    if (compiled) {
+      for (size_t k = 0; k < cc.prog.ins.size(); ++k)
+        cc.prog.ins[k].active = slot_active[(size_t)cc.live_in_slots[k]] != 0;
+      if (!std::getenv("STANLI_NO_PROGRAM_DEST_FORWARD") &&
+          !std::getenv("STANLI_NO_ISLAND_COMPACT") &&
+          may_forward_adjacent_copy_destination(cc.prog))
+        destination_source = std::make_unique<IslandProg>(cc.prog);
+      compact_island_gated(cc.prog, false);
+      priced_gen = gen_adjoint(cc.prog);
+      cc.prog.native_adj = priced_gen && !std::getenv("STANLI_NO_NATIVE_ADJ");
       // The var replay cannot execute a CALL (kernels are double
       // machinery), so a CALL-bearing island exists only with its
       // generated adjoint; otherwise the run stays as ops, which is the
@@ -509,104 +608,118 @@ int carve_islands(Graph& g,
     // and for asking why a region was left alone.)
     if (compiled && !std::getenv("STANLI_ISLAND_ALWAYS")) {
       int64_t graph_elems = 0;
-      for (size_t u = i; u < j; ++u)
-        graph_elems += g.ops[u].opcode == OP_SET_INDEX_INPLACE
-                           ? 1
-                           : g.slots[g.ops[u].out].len;
+      for (size_t u = i; u < j; ++u) {
+        const Op& op = g.ops[u];
+        if (op.opcode == OP_SET_INDEX_INPLACE)
+          graph_elems += 1;
+        else if (op.opcode == OP_SET_SLICE_INPLACE)
+          graph_elems += g.slots[op.in[1]].len;
+        else
+          graph_elems += g.slots[op.out].len;
+      }
       const int64_t graph_cost = graph_elems + kOpCost * (int64_t)(j - i);
       // A CALL should read as cost-NEUTRAL: it runs the graph's own
       // kernel with the graph's own per-call overhead (context assembly,
       // indirect call, twice per gradient), so absorbing one buys
       // continuity, never speed. Two corrections make that true in the
-      // arithmetic: its scratch counts at weight 1 rather than
-      // kRegWeight (working memory the graph op also had, free in this
-      // accounting), and each CALL pays the same kOpCost the graph side
-      // is charged -- without which a region of nothing but CALLs reads
-      // as a win and measures a loss (dugongs_model, 0.63x, the first
-      // sweep after the vocabulary widened).
+      // arithmetic: its scratch is subtracted from the two value-file passes
+      // (working memory the graph op also had) but retains its identity cell
+      // in the compact adjoint count, for effective weight 1; and each CALL
+      // pays the same kOpCost the graph side is charged -- without which a
+      // region of nothing but CALLs reads as a win and measures a loss
+      // (dugongs_model, 0.63x, the first sweep after the vocabulary widened).
       const int64_t n_calls = (int64_t)cc.prog.calls.size();
+      // A rare program the generator refuses keeps the replay. Preserve its
+      // old one-cell-per-value charge rather than treating an absent compact
+      // adjoint program as a zero-sized file.
+      const int64_t adj_regs = cc.prog.adj.empty()
+                                   ? (int64_t)cc.prog.n_regs
+                                   : (int64_t)cc.prog.adj.n_regs;
       const int64_t island_cost =
-          kRegWeight * ((int64_t)cc.prog.n_regs - cc.n_call_scratch) +
-          cc.n_call_scratch + (int64_t)cc.prog.code.size() +
+          kValueRegWeight * ((int64_t)cc.prog.n_regs - cc.n_call_scratch) +
+          adj_regs + (int64_t)cc.prog.code.size() +
           (int64_t)cc.prog.adj.code.size() + (kOpCost - 1) * 2 * n_calls;
       if (graph_cost < island_cost) compiled = false;
     }
-    if (compiled) {
-      // Live-outs: written in the region and visible after it, in
-      // first-write order for a deterministic packing.
-      std::vector<int> live_outs;
-      std::unordered_set<int> seen;
-      for (size_t u = i; u < j; ++u) {
-        const int o = g.ops[u].out;
-        if (seen.count(o)) continue;
-        seen.insert(o);
-        auto lit = last_use.find(o);
-        const bool read_after = lit != last_use.end() && lit->second >= j;
-        if (read_after || root_set.count(o) || term_set.count(o))
-          live_outs.push_back(o);
-      }
-      // A slot that is BOTH a live-in and a live-out (an in-place chain
-      // whose template the region reads first and overwrites last) cannot
-      // keep its id on the output side: the island reads the arena buffer
-      // in the forward, and an extraction writing the same buffer would
-      // feed the NEXT gradient's forward its own previous output. The
-      // extraction gets a fresh slot and later references are renamed --
-      // unless the slot is read from outside the graph, where the id is
-      // the contract, and then the run stays as ops.
-      std::unordered_set<int> in_set(cc.live_in_slots.begin(),
-                                     cc.live_in_slots.end());
-      bool aliased_pinned = false;
-      for (int o : live_outs)
-        if (in_set.count(o) && pinned.count(o)) aliased_pinned = true;
-      if (!live_outs.empty() && !aliased_pinned) {
-        int64_t packed = 0;
-        for (int o : live_outs) {
-          for (int e = 0; e < (int)g.slots[o].len; ++e)
-            cc.prog.out_regs.push_back(cc.reg_of.at(o) + e);
-          packed += g.slots[o].len;
+    if (compiled && destination_source && priced_gen) {
+      IslandProg optimized = std::move(*destination_source);
+      if (compact_island_gated(optimized, true)) {
+        const bool optimized_gen = gen_adjoint(optimized);
+        optimized.native_adj =
+            optimized_gen && !std::getenv("STANLI_NO_NATIVE_ADJ");
+        // Do not trade the existing generated backward for replay if
+        // forwarding exposes an unforeseen generator limitation. CALL cannot
+        // replay at all.
+        const bool usable =
+            optimized_gen && (optimized.calls.empty() || optimized.native_adj);
+        if (usable) {
+          cc.prog = std::move(optimized);
         }
-        auto prog = std::make_shared<IslandProg>(std::move(cc.prog));
-        Op is;
-        is.opcode = OP_ISLAND;
-        is.n_in = (int)cc.live_in_slots.size();
-        for (int k = 0; k < is.n_in; ++k) is.in[k] = cc.live_in_slots[k];
-        is.out = g.add_slot(packed, false);
+      }
+    }
+    if (compiled) {
+      int64_t packed = 0;
+      for (int o : live_outs) packed += g.slots[o].len;
+      std::shared_ptr<const Program> optimized;
+      if (!std::getenv("STANLI_NO_ISLAND_SOFTMAX3"))
+        optimized = specialize_softmax3(cc.prog);
+      const bool specialized = static_cast<bool>(optimized);
+      Op is;
+      is.opcode = OP_ISLAND;
+      is.variant = specialized ? kIslandSoftmax3Variant : 0;
+      is.n_in = (int)cc.live_in_slots.size();
+      for (int k = 0; k < is.n_in; ++k) is.in[k] = cc.live_in_slots[k];
+      is.out = g.add_slot(packed, false);
+      slot_active.resize(g.slots.size(), 1);
+      if (specialized) {
+        auto specialized_prog = std::make_shared<Softmax3IslandProg>();
+        static_cast<IslandProg&>(*specialized_prog) = std::move(cc.prog);
+        specialized_prog->optimized_double = std::move(optimized);
+        // Erase the converted base pointer, not the derived pointer: readers
+        // shared with OP_ISLAND recover IslandProg directly from udata.
+        std::shared_ptr<IslandProg> prog = std::move(specialized_prog);
         is.udata = prog.get();
         g.udata_pool.push_back(std::move(prog));
-        result.push_back(is);
-        // Extractions write the ORIGINAL slot ids, so downstream readers,
-        // roots, and target terms are untouched -- except for the
-        // live-in/live-out slots above, which get a fresh slot and a
-        // rename of every later reference (read or write, as reroll's
-        // write fusion does, so the two stay consistent).
-        int64_t off = 0;
-        for (int o : live_outs) {
-          const int64_t len = g.slots[o].len;
-          int dst = o;
-          if (in_set.count(o)) {
-            dst = g.add_slot(len, false);
-            for (size_t u = j; u < g.ops.size(); ++u) {
-              for (int q = 0; q < g.ops[u].n_in; ++q)
-                if (g.ops[u].in[q] == o) g.ops[u].in[q] = dst;
-              if (g.ops[u].out == o) g.ops[u].out = dst;
-              if (g.ops[u].out2 == o) g.ops[u].out2 = dst;
-            }
-          }
-          Op ex;
-          ex.opcode = len == 1 ? OP_INDEX : OP_SLICE;
-          ex.n_in = 1;
-          ex.in[0] = is.out;
-          ex.out = dst;
-          g.idata_pool.push_back({(int)off});
-          ex.idata = g.idata_pool.back().data();
-          ex.n_idata = 1;
-          result.push_back(ex);
-          off += len;
-        }
-        ++carved;
-        i = j;
-        continue;
+      } else {
+        auto prog = std::make_shared<IslandProg>(std::move(cc.prog));
+        is.udata = prog.get();
+        g.udata_pool.push_back(std::move(prog));
       }
+      result.push_back(is);
+      // Extractions write the ORIGINAL slot ids, so downstream readers,
+      // roots, and target terms are untouched -- except for the
+      // live-in/live-out slots above, which get a fresh slot and a
+      // rename of every later reference (read or write, as reroll's
+      // write fusion does, so the two stay consistent).
+      int64_t off = 0;
+      for (int o : live_outs) {
+        const int64_t len = g.slots[o].len;
+        int dst = o;
+        if (in_set.count(o)) {
+          dst = g.add_slot(len, false);
+          slot_active.resize(g.slots.size(), 1);
+          slot_active[(size_t)dst] = slot_active[(size_t)o];
+          for (size_t u = j; u < g.ops.size(); ++u) {
+            for (int q = 0; q < g.ops[u].n_in; ++q)
+              if (g.ops[u].in[q] == o) g.ops[u].in[q] = dst;
+            if (g.ops[u].out == o) g.ops[u].out = dst;
+            if (g.ops[u].out2 == o) g.ops[u].out2 = dst;
+          }
+        }
+        Op ex;
+        ex.opcode = len == 1 ? OP_INDEX : OP_SLICE;
+        ex.n_in = 1;
+        ex.in[0] = is.out;
+        ex.out = dst;
+        g.idata_pool.push_back({(int)off});
+        ex.idata = g.idata_pool.back().data();
+        ex.n_idata = 1;
+        result.push_back(ex);
+        off += len;
+      }
+      ++carved;
+      i = j;
+      continue;
     }
     // Compile failed or nothing escapes: leave the run as ops.
     while (i < j) result.push_back(g.ops[i++]);

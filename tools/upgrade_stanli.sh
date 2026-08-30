@@ -3,7 +3,7 @@
 # convention for bundled libraries
 set -e
 
-STANLI_REF="6673331"
+STANLI_REF="8c4b874"
 STANLI_TARBALL="stanli-$STANLI_REF.tar.gz"
 STANLI_URL="https://github.com/seantalts/stanli/archive/$STANLI_REF.tar.gz"
 
@@ -11,7 +11,11 @@ if [ ! -f "$STANLI_TARBALL" ]; then
   curl -sSL -o "$STANLI_TARBALL" "$STANLI_URL"
 fi
 tar -xf "$STANLI_TARBALL"
-STANLI_DIR=$(find . -maxdepth 1 -type d -name 'stanli-*')
+# Read the archive's single top-level directory rather than globbing the
+# working tree: old upgrade snapshots are intentionally left here and would
+# otherwise make STANLI_DIR contain multiple paths.
+STANLI_DIR=$(tar -tf "$STANLI_TARBALL" | awk -F/ 'NF { print $1; exit }')
+test -n "$STANLI_DIR" && test -d "$STANLI_DIR"
 
 SRC=../src/stanli
 
@@ -180,7 +184,7 @@ old_no_adjoint = """      // A refusal is not an error -- the replay still gives
       // gradient -- but it is worth being able to see, because it is the
       // difference between a region that is fast and one that merely
       // works, and nothing else about the model would show it.
-      if (!gen && std::getenv("STANLI_DEBUG_ISLAND"))
+      if (!priced_gen && std::getenv("STANLI_DEBUG_ISLAND"))
         std::fprintf(stderr,
                      "island: no adjoint generated for a %zu-op region; "
                      "it will replay under var\\n",
@@ -202,28 +206,39 @@ new_cost = """      if (graph_cost < island_cost) compiled = false;
 assert old_cost in text, "island-cost debug trace not found -- island.cpp changed upstream"
 text = text.replace(old_cost, new_cost, 1)
 
-old_carved = """        if (std::getenv("STANLI_DEBUG_ISLAND")) {
-          const IslandProg& p = *static_cast<const IslandProg*>(is.udata);
+old_forwarding = """        } else if (std::getenv("STANLI_DEBUG_ISLAND")) {
           std::fprintf(stderr,
-                       "island: ops=%zu instr=%zu regs=%d ins=%zu outs=%zu "
-                       "adj=%zu\\n",
-                       j - i, p.code.size(), p.n_regs, p.ins.size(),
-                       p.out_regs.size(), p.adj.code.size());
-          // Which instructions the region is made of, so a disagreement
-          // with the replay can be attributed to an opcode rather than
-          // guessed at.
-          std::vector<int> hist(64, 0);
-          for (const auto& I : p.code)
-            if ((int)I.code < 64) ++hist[(size_t)I.code];
-          std::fprintf(stderr, "island opcodes:");
-          for (int c = 0; c < 64; ++c)
-            if (hist[(size_t)c])
-              std::fprintf(stderr, " %d:%d", c, hist[(size_t)c]);
-          std::fprintf(stderr, "\\n");
+                       "island: destination forwarding kept the priced "
+                       "program because its optimized adjoint was refused\\n");
         }
-        ++carved;
 """
-new_carved = """        ++carved;
+new_forwarding = """        }
+"""
+assert old_forwarding in text, "destination-forwarding debug trace not found -- island.cpp changed upstream"
+text = text.replace(old_forwarding, new_forwarding, 1)
+
+old_carved = """      if (std::getenv("STANLI_DEBUG_ISLAND")) {
+        const IslandProg& p = *static_cast<const IslandProg*>(is.udata);
+        std::fprintf(stderr,
+                     "island: ops=%zu instr=%zu regs=%d ins=%zu outs=%zu "
+                     "adj=%zu adj_regs=%d\\n",
+                     j - i, p.code.size(), p.n_regs, p.ins.size(),
+                     p.out_regs.size(), p.adj.code.size(), p.adj.n_regs);
+        // Which instructions the region is made of, so a disagreement
+        // with the replay can be attributed to an opcode rather than
+        // guessed at.
+        std::vector<int> hist(64, 0);
+        for (const auto& I : p.code)
+          if ((int)I.code < 64) ++hist[(size_t)I.code];
+        std::fprintf(stderr, "island opcodes:");
+        for (int c = 0; c < 64; ++c)
+          if (hist[(size_t)c])
+            std::fprintf(stderr, " %d:%d", c, hist[(size_t)c]);
+        std::fprintf(stderr, "\\n");
+      }
+      ++carved;
+"""
+new_carved = """      ++carved;
 """
 assert old_carved in text, "carved-island debug trace not found -- island.cpp changed upstream"
 text = text.replace(old_carved, new_carved, 1)
@@ -242,6 +257,31 @@ import sys
 path = sys.argv[1]
 text = open(path).read()
 
+# Preparation profiling is an opt-in standalone-runtime diagnostic. stanr
+# never enables it, and its report writes around R's console to raw stderr.
+report_start = "  void report() const {\n"
+report_end = "\n private:\n"
+start = text.find(report_start)
+assert start >= 0, "PrepTrace::report() not found -- lower.cpp changed upstream"
+end = text.find(report_end, start)
+assert end >= 0, "end of PrepTrace::report() not found -- lower.cpp changed upstream"
+text = text[:start] + "  void report() const {}\n" + text[end:]
+
+old_overflow = "    if (size_ >= rows_.size()) std::abort();\n"
+new_overflow = "    if (size_ >= rows_.size()) return rows_.back();\n"
+assert old_overflow in text, "PrepTrace overflow guard not found -- lower.cpp changed upstream"
+text = text.replace(old_overflow, new_overflow, 1)
+
+old_algebra = """    if (!spec->prog.ok && std::getenv("STANLI_DEBUG_ALGEBRA"))
+      std::fprintf(stderr,
+                   "stanli: algebraic system %s falls back to the "
+                   "interpreter: %s\\n",
+                   spec->system_name.c_str(), spec->prog.why.c_str());
+
+"""
+assert old_algebra in text, "algebra fallback debug trace not found -- lower.cpp changed upstream"
+text = text.replace(old_algebra, "", 1)
+
 old_doc = """  // The op tail both ODE families share: report an interpreter fallback,
   // emit OP_ODE and hand the spec to the graph.
 """
@@ -258,12 +298,27 @@ old_trace = """    // Falling back to the interpreter is correct but ~30x slower
                    "stanli: ODE right-hand side %s falls back to the "
                    "interpreter: %s\\n",
                    spec->rhs_name.c_str(), spec->prog.why.c_str());
-    Val v = emit_value(OP_ODE, {z0, theta}, N * S, result_si, {(int)N, (int)S});
 """
-new_trace = """    Val v = emit_value(OP_ODE, {z0, theta}, N * S, result_si, {(int)N, (int)S});
-"""
+new_trace = ""
 assert old_trace in text, "ODE fallback debug trace not found -- lower.cpp changed upstream"
 text = text.replace(old_trace, new_trace, 1)
+
+old_direct_rk = """    if (spec->prog.ok &&
+        (spec->solver == OdeSpec::RK45 || spec->solver == OdeSpec::CKRK) &&
+        std::getenv("STANLI_DEBUG_ODE")) {
+      if (spec->direct_rk)
+        std::fprintf(stderr,
+                     "stanli: ODE right-hand side %s is direct-RK eligible%s\\n",
+                     spec->rhs_name.c_str(),
+                     spec->direct_rk_enabled ? "" : " (oracle selected)");
+      else
+        std::fprintf(stderr,
+                     "stanli: ODE right-hand side %s keeps the RK oracle: %s\\n",
+                     spec->rhs_name.c_str(), spec->direct_rk_why.c_str());
+    }
+"""
+assert old_direct_rk in text, "direct-RK debug trace not found -- lower.cpp changed upstream"
+text = text.replace(old_direct_rk, "", 1)
 
 old_include = "#include <cstdio>\n"
 assert old_include in text, "cstdio include not found -- lower.cpp changed upstream"
@@ -272,56 +327,46 @@ text = text.replace(old_include, "", 1)
 open(path, "w").write(text)
 EOF
 
-python3 - "$SRC/runtime/kernels/elementwise.cpp" << 'EOF'
+python3 - "$SRC/runtime/src" "$SRC/runtime/kernels" << 'EOF'
+import glob
+import os
+import re
 import sys
 
-path = sys.argv[1]
-text = open(path).read()
+# R CMD check flags the abort path emitted by runtime assert(). The retained
+# runtime is fed only graphs and descriptors constructed by stanli's checked
+# lowering/optimization passes, so these are internal consistency checks, not
+# validation of R input. Strip them from every shipped translation unit so a
+# newly added internal kernel cannot silently reintroduce the banned symbol.
+def strip_asserts(text, path):
+    lines = text.splitlines(keepends=True)
+    out = []
+    removed = 0
+    i = 0
+    while i < len(lines):
+        if not re.match(r'^\s*assert\s*\(', lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        statement = lines[i]
+        i += 1
+        while not re.search(r'\);\s*(?://.*)?$', statement.rstrip("\n")):
+            assert i < len(lines), f"unterminated assert() in {path}"
+            statement += lines[i]
+            i += 1
+        removed += 1
+    result = ''.join(out)
+    if not re.search(r'^\s*assert\s*\(', result, re.M):
+        result = result.replace("#include <cassert>\n", "", 1)
+    return result, removed
 
-old_include = "#include <cassert>\n"
-assert old_include in text, "cassert include not found -- elementwise.cpp changed upstream"
-text = text.replace(old_include, "", 1)
-
-old_check = "    assert(ctx.in[i].len == 1);\n    acc += ctx.in[i].data[0];\n"
-new_check = "    acc += ctx.in[i].data[0];\n"
-assert old_check in text, "add_n_fwd length assert not found -- elementwise.cpp changed upstream"
-text = text.replace(old_check, new_check, 1)
-
-open(path, "w").write(text)
-EOF
-
-python3 - "$SRC/runtime/src/executor.cpp" << 'EOF'
-import sys
-
-path = sys.argv[1]
-text = open(path).read()
-
-old_include = "#include <cassert>\n"
-assert old_include in text, "cassert include not found -- executor.cpp changed upstream"
-text = text.replace(old_include, "", 1)
-
-old_kernel = "  assert(opcode < OP_COUNT_);\n  return g_table[opcode];\n"
-new_kernel = "  return g_table[opcode];\n"
-assert old_kernel in text, "kernel() opcode assert not found -- executor.cpp changed upstream"
-text = text.replace(old_kernel, new_kernel, 1)
-
-old_register = "  assert(opcode < OP_COUNT_);\n  g_table[opcode] = k;\n"
-new_register = "  g_table[opcode] = k;\n"
-assert old_register in text, "register_kernel() opcode assert not found -- executor.cpp changed upstream"
-text = text.replace(old_register, new_register, 1)
-
-old_call = (
-    "  assert(k != nullptr);  // the carver only emits registered opcodes\n"
-    "  k->forward(ctx);\n"
-)
-new_call = "  k->forward(ctx);  // the carver only emits registered opcodes\n"
-assert old_call in text, "run_call() null-kernel assert not found -- executor.cpp changed upstream"
-text = text.replace(old_call, new_call, 1)
-
-old_result = "  assert(r.len == 1);\n  return values_[r.offset];\n"
-new_result = "  return values_[r.offset];\n"
-assert old_result in text, "forward() result-length assert not found -- executor.cpp changed upstream"
-text = text.replace(old_result, new_result, 1)
-
-open(path, "w").write(text)
+total = 0
+for directory in sys.argv[1:]:
+    for path in glob.glob(os.path.join(directory, "*.cpp")):
+        text = open(path).read()
+        text, removed = strip_asserts(text, path)
+        if removed:
+            open(path, "w").write(text)
+            total += removed
+assert total > 0, "no runtime assert() calls found -- stanli layout changed upstream"
 EOF

@@ -26,10 +26,13 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace stanli {
+
+struct IslandProg;
 
 struct RhsProgram : Program {
   // Where run_rhs deposits the call arguments.
@@ -69,25 +72,102 @@ RhsProgram compile_rhs(const mir::FunDef& f,
                        int n_y, int n_theta, int n_x_r,
                        const std::vector<int>& x_i);
 
-// Evaluate. The register file is reused between calls (one per scalar type),
-// which is what makes a call allocation-free; the compiler guarantees every
-// register is written before it is read, so leftovers are never observed.
+// Build an immutable double-forward/generated-reverse derivative payload from
+// a compiled RHS. The canonical RhsProgram is copied before checkpoint saves
+// are inserted, so callers always retain it as the exact var-replay oracle.
+// Programs with runtime control flow or another unsupported derivative opcode
+// return null and keep that oracle path.
+std::shared_ptr<const IslandProg> make_rhs_adjoint_program(
+    const RhsProgram& rhs, std::string* refusal = nullptr);
+
+// Evaluate. The register file is reused between calls (one per result scalar
+// type), which keeps the register-machine body allocation-free after first
+// use; the compiler guarantees every register is written before it is read,
+// so leftovers are never observed. y and theta may have different scalar
+// types: seed them straight into the result-typed registers instead of
+// allocating promoted vectors for every integrator callback.
+//
+// Promotions deliberately retain the old order: y, every source theta
+// (including an unused lowering placeholder), t, then x_r. Besides keeping
+// values identical, this preserves stan-math's var/nochain node creation order
+// from when y and theta were staged in vectors before the call.
 // Not reentrant, which is fine: an ODE right-hand side cannot solve an ODE.
 template <typename T>
-void run_rhs(const RhsProgram& p, const T& t, const T* y, const T* th,
-             const double* xr, std::vector<T>& out) {
+std::vector<T>& rhs_regs() {
   static thread_local std::vector<T> reg;
+  return reg;
+}
+
+namespace detail {
+
+template <typename T, typename T_time, typename T_y, typename T_theta>
+void seed_rhs_regs(const RhsProgram& p, const T_time& t, const T_y* y,
+                   const T_theta* th, size_t n_th_source, const double* xr,
+                   std::vector<T>& reg) {
   if ((int)reg.size() < p.n_regs) reg.resize((size_t)p.n_regs);
-  reg[(size_t)p.t_reg] = t;
-  for (int i = 0; i < p.n_y; ++i) reg[(size_t)(p.y0 + i)] = y[i];
-  for (int i = 0; i < p.n_th; ++i) reg[(size_t)(p.th0 + i)] = th[i];
+  for (int i = 0; i < p.n_y; ++i) reg[(size_t)(p.y0 + i)] = T(y[i]);
+  for (int i = 0; i < p.n_th; ++i) reg[(size_t)(p.th0 + i)] = T(th[i]);
+  for (size_t i = (size_t)p.n_th; i < n_th_source; ++i) {
+    [[maybe_unused]] const T promoted(th[i]);
+  }
+  reg[(size_t)p.t_reg] = T(t);
   for (int i = 0; i < p.n_xr; ++i) reg[(size_t)(p.xr0 + i)] = T(xr[i]);
+}
+
+template <typename T, typename T_time, typename T_y, typename T_theta>
+std::vector<T>& eval_rhs_regs(const RhsProgram& p, const T_time& t,
+                              const T_y* y, const T_theta* th,
+                              size_t n_th_source, const double* xr) {
+  std::vector<T>& reg = rhs_regs<T>();
+  seed_rhs_regs<T>(p, t, y, th, n_th_source, xr, reg);
 
   run_program(p, reg);
+  return reg;
+}
 
+}  // namespace detail
+
+// Caller-owned output form for hot callback adapters. The destination must
+// hold p.out_regs.size() scalars and must not alias the reusable register file.
+// Unlike the vector wrapper below this performs no output allocation.
+template <typename T, typename T_time, typename T_y, typename T_theta>
+void run_rhs_into(const RhsProgram& p, const T_time& t, const T_y* y,
+                  const T_theta* th, size_t n_th_source, const double* xr,
+                  T* out) {
+  const std::vector<T>& reg =
+      detail::eval_rhs_regs<T>(p, t, y, th, n_th_source, xr);
+  for (size_t i = 0; i < p.out_regs.size(); ++i)
+    out[i] = reg[(size_t)p.out_regs[i]];
+}
+
+template <typename T, typename T_time, typename T_y, typename T_theta>
+void run_rhs(const RhsProgram& p, const T_time& t, const T_y* y,
+             const T_theta* th, size_t n_th_source, const double* xr,
+             std::vector<T>& out) {
+  const std::vector<T>& reg =
+      detail::eval_rhs_regs<T>(p, t, y, th, n_th_source, xr);
+
+  // Keep resize after the program replay, as in the original adapter. Besides
+  // retaining allocation behavior for existing callers, this leaves the
+  // observable var/nochain tape order unchanged.
   out.resize(p.out_regs.size());
   for (size_t i = 0; i < p.out_regs.size(); ++i)
     out[i] = reg[(size_t)p.out_regs[i]];
+}
+
+// Compatibility entry for the register program's existing callers. A normal
+// RHS has exactly p.n_th source values; the ODE adapter above uses the sized
+// overload when lowering supplied an extra, deliberately unread placeholder.
+template <typename T, typename T_time, typename T_y, typename T_theta>
+void run_rhs(const RhsProgram& p, const T_time& t, const T_y* y,
+             const T_theta* th, const double* xr, std::vector<T>& out) {
+  run_rhs<T>(p, t, y, th, (size_t)p.n_th, xr, out);
+}
+
+template <typename T, typename T_time, typename T_y, typename T_theta>
+void run_rhs_into(const RhsProgram& p, const T_time& t, const T_y* y,
+                  const T_theta* th, const double* xr, T* out) {
+  run_rhs_into<T>(p, t, y, th, (size_t)p.n_th, xr, out);
 }
 
 }  // namespace stanli

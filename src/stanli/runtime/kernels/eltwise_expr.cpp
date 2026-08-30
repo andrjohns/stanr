@@ -330,10 +330,9 @@ void cumsum_bwd(KernelCtx& ctx) {
   ctx.in_adj[0].data[0] += radj[0];
 }
 
-void logv_fwd(KernelCtx& ctx) {
-  for (int64_t i = 0; i < ctx.out.len; ++i)
-    ctx.out.data[i] = std::log(ctx.in[0].data[i]);
-}
+// Eigen's packet log, a ulp off libm on some arguments. The matching packet
+// exp is NOT taken: it puts kronecker_gp over its reference gate.
+void logv_fwd(KernelCtx& ctx) { out_a(ctx) = in_a(ctx, 0).log(); }
 void logv_bwd(KernelCtx& ctx) {
   if (!ctx.in_adj[0].data) return;
   if (ctx.out.len == 1)
@@ -442,6 +441,54 @@ void mean_bwd(KernelCtx& ctx) {
   for (int64_t i = 0; i < ctx.in[0].len; ++i) ctx.in_adj[0].data[i] += d;
 }
 
+// Sample variance and standard deviation mirror the Stan Math rev overloads:
+// both use an owning-style Eigen reduction, and sd uses the same small-spread
+// derivative fallback instead of dividing by a nearly zero result.
+template <bool StdDev>
+void dispersion_fwd(KernelCtx& ctx) {
+  const int64_t n = ctx.in[0].len;
+  if (n == 1) {
+    ctx.out.data[0] = 0.0;
+    ctx.scratch[0] = 0.0;
+    return;
+  }
+  using Vec = Eigen::Matrix<double, Eigen::Dynamic, 1>;
+  const Eigen::Map<const Vec> input(ctx.in[0].data, n);
+  // The AoS rev overload first materializes values into an owning vector,
+  // then lets Eigen reduce both the mean and squared norm. Preserve those
+  // packet groupings rather than folding the squared differences by hand.
+  const Vec values = input;
+  const double mean = values.mean();
+  const Vec diff = values.array() - mean;
+  const double sum_of_squares = diff.squaredNorm();
+  const double size_m1 = static_cast<double>(n - 1);
+  const double variance = sum_of_squares / size_m1;
+  ctx.out.data[0] = StdDev ? std::sqrt(variance) : variance;
+  if constexpr (StdDev) {
+    if (sum_of_squares < 1e-20) {
+      const double partial = 1.0 / std::sqrt(static_cast<double>(n));
+      for (int64_t i = 0; i < n; ++i) ctx.scratch[i] = partial;
+    } else {
+      const double denominator = ctx.out.data[0] * size_m1;
+      for (int64_t i = 0; i < n; ++i) ctx.scratch[i] = diff(i) / denominator;
+    }
+  } else {
+    for (int64_t i = 0; i < n; ++i) ctx.scratch[i] = 2.0 * diff(i) / size_m1;
+  }
+}
+
+void dispersion_bwd(KernelCtx& ctx) {
+  // Stan Math returns a disconnected constant for a singleton, so even an
+  // infinite upstream adjoint must not form inf * 0 and poison the input.
+  if (!ctx.in_adj[0].data || ctx.in[0].len == 1) return;
+  for (int64_t i = 0; i < ctx.in[0].len; ++i)
+    ctx.in_adj[0].data[i] += ctx.out_adj * ctx.scratch[i];
+}
+
+int64_t dispersion_scratch(const Op& op, const Slot* slots) {
+  return slots[op.in[0]].len;
+}
+
 // rep_vector(x, n): out[i] = x; scalar adjoint accumulates ascending.
 void repv_fwd(KernelCtx& ctx) {
   for (int64_t i = 0; i < ctx.out.len; ++i) ctx.out.data[i] = ctx.in[0].data[0];
@@ -503,6 +550,10 @@ void register_eltwise_kernels() {
   register_kernel(OP_LOG1M, Kernel{log1mv_fwd, log1mv_bwd, nullptr});
   register_kernel(OP_LOGIT, Kernel{logitv_fwd, logitv_bwd, nullptr});
   register_kernel(OP_MEAN, Kernel{mean_fwd, mean_bwd, nullptr});
+  register_kernel(
+      OP_SD, Kernel{dispersion_fwd<true>, dispersion_bwd, dispersion_scratch});
+  register_kernel(OP_VARIANCE, Kernel{dispersion_fwd<false>, dispersion_bwd,
+                                      dispersion_scratch});
   register_kernel(OP_REP_VEC, Kernel{repv_fwd, repv_bwd, nullptr});
 }
 

@@ -1,13 +1,96 @@
 #include <stanli/wa_interp.hpp>
 
+#include <stanli/mir_interp.hpp>
+
 #include <stan/math.hpp>
 
 #include <Eigen/Dense>
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace stanli {
+
+size_t scalar_rng_arity(ScalarRng family) {
+  switch (family) {
+    case ScalarRng::PoissonLog:
+    case ScalarRng::Bernoulli:
+      return 1;
+    case ScalarRng::Uniform:
+    case ScalarRng::Normal:
+    case ScalarRng::Lognormal:
+    case ScalarRng::Binomial:
+      return 2;
+  }
+  throw std::logic_error("unknown scalar RNG family");
+}
+
+bool scalar_rng_is_int(ScalarRng family) {
+  return family == ScalarRng::PoissonLog || family == ScalarRng::Bernoulli ||
+         family == ScalarRng::Binomial;
+}
+
+double scalar_rng_draw(ScalarRng family, const double* args, size_t nargs,
+                       WaRng& rng) {
+  if (nargs != scalar_rng_arity(family) || (nargs != 0 && args == nullptr))
+    throw std::logic_error("malformed scalar RNG arguments");
+  stan::rng_t& g = rng.gen();
+  switch (family) {
+    case ScalarRng::PoissonLog:
+      return static_cast<double>(stan::math::poisson_log_rng(args[0], g));
+    case ScalarRng::Uniform:
+      return stan::math::uniform_rng(args[0], args[1], g);
+    case ScalarRng::Bernoulli:
+      return static_cast<double>(stan::math::bernoulli_rng(args[0], g));
+    case ScalarRng::Normal:
+      return stan::math::normal_rng(args[0], args[1], g);
+    case ScalarRng::Lognormal:
+      return stan::math::lognormal_rng(args[0], args[1], g);
+    case ScalarRng::Binomial:
+      return static_cast<double>(
+          stan::math::binomial_rng(static_cast<int>(args[0]), args[1], g));
+  }
+  throw std::logic_error("unknown scalar RNG family");
+}
+
+int categorical_rng_draw(const double* probabilities, size_t size, WaRng& rng) {
+  if (size != 0 && probabilities == nullptr)
+    throw std::logic_error("malformed categorical RNG arguments");
+  Eigen::VectorXd theta(static_cast<Eigen::Index>(size));
+  for (size_t i = 0; i < size; ++i)
+    theta[static_cast<Eigen::Index>(i)] = probabilities[i];
+  return stan::math::categorical_rng(theta, rng.gen());
+}
+
+void multi_normal_rng_draw(const double* location, size_t location_size,
+                           const double* covariance, size_t covariance_size,
+                           size_t covariance_rows, size_t covariance_cols,
+                           double* output, size_t output_size, WaRng& rng) {
+  if ((location_size != 0 && location == nullptr) ||
+      (covariance_size != 0 && covariance == nullptr) ||
+      (output_size != 0 && output == nullptr) || output_size != location_size ||
+      (covariance_rows != 0 &&
+       covariance_cols >
+           std::numeric_limits<size_t>::max() / covariance_rows) ||
+      covariance_rows * covariance_cols != covariance_size)
+    throw std::logic_error("malformed multi-normal RNG arguments");
+
+  Eigen::VectorXd mu(static_cast<Eigen::Index>(location_size));
+  for (size_t i = 0; i < location_size; ++i)
+    mu[static_cast<Eigen::Index>(i)] = location[i];
+  Eigen::MatrixXd sigma(static_cast<Eigen::Index>(covariance_rows),
+                        static_cast<Eigen::Index>(covariance_cols));
+  for (size_t j = 0; j < covariance_cols; ++j)
+    for (size_t i = 0; i < covariance_rows; ++i)
+      sigma(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j)) =
+          covariance[j * covariance_rows + i];
+
+  const Eigen::VectorXd draw =
+      stan::math::multi_normal_rng(mu, sigma, rng.gen());
+  for (size_t i = 0; i < output_size; ++i)
+    output[i] = draw[static_cast<Eigen::Index>(i)];
+}
 
 double wa_probe_point(int64_t i, int variant) {
   switch (variant) {
@@ -52,7 +135,8 @@ std::vector<double> WaInterp::eval(
     return false;
   };
   h.fun = [this, &cur, &rng](const mir::Expr& e, DataMap::Entry* out) {
-    return rng_fun(*cur, e, out, rng) || ode_fun(*cur, e, out);
+    return rng_fun(*cur, e, out, rng) || ode_fun(*cur, e, out) ||
+           algebra_fun(*cur, e, out);
   };
   MirInterp<double> in(funs_, "write_array", std::move(h));
   cur = &in;
@@ -178,11 +262,52 @@ struct InterpRhs {
   }
 };
 
+// The algebraic system handed to stan-math's legacy Powell solver.  As with
+// InterpRhs, the apparently double-only write_array path still needs a
+// templated callback: stan-math differentiates the system with respect to
+// the unknown vector internally to form the Newton step.
+struct InterpAlgebraSystem {
+  const std::map<std::string, const mir::FunDef*>* funs;
+  const mir::FunDef* system;
+
+  template <typename T_x, typename T_y>
+  Eigen::Matrix<stan::return_type_t<typename T_x::Scalar, typename T_y::Scalar>,
+                Eigen::Dynamic, 1>
+  operator()(const T_x& x, const T_y& y, const std::vector<double>& x_r,
+             const std::vector<int>& x_i, std::ostream* = nullptr) const {
+    using T = stan::return_type_t<typename T_x::Scalar, typename T_y::Scalar>;
+    std::vector<std::vector<T>> reals(3);
+    reals[0].reserve(static_cast<size_t>(x.size()));
+    reals[1].reserve(static_cast<size_t>(y.size()));
+    reals[2].reserve(x_r.size());
+    for (Eigen::Index i = 0; i < x.size(); ++i) reals[0].push_back(T(x(i)));
+    for (Eigen::Index i = 0; i < y.size(); ++i) reals[1].push_back(T(y(i)));
+    for (double value : x_r) reals[2].push_back(T(value));
+
+    MirInterp<T> ev(*funs, "algebraic system");
+    const std::vector<T> result = ev.call(*system, reals, {x_i});
+    Eigen::Matrix<T, Eigen::Dynamic, 1> out(
+        static_cast<Eigen::Index>(result.size()));
+    for (size_t i = 0; i < result.size(); ++i)
+      out(static_cast<Eigen::Index>(i)) = result[i];
+    return out;
+  }
+};
+
 }  // namespace
 
 bool WaInterp::ode_fun(MirInterp<double>& in, const mir::Expr& e,
                        DataMap::Entry* out) {
-  if (e.name.rfind("integrate_ode_", 0) != 0) return false;
+  enum class LegacySolver { RK45, BDF, ADAMS };
+  LegacySolver solver;
+  if (e.name == "integrate_ode_rk45")
+    solver = LegacySolver::RK45;
+  else if (e.name == "integrate_ode_bdf")
+    solver = LegacySolver::BDF;
+  else if (e.name == "integrate_ode_adams")
+    solver = LegacySolver::ADAMS;
+  else
+    return false;
   if (e.args.size() < 7)
     throw CompileError("stanli write_array: " + e.name + " arity");
   auto fit = funs_.find(e.args[0].name);
@@ -199,22 +324,33 @@ bool WaInterp::ode_fun(MirInterp<double>& in, const mir::Expr& e,
   std::vector<int> x_i = xie.i;
   if (x_i.empty())
     for (double v : xie.r) x_i.push_back((int)v);
-  const bool stiff = e.name.find("bdf") != std::string::npos;
+  const bool multistep =
+      solver == LegacySolver::BDF || solver == LegacySolver::ADAMS;
   // Solver defaults match the lowering's (and stan-math's own): rk45
-  // 1e-6/1e-6/1e6, bdf 1e-10/1e-10/1e8.
-  double rtol = stiff ? 1e-10 : 1e-6, atol = rtol;
-  long max_steps = stiff ? 100000000 : 1000000;
+  // 1e-6/1e-6/1e6, BDF and Adams 1e-10/1e-10/1e8.
+  double rtol = multistep ? 1e-10 : 1e-6, atol = rtol;
+  long max_steps = multistep ? 100000000 : 1000000;
   if (e.args.size() >= 10) {
     rtol = vec(7).at(0);
     atol = vec(8).at(0);
     max_steps = (long)vec(9).at(0);
   }
   InterpRhs f{&funs_, fit->second};
-  const auto sol =
-      stiff ? stan::math::integrate_ode_bdf(f, z0, t0, ts, theta, x_r, x_i,
-                                            nullptr, rtol, atol, max_steps)
-            : stan::math::integrate_ode_rk45(f, z0, t0, ts, theta, x_r, x_i,
-                                             nullptr, rtol, atol, max_steps);
+  std::vector<std::vector<double>> sol;
+  switch (solver) {
+    case LegacySolver::RK45:
+      sol = stan::math::integrate_ode_rk45(f, z0, t0, ts, theta, x_r, x_i,
+                                           nullptr, rtol, atol, max_steps);
+      break;
+    case LegacySolver::BDF:
+      sol = stan::math::integrate_ode_bdf(f, z0, t0, ts, theta, x_r, x_i,
+                                          nullptr, rtol, atol, max_steps);
+      break;
+    case LegacySolver::ADAMS:
+      sol = stan::math::integrate_ode_adams(f, z0, t0, ts, theta, x_r, x_i,
+                                            nullptr, rtol, atol, max_steps);
+      break;
+  }
   // array[N, S]: Fortran storage to match the interpreter's N-D indexing.
   const int64_t N = (int64_t)sol.size();
   const int64_t S = N > 0 ? (int64_t)sol[0].size() : 0;
@@ -226,9 +362,59 @@ bool WaInterp::ode_fun(MirInterp<double>& in, const mir::Expr& e,
   return true;
 }
 
+bool WaInterp::algebra_fun(MirInterp<double>& in, const mir::Expr& e,
+                           DataMap::Entry* out) {
+  if (e.name != "algebra_solver") return false;
+  if (e.args.size() != 5 && e.args.size() != 8)
+    throw CompileError("stanli write_array: algebra_solver arity");
+  const auto fit = funs_.find(e.args[0].name);
+  if (fit == funs_.end())
+    throw CompileError("stanli write_array: unknown algebraic system " +
+                       e.args[0].name);
+
+  const auto vec = [&](size_t k) { return in.eval(e.args[k]).r; };
+  const std::vector<double> xv = vec(1);
+  const std::vector<double> yv = vec(2);
+  const std::vector<double> x_r = vec(3);
+  DataMap::Entry xie = in.eval(e.args[4]);
+  std::vector<int> x_i = xie.i;
+  if (x_i.empty())
+    for (double value : xie.r) x_i.push_back(static_cast<int>(value));
+
+  // These are the legacy algebra_solver defaults, matching AlgebraSpec and
+  // stan-math's generated-model interface.  The eight-argument overload
+  // supplies relative tolerance, function tolerance, and step limit.
+  double relative_tolerance = 1e-10;
+  double function_tolerance = 1e-6;
+  int64_t max_num_steps = 1000;
+  if (e.args.size() == 8) {
+    relative_tolerance = vec(5).at(0);
+    function_tolerance = vec(6).at(0);
+    max_num_steps = static_cast<int64_t>(vec(7).at(0));
+  }
+
+  Eigen::VectorXd x(static_cast<Eigen::Index>(xv.size()));
+  Eigen::VectorXd y(static_cast<Eigen::Index>(yv.size()));
+  for (size_t i = 0; i < xv.size(); ++i)
+    x(static_cast<Eigen::Index>(i)) = xv[i];
+  for (size_t i = 0; i < yv.size(); ++i)
+    y(static_cast<Eigen::Index>(i)) = yv[i];
+
+  const Eigen::VectorXd solved = stan::math::algebra_solver(
+      InterpAlgebraSystem{&funs_, fit->second}, x, y, x_r, x_i, nullptr,
+      relative_tolerance, function_tolerance, max_num_steps);
+  out->is_int = false;
+  out->i.clear();
+  out->dims = {static_cast<int64_t>(solved.size())};
+  out->r.resize(static_cast<size_t>(solved.size()));
+  for (Eigen::Index i = 0; i < solved.size(); ++i)
+    out->r[static_cast<size_t>(i)] = solved(i);
+  return true;
+}
+
 bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
                        DataMap::Entry* out, WaRng& rng) {
-  boost::ecuyer1988& g = rng.gen();
+  stan::rng_t& g = rng.gen();
   const std::string& f = e.name;
   if (f.size() < 5 || f.compare(f.size() - 4, 4, "_rng") != 0) return false;
   const std::string base = f.substr(0, f.size() - 4);
@@ -241,32 +427,44 @@ bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
   };
 
   // Vector-valued draw from a mean vector and covariance (or Cholesky
-  // factor) matrix.
+  // factor) matrix. The covariance form shares its owning-Eigen helper with
+  // OP_RNG so validation and engine schedules cannot drift between modes.
   if (base == "multi_normal" || base == "multi_normal_cholesky") {
     const auto& mu = av.at(0);
     const auto& S = av.at(1);
     const int64_t K = (int64_t)mu.r.size();
-    Eigen::VectorXd m(K);
-    for (int64_t i = 0; i < K; ++i) m[i] = mu.r[(size_t)i];
-    Eigen::MatrixXd sig(K, K);
-    for (int64_t j = 0; j < K; ++j)
-      for (int64_t i = 0; i < K; ++i) sig(i, j) = S.r.at((size_t)(j * K + i));
-    const Eigen::VectorXd draw =
-        base == "multi_normal"
-            ? stan::math::multi_normal_rng(m, sig, g)
-            : stan::math::multi_normal_cholesky_rng(m, sig, g);
     out->dims = {K};
-    for (int64_t i = 0; i < K; ++i) out->r.push_back(draw[i]);
+    out->r.resize(static_cast<size_t>(K));
+    if (base == "multi_normal") {
+      if (S.dims.size() != 2)
+        throw std::logic_error("malformed multi-normal covariance shape");
+      multi_normal_rng_draw(mu.r.data(), mu.r.size(), S.r.data(), S.r.size(),
+                            static_cast<size_t>(S.dims[0]),
+                            static_cast<size_t>(S.dims[1]), out->r.data(),
+                            out->r.size(), rng);
+    } else {
+      Eigen::VectorXd m(K);
+      for (int64_t i = 0; i < K; ++i) m[i] = mu.r[(size_t)i];
+      Eigen::MatrixXd sig(K, K);
+      for (int64_t j = 0; j < K; ++j)
+        for (int64_t i = 0; i < K; ++i) sig(i, j) = S.r.at((size_t)(j * K + i));
+      const Eigen::VectorXd draw =
+          stan::math::multi_normal_cholesky_rng(m, sig, g);
+      for (int64_t i = 0; i < K; ++i) out->r[static_cast<size_t>(i)] = draw[i];
+    }
     return true;
   }
 
   // Whole-vector argument, one categorical draw.
   if (base == "categorical" || base == "categorical_logit") {
-    Eigen::VectorXd th((int64_t)av.at(0).r.size());
-    for (size_t i = 0; i < av[0].r.size(); ++i) th[(int64_t)i] = av[0].r[i];
-    const int k = base == "categorical"
-                      ? stan::math::categorical_rng(th, g)
-                      : stan::math::categorical_logit_rng(th, g);
+    int k = 0;
+    if (base == "categorical") {
+      k = categorical_rng_draw(av.at(0).r.data(), av.at(0).r.size(), rng);
+    } else {
+      Eigen::VectorXd th((int64_t)av.at(0).r.size());
+      for (size_t i = 0; i < av[0].r.size(); ++i) th[(int64_t)i] = av[0].r[i];
+      k = stan::math::categorical_logit_rng(th, g);
+    }
     out->is_int = true;
     out->i = {k};
     out->r = {(double)k};
@@ -283,13 +481,16 @@ bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
     int vi = 0;
     bool iv = false;
     if (base == "normal") {
-      v = stan::math::normal_rng(sc(0, i), sc(1, i), g);
+      const double args[] = {sc(0, i), sc(1, i)};
+      v = scalar_rng_draw(ScalarRng::Normal, args, 2, rng);
     } else if (base == "std_normal") {
       v = stan::math::std_normal_rng(g);
     } else if (base == "lognormal") {
-      v = stan::math::lognormal_rng(sc(0, i), sc(1, i), g);
+      const double args[] = {sc(0, i), sc(1, i)};
+      v = scalar_rng_draw(ScalarRng::Lognormal, args, 2, rng);
     } else if (base == "uniform") {
-      v = stan::math::uniform_rng(sc(0, i), sc(1, i), g);
+      const double args[] = {sc(0, i), sc(1, i)};
+      v = scalar_rng_draw(ScalarRng::Uniform, args, 2, rng);
     } else if (base == "gamma") {
       v = stan::math::gamma_rng(sc(0, i), sc(1, i), g);
     } else if (base == "inv_gamma") {
@@ -311,19 +512,24 @@ bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
     } else if (base == "weibull") {
       v = stan::math::weibull_rng(sc(0, i), sc(1, i), g);
     } else if (base == "bernoulli") {
-      vi = stan::math::bernoulli_rng(sc(0, i), g);
+      const double args[] = {sc(0, i)};
+      vi =
+          static_cast<int>(scalar_rng_draw(ScalarRng::Bernoulli, args, 1, rng));
       iv = true;
     } else if (base == "bernoulli_logit") {
       vi = stan::math::bernoulli_logit_rng(sc(0, i), g);
       iv = true;
     } else if (base == "binomial") {
-      vi = stan::math::binomial_rng((int)sc(0, i), sc(1, i), g);
+      const double args[] = {sc(0, i), sc(1, i)};
+      vi = static_cast<int>(scalar_rng_draw(ScalarRng::Binomial, args, 2, rng));
       iv = true;
     } else if (base == "poisson") {
       vi = stan::math::poisson_rng(sc(0, i), g);
       iv = true;
     } else if (base == "poisson_log") {
-      vi = stan::math::poisson_log_rng(sc(0, i), g);
+      const double args[] = {sc(0, i)};
+      vi = static_cast<int>(
+          scalar_rng_draw(ScalarRng::PoissonLog, args, 1, rng));
       iv = true;
     } else if (base == "neg_binomial_2") {
       vi = stan::math::neg_binomial_2_rng(sc(0, i), sc(1, i), g);

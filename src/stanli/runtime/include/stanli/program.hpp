@@ -24,9 +24,11 @@
 
 #include <stan/math.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace stanli {
@@ -50,47 +52,69 @@ enum ProgramOpFlag : uint16_t {
   kProgramSaveOut = 1u << 7,
   kProgramNoOutput = 1u << 8,
   kProgramRangeOutput = 1u << 9,
+  kProgramReadB = 1u << 10,
+  kProgramReadC = 1u << 11,
 };
 
-#define STANLI_PROGRAM_CODE_LIST(X)                                       \
-  X(CONST, kProgramNoInputs)                                              \
-  X(CONSTR, kProgramNoInputs | kProgramRangeOutput)                       \
-  X(MOV, 0)                                                               \
-  X(MOVR, kProgramRangeA | kProgramRangeOutput)                           \
-  X(ADD, 0)                                                               \
-  X(SUB, 0)                                                               \
-  X(MUL, kProgramSaveA | kProgramSaveB)                                   \
-  X(DIV, kProgramSaveA | kProgramSaveB)                                   \
-  X(POW, kProgramSaveA | kProgramSaveB | kProgramSaveOut)                 \
-  X(FMAX, kProgramSaveA | kProgramSaveB)                                  \
-  X(FMIN, kProgramSaveA | kProgramSaveB)                                  \
-  X(NEG, 0)                                                               \
-  X(EXP, kProgramSaveOut)                                                 \
-  X(LOG, kProgramSaveA)                                                   \
-  X(SQRT, kProgramSaveOut)                                                \
-  X(SQUARE, kProgramSaveA)                                                \
-  X(INV, kProgramSaveA)                                                   \
-  X(FABS, kProgramSaveA)                                                  \
-  X(INV_LOGIT, kProgramSaveOut)                                           \
-  X(LOG1M, kProgramSaveA)                                                 \
-  X(TANH, kProgramSaveA)                                                  \
-  X(GT, 0)                                                                \
-  X(GE, 0)                                                                \
-  X(LT, 0)                                                                \
-  X(LE, 0)                                                                \
-  X(EQ, 0)                                                                \
-  X(NE, 0)                                                                \
-  X(JZ, kProgramNoAdjoint | kProgramNoOutput)                             \
-  X(JMP, kProgramNoAdjoint | kProgramNoOutput)                            \
-  X(LOG_RANGE, kProgramRangeA | kProgramSaveA | kProgramRangeOutput)      \
-  X(EXP_RANGE, kProgramRangeA | kProgramSaveOut | kProgramRangeOutput)    \
-  X(DOT, kProgramRangeA | kProgramRangeB | kProgramSaveA | kProgramSaveB) \
-  X(LSE_RANGE, kProgramRangeA | kProgramSaveA | kProgramSaveOut)          \
-  X(SOFTMAX, kProgramRangeA | kProgramSaveOut | kProgramRangeOutput)      \
-  X(LSE2, kProgramSaveA | kProgramSaveB)                                  \
-  X(LOG_MIX, kProgramSaveA | kProgramSaveB | kProgramSaveC)               \
-  X(FMA, kProgramSaveA | kProgramSaveB)                                   \
-  X(DENSITY, 0)                                                           \
+// `a` is an operand wherever kProgramNoInputs is absent; b and c are not,
+// and the ones that are not hold register zero rather than nothing, so
+// which registers a program actually reads needs saying. DENSITY's arity
+// decides its own (program_density.hpp) and CALL's payload decides its own.
+#define STANLI_PROGRAM_CODE_LIST(X)                                          \
+  X(CONST, kProgramNoInputs)                                                 \
+  X(CONSTR, kProgramNoInputs | kProgramRangeOutput)                          \
+  X(MOV, 0)                                                                  \
+  X(MOVR, kProgramRangeA | kProgramRangeOutput)                              \
+  X(ADD, kProgramReadB)                                                      \
+  X(SUB, kProgramReadB)                                                      \
+  X(MUL, kProgramReadB | kProgramSaveA | kProgramSaveB)                      \
+  X(DIV, kProgramReadB | kProgramSaveA | kProgramSaveB)                      \
+  X(IDIV, kProgramReadB | kProgramNoAdjoint)                                 \
+  X(POW, kProgramReadB | kProgramSaveA | kProgramSaveB | kProgramSaveOut)    \
+  X(FMAX, kProgramReadB | kProgramSaveA | kProgramSaveB)                     \
+  X(FMIN, kProgramReadB | kProgramSaveA | kProgramSaveB)                     \
+  X(NEG, 0)                                                                  \
+  X(EXP, kProgramSaveOut)                                                    \
+  X(LOG, kProgramSaveA)                                                      \
+  X(SQRT, kProgramSaveOut)                                                   \
+  X(SQUARE, kProgramSaveA)                                                   \
+  X(INV, kProgramSaveA)                                                      \
+  X(FABS, kProgramSaveA)                                                     \
+  X(INV_LOGIT, kProgramSaveOut)                                              \
+  X(LOG1M, kProgramSaveA)                                                    \
+  X(LOG1P_EXP, kProgramSaveA)                                                \
+  X(TANH, kProgramSaveA)                                                     \
+  X(GT, kProgramReadB)                                                       \
+  X(GE, kProgramReadB)                                                       \
+  X(LT, kProgramReadB)                                                       \
+  X(LE, kProgramReadB)                                                       \
+  X(EQ, kProgramReadB)                                                       \
+  X(NE, kProgramReadB)                                                       \
+  X(DYN_INDEX, kProgramReadB | kProgramNoAdjoint)                            \
+  X(MAX_RANGE, kProgramRangeA | kProgramNoAdjoint)                           \
+  X(JZ, kProgramNoAdjoint | kProgramNoOutput)                                \
+  X(JMP, kProgramNoInputs | kProgramNoAdjoint | kProgramNoOutput)            \
+  X(LOG_RANGE, kProgramRangeA | kProgramSaveA | kProgramRangeOutput)         \
+  X(EXP_RANGE, kProgramRangeA | kProgramSaveOut | kProgramRangeOutput)       \
+  X(DOT, kProgramRangeA | kProgramRangeB | kProgramReadB | kProgramSaveA |   \
+             kProgramSaveB)                                                  \
+  X(LSE_RANGE, kProgramRangeA | kProgramSaveA | kProgramSaveOut)             \
+  X(SOFTMAX, kProgramRangeA | kProgramSaveOut | kProgramRangeOutput)         \
+  X(LSE2, kProgramReadB | kProgramSaveA | kProgramSaveB)                     \
+  X(LOG_DIFF_EXP, kProgramReadB | kProgramSaveA | kProgramSaveB)             \
+  X(LOG_MIX, kProgramReadB | kProgramReadC | kProgramSaveA | kProgramSaveB | \
+                 kProgramSaveC)                                              \
+  X(FMA, kProgramReadB | kProgramReadC | kProgramSaveA | kProgramSaveB)      \
+  X(DIAG_PRE_MULTIPLY, kProgramReadB | kProgramNoAdjoint)                    \
+  X(DIAG_POST_MULTIPLY, kProgramReadB | kProgramNoAdjoint)                   \
+  X(MATRIX_EXP, kProgramRangeA | kProgramRangeOutput | kProgramNoAdjoint)    \
+  X(MDIVIDE_LEFT, kProgramRangeA | kProgramRangeB | kProgramReadB |          \
+                      kProgramRangeOutput | kProgramNoAdjoint)               \
+  X(MDIVIDE_RIGHT_SPD, kProgramRangeA | kProgramRangeB | kProgramReadB |     \
+                           kProgramRangeOutput | kProgramNoAdjoint)          \
+  X(QUAD_FORM_SYM, kProgramRangeA | kProgramRangeB | kProgramReadB |         \
+                       kProgramRangeOutput | kProgramNoAdjoint)              \
+  X(DENSITY, 0)                                                              \
   X(CALL, 0)
 
 struct Program {
@@ -101,8 +125,8 @@ struct Program {
     // CONST/CONSTR, MOV/MOVR, arithmetic, comparisons, jumps, ranged
     // arithmetic, densities, and CALL appear above in that order. Their
     // exact execution semantics live in run_program below.
-    // Any scalar continuous density: `len` selects which
-    // (program_density.hpp). One opcode rather than one per density is
+    // Any scalar continuous density or distribution function: `len` selects
+    // which (program_density.hpp). One opcode rather than one per function is
     // what lets the machine speak the runtime's whole list instead of a
     // hand-picked subset of it.
     //
@@ -118,8 +142,9 @@ struct Program {
     // propto-OFF only (the island carver refuses propto). With no
     // term-dropping the value does not depend on which arguments are
     // autodiff, so binding all of them as T reproduces the scalar op's
-    // value exactly; the extra partials computed for data arguments are
-    // discarded when the executor hands the island a null adjoint.
+    // value exactly. The backward is where activity matters, and it is
+    // the generated adjoint that carries the per-argument mask
+    // (adjoint.hpp).
     // Any graph kernel, by opcode: the payload is calls[a]. This is the
     // union point with the graph executor -- one instruction gives the
     // register machine the graph's whole vocabulary, and its derivative
@@ -140,7 +165,7 @@ struct Program {
   // way every value is. `bwd_in`/`bwd_out` are where the VALUES live at
   // backward time -- the same registers, unless the adjoint generator
   // had to checkpoint them (some kernel backwards re-read their inputs;
-  // backward_ignores_input_values is a whitelist, not a guarantee).
+  // backward_ignores_values is a whitelist, not a guarantee).
   struct Call {
     uint16_t opcode = 0;
     uint8_t variant = 0;
@@ -188,6 +213,9 @@ inline constexpr const ProgramOpSpec& program_code_spec(Program::Code code) {
 }
 
 inline constexpr int program_output_len(const Program::Instr& instr) {
+  if (instr.code == Program::DIAG_PRE_MULTIPLY ||
+      instr.code == Program::DIAG_POST_MULTIPLY)
+    return static_cast<int>(static_cast<int64_t>(instr.c) * instr.len);
   const ProgramOpSpec& spec = program_code_spec(instr.code);
   return spec.has(kProgramNoOutput)      ? 0
          : spec.has(kProgramRangeOutput) ? instr.len
@@ -196,6 +224,20 @@ inline constexpr int program_output_len(const Program::Instr& instr) {
 
 static_assert(program_code_count() == static_cast<size_t>(Program::CALL) + 1,
               "every Program::Code needs exactly one ProgramOpSpec");
+
+// Drop the initializer fills and the copies the MIR spells out, then
+// renumber away whatever registers that leaves unreferenced (program.cpp).
+// `seeded` names the register ranges the caller writes before the program
+// runs -- an ODE argument region, an island live-in -- and comes back in the
+// new numbering along with the program.
+void compact_program(Program& p, std::vector<std::pair<int, int>>& seeded);
+
+// Explicitly gate producer-destination forwarding and report whether it
+// changed the program. The original entry point above remains the public
+// default (and preserves its ABI); islands use this helper to price their
+// established compacted form before optimizing an accepted region.
+bool compact_program_gated(Program& p, std::vector<std::pair<int, int>>& seeded,
+                           bool enable_destination_forwarding);
 
 // Assemble the forward context for `call` over the register file `reg`.
 // Backward-only fields are left null; run_adjoint fills its own.
@@ -251,6 +293,11 @@ void run_program(const Program& p, T* reg) {
       case Program::DIV:
         d() = ra() / rb();
         break;
+      case Program::IDIV:
+        d() =
+            T(stan::math::divide(static_cast<int>(stan::math::value_of(ra())),
+                                 static_cast<int>(stan::math::value_of(rb()))));
+        break;
       case Program::POW:
         d() = stan::math::pow(ra(), rb());
         break;
@@ -287,6 +334,9 @@ void run_program(const Program& p, T* reg) {
       case Program::LOG1M:
         d() = stan::math::log1m(ra());
         break;
+      case Program::LOG1P_EXP:
+        d() = stan::math::log1p_exp(ra());
+        break;
       case Program::TANH:
         d() = stan::math::tanh(ra());
         break;
@@ -308,6 +358,21 @@ void run_program(const Program& p, T* reg) {
       case Program::NE:
         d() = T(stan::math::value_of(ra()) != stan::math::value_of(rb()));
         break;
+      case Program::DYN_INDEX: {
+        const double raw = stan::math::value_of(rb());
+        if (!std::isfinite(raw) || std::trunc(raw) != raw || raw < 1.0 ||
+            raw > static_cast<double>(I.len))
+          throw std::out_of_range("register-program index out of range");
+        d() = reg[(size_t)(I.a + I.c + static_cast<int32_t>(raw) - 1)];
+        break;
+      }
+      case Program::MAX_RANGE: {
+        std::vector<T> owning;
+        if (I.len > 0)
+          owning.assign(&reg[(size_t)I.a], &reg[(size_t)(I.a + I.len)]);
+        d() = stan::math::max(owning);
+        break;
+      }
       case Program::JZ:
         if (stan::math::value_of(ra()) == 0.0) pc = I.dst - 1;
         break;
@@ -347,16 +412,101 @@ void run_program(const Program& p, T* reg) {
       case Program::LSE2:
         d() = stan::math::log_sum_exp(ra(), rb());
         break;
+      case Program::LOG_DIFF_EXP:
+        d() = stan::math::log_diff_exp(ra(), rb());
+        break;
       case Program::LOG_MIX:
         d() = stan::math::log_mix(ra(), rb(), reg[(size_t)I.c]);
         break;
       case Program::FMA:
         d() = stan::math::fma(ra(), rb(), reg[(size_t)I.c]);
         break;
-        // One call for every scalar continuous density the runtime has;
-      // program_density.cpp holds the switch, so the 27 instantiations
-      // are paid in one translation unit instead of in every one that
-      // runs a program.
+      case Program::DIAG_PRE_MULTIPLY:
+      case Program::DIAG_POST_MULTIPLY: {
+        using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+        const int32_t rows = I.c, cols = I.len;
+        // A zero-size result contributes neither a value nor an adjoint.
+        // Avoid forming Maps from a null register file in the 0x0 case.
+        if (rows == 0 || cols == 0) break;
+        const int32_t vlen = I.code == Program::DIAG_PRE_MULTIPLY ? rows : cols;
+        Eigen::Map<const VecT> v(reg + I.a, vlen);
+        Eigen::Map<const MatT> m(reg + I.b, rows, cols);
+        Eigen::Map<MatT> out(reg + I.dst, rows, cols);
+        if (I.code == Program::DIAG_PRE_MULTIPLY)
+          out = stan::math::diag_pre_multiply(v, m);
+        else
+          out = stan::math::diag_post_multiply(m, v);
+        break;
+      }
+      case Program::MATRIX_EXP: {
+        using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+        const int32_t rows = I.b, cols = I.c;
+        if (rows == 0 || cols == 0) break;
+        Eigen::Map<const MatT> input(reg + I.a, rows, cols);
+        Eigen::Map<MatT> output(reg + I.dst, rows, cols);
+        output = stan::math::matrix_exp(input);
+        break;
+      }
+      case Program::MDIVIDE_LEFT: {
+        using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+        using VecT2 = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+        const int32_t nrow = std::abs(I.c);
+        if (nrow == 0 || I.len == 0) break;
+        Eigen::Map<const MatT> divisor(reg + I.a, nrow, nrow);
+        if (I.c < 0) {
+          Eigen::Map<const VecT2> rhs(reg + I.b, nrow);
+          Eigen::Map<VecT2> output(reg + I.dst, nrow);
+          output = stan::math::mdivide_left(divisor, rhs);
+        } else {
+          const int32_t ncol = nrow == 0 ? 0 : I.len / nrow;
+          Eigen::Map<const MatT> rhs(reg + I.b, nrow, ncol);
+          Eigen::Map<MatT> output(reg + I.dst, nrow, ncol);
+          output = stan::math::mdivide_left(divisor, rhs);
+        }
+        break;
+      }
+      case Program::MDIVIDE_RIGHT_SPD: {
+        using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+        using RowT = Eigen::Matrix<T, 1, Eigen::Dynamic>;
+        const int32_t ncol = std::abs(I.c);
+        if (ncol == 0 || I.len == 0) break;
+        Eigen::Map<const MatT> divisor(reg + I.a, ncol, ncol);
+        if (I.c < 0) {
+          Eigen::Map<const RowT> lhs(reg + I.b, ncol);
+          Eigen::Map<RowT> output(reg + I.dst, ncol);
+          output = stan::math::mdivide_right_spd(lhs, divisor);
+        } else {
+          const int32_t nrow = ncol == 0 ? 0 : I.len / ncol;
+          Eigen::Map<const MatT> lhs(reg + I.b, nrow, ncol);
+          Eigen::Map<MatT> output(reg + I.dst, nrow, ncol);
+          output = stan::math::mdivide_right_spd(lhs, divisor);
+        }
+        break;
+      }
+      case Program::QUAD_FORM_SYM: {
+        using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+        using VecT2 = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+        const int32_t nrow = std::abs(I.c);
+        if (nrow == 0) {
+          for (int32_t k = 0; k < I.len; ++k) reg[I.dst + k] = T(0.0);
+          break;
+        }
+        Eigen::Map<const MatT> a(reg + I.a, nrow, nrow);
+        if (I.c < 0) {
+          Eigen::Map<const VecT2> b(reg + I.b, nrow);
+          reg[(size_t)I.dst] = stan::math::quad_form_sym(a, b);
+        } else {
+          const int32_t ncol = static_cast<int32_t>(std::sqrt(I.len));
+          Eigen::Map<const MatT> b(reg + I.b, nrow, ncol);
+          Eigen::Map<MatT> output(reg + I.dst, ncol, ncol);
+          output = stan::math::quad_form_sym(a, b);
+        }
+        break;
+      }
+      // One call for every scalar continuous probability function the runtime
+      // has; program_density.cpp holds the switch, so the instantiations are
+      // paid in one translation unit instead of in every one that runs a
+      // program.
       case Program::CALL:
         if constexpr (std::is_same_v<T, double>) {
           run_call(p.calls[(size_t)I.a], reg);

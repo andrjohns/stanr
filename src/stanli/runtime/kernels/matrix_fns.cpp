@@ -1,14 +1,16 @@
 // Matrix-valued legacy ops: GP covariance, cholesky_decompose, diag_matrix,
-// multi_normal(_cholesky). Forward runs the prim (double) implementation;
-// backward replays the same call on a nested var tape and seeds the output
-// adjoints with the dot trick. Correct by construction against the code
-// CmdStan runs, at the cost of a nested tape per gradient.
+// multi_normal(_cholesky). Most forwards run the prim (double)
+// implementation and backwards replay the same call on a nested var tape,
+// seeded with the dot trick. The profiled single-vector Cholesky density below
+// is the compact native exception: it retains Stan Math's closed-form matrix
+// partials from forward to backward.
 //
 // Matrices live in slots column-major, matching Eigen and the rest of the
 // pipeline, so a flat slot maps straight onto Map<MatrixXd>.
 #include <stanli/graph.hpp>
 #include <stanli/legacy.hpp>
 #include <stanli/optable.hpp>
+#include <stanli/packet.hpp>
 
 #include <stan/math.hpp>
 
@@ -129,6 +131,190 @@ void chol_bwd(KernelCtx& ctx) {
              [](const auto& a) { return stan::math::cholesky_decompose(a); });
 }
 
+// ---- matrix_exp(A) ---------------------------------------------------------
+void matrix_exp_fwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0];
+  MapM(ctx.out.data, n, n) =
+      stan::math::matrix_exp(CMapM(ctx.in[0].data, n, n));
+}
+void matrix_exp_bwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0];
+  nary_bwd(ctx, [n](std::vector<VarV>& xs) {
+    Eigen::Map<VarM> a(xs[0].data(), n, n);
+    return stan::math::matrix_exp(a);
+  });
+}
+
+// ---- inverse / inverse_spd / log_determinant -----------------------------
+// All three use Stan Math itself in both sweeps. Inverse and log_determinant
+// have specialized rev overloads whose forward values are their double
+// implementations. inverse_spd is a scalar-templated LDLT, so its active
+// forward must run on Matrix<var> too: Eigen can otherwise choose different
+// packet arithmetic from the CmdStan expression.
+void inverse_fwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0];
+  MapM(ctx.out.data, n, n) = stan::math::inverse(CMapM(ctx.in[0].data, n, n));
+}
+void inverse_bwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0];
+  nary_bwd(ctx, [n](std::vector<VarV>& xs) {
+    Eigen::Map<VarM> a(xs[0].data(), n, n);
+    return stan::math::inverse(a);
+  });
+}
+
+void inverse_spd_fwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0];
+  if (ctx.variant == 0) {
+    MapM(ctx.out.data, n, n) =
+        stan::math::inverse_spd(CMapM(ctx.in[0].data, n, n));
+    return;
+  }
+  stan::math::nested_rev_autodiff nested;
+  VarM a(n, n);
+  for (int64_t i = 0; i < n * n; ++i) a.data()[i] = ctx.in[0].data[i];
+  MapM(ctx.out.data, n, n) = stan::math::value_of(stan::math::inverse_spd(a));
+}
+void inverse_spd_bwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0];
+  nary_bwd(ctx, [n](std::vector<VarV>& xs) {
+    Eigen::Map<VarM> a(xs[0].data(), n, n);
+    return stan::math::inverse_spd(a);
+  });
+}
+
+void log_det_fwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0];
+  ctx.out.data[0] = stan::math::log_determinant(CMapM(ctx.in[0].data, n, n));
+}
+void log_det_bwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0];
+  nary_bwd(ctx, [n](std::vector<VarV>& xs) {
+    Eigen::Map<VarM> a(xs[0].data(), n, n);
+    return stan::math::log_determinant(a);
+  });
+}
+
+// ---- quad_form(A, B) ------------------------------------------------------
+// in = {A (n x n), B (n x m)}; idata = {n, m}. Variant bits match the
+// quad_form_sym convention: bit 0 marks vector B and bit 1 marks an active
+// expression. The active vector overload associates B' * A * B, whereas the
+// primitive overload uses B.dot(A * B).
+void qf_fwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0], m = ctx.idata[1];
+  const CMapM a(ctx.in[0].data, n, n);
+  if (!(ctx.variant & 1u)) {
+    MapM(ctx.out.data, m, m) =
+        stan::math::quad_form(a, CMapM(ctx.in[1].data, n, m));
+    return;
+  }
+  const VecD b = CMapV(ctx.in[1].data, n);
+  if (!(ctx.variant & 2u)) {
+    ctx.out.data[0] = stan::math::quad_form(a, b);
+    return;
+  }
+  stan::math::check_square("quad_form", "A", a);
+  stan::math::check_multiplicable("quad_form", "A", a, "B", b);
+  const MatD c = b.transpose() * a * b;
+  ctx.out.data[0] = c(0, 0);
+}
+void qf_bwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0], m = ctx.idata[1];
+  if (ctx.variant & 1u) {
+    nary_bwd(ctx, [n](std::vector<VarV>& xs) {
+      Eigen::Map<VarM> a(xs[0].data(), n, n);
+      return stan::math::quad_form(a, xs[1]);
+    });
+    return;
+  }
+  nary_bwd(ctx, [n, m](std::vector<VarV>& xs) {
+    Eigen::Map<VarM> a(xs[0].data(), n, n);
+    Eigen::Map<VarM> b(xs[1].data(), n, m);
+    return stan::math::quad_form(a, b);
+  });
+}
+
+// ---- add_diag(A, d) -------------------------------------------------------
+// idata = {rows, cols}; variant 0 is a vector diagonal, 1 is a scalar.
+void add_diag_fwd(KernelCtx& ctx) {
+  const int64_t rows = ctx.idata[0], cols = ctx.idata[1];
+  MapM out(ctx.out.data, rows, cols);
+  out = CMapM(ctx.in[0].data, rows, cols);
+  const int64_t n = std::min(rows, cols);
+  for (int64_t i = 0; i < n; ++i)
+    out(i, i) += ctx.in[1].data[ctx.variant == 1 ? 0 : i];
+}
+void add_diag_bwd(KernelCtx& ctx) {
+  const int64_t rows = ctx.idata[0], cols = ctx.idata[1];
+  if (ctx.in_adj[0].data)
+    MapM(ctx.in_adj[0].data, rows, cols) +=
+        CMapM(ctx.out_adj_vec.data, rows, cols);
+  if (!ctx.in_adj[1].data) return;
+  const int64_t n = std::min(rows, cols);
+  if (ctx.variant == 1) {
+    // Eigen creates the diagonal scalar additions in increasing coefficient
+    // order; Stan's tape replays them in reverse.
+    for (int64_t i = n; i-- > 0;)
+      ctx.in_adj[1].data[0] += ctx.out_adj_vec.data[i * rows + i];
+  } else {
+    for (int64_t i = 0; i < n; ++i)
+      ctx.in_adj[1].data[i] += ctx.out_adj_vec.data[i * rows + i];
+  }
+}
+
+// ---- quad_form_sym(A, B) --------------------------------------------------
+// in = {A (n x n), B (n x m)}; idata = {n, m}. The output is the m x m
+// matrix 0.5 * (C + C') with C = B' A B, or the single scalar extracted from
+// that 1 x 1 symmetrised matrix when B is a reverse-mode vector. The latter
+// still performs the add and multiply: although algebraically redundant,
+// those operations affect IEEE overflow and must match CmdStan exactly.
+// stan-math checks A for symmetry and throws what CmdStan would when it is
+// not.
+//
+// Variant bit 0 says the second operand is a vector; bit 1 says CmdStan
+// would have typed this expression `var`. Only the vector overload needs
+// that second bit, because stan-math associates it two ways: prim computes
+// B.dot(A * B), a gemv and then a dot, while the rev path builds a
+// quad_form_vari over a column vector and evaluates B' * A * B, grouping
+// from the other end. The matrix overload has one association in both.
+void qfs_fwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0], m = ctx.idata[1];
+  const CMapM a(ctx.in[0].data, n, n);
+  if (!(ctx.variant & 1u)) {
+    const CMapM b(ctx.in[1].data, n, m);
+    MapM(ctx.out.data, m, m) = stan::math::quad_form_sym(a, b);
+    return;
+  }
+  const VecD b = CMapV(ctx.in[1].data, n);
+  if (!(ctx.variant & 2u)) {
+    ctx.out.data[0] = stan::math::quad_form_sym(a, b);
+    return;
+  }
+  stan::math::check_multiplicable("quad_form_sym", "A", a, "B", b);
+  stan::math::check_symmetric("quad_form_sym", "A", a);
+  MatD c = b.transpose() * a * b;
+  const MatD sym = 0.5 * (c + c.transpose());
+  c = sym;
+  ctx.out.data[0] = c(0, 0);
+}
+void qfs_bwd(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0], m = ctx.idata[1];
+  // The rev overload is the one CmdStan reaches at either shape, so the
+  // replay needs no variant beyond the operand shape itself.
+  if (ctx.variant & 1u) {
+    nary_bwd(ctx, [n](std::vector<VarV>& xs) {
+      Eigen::Map<VarM> a(xs[0].data(), n, n);
+      return stan::math::quad_form_sym(a, xs[1]);
+    });
+    return;
+  }
+  nary_bwd(ctx, [n, m](std::vector<VarV>& xs) {
+    Eigen::Map<VarM> a(xs[0].data(), n, n);
+    Eigen::Map<VarM> b(xs[1].data(), n, m);
+    return stan::math::quad_form_sym(a, b);
+  });
+}
+
 // Bind a slot as a var matrix or vector, and scatter the adjoints back
 // afterwards. Shared by the multivariate densities below and by the tail
 // densities further down.
@@ -177,6 +363,65 @@ template <bool Grad, typename... Args>
     (tail_scatter(ctx, slot++, args), ...);
   }
   return value;
+}
+
+double* tail_stash(double* s, const VarM& M) {
+  for (int64_t i = 0; i < M.size(); ++i) *s++ = M.data()[i].adj();
+  return s;
+}
+double* tail_stash(double* s, const VarV& v) {
+  for (int64_t i = 0; i < v.size(); ++i) *s++ = v(i).adj();
+  return s;
+}
+double* tail_stash(double* s, const stan::math::var& x) {
+  *s++ = x.adj();
+  return s;
+}
+double* tail_stash(double* s, const std::vector<VarV>& xs) {
+  for (const auto& x : xs) s = tail_stash(s, x);
+  return s;
+}
+
+// finish_tail_density split across the sweeps: one tape per gradient, gradded
+// in the FORWARD with a seed of 1, contracted in the backward. That is only
+// bitwise for a density whose reverse sweep multiplies the output adjoint in
+// once per operand -- the partials_propagator family. Densities that reduce
+// through var arithmetic (wishart, lkj, wiener, multi_normal_prec) round the
+// two orders differently and stay on the two-tape form above.
+template <typename... Args>
+[[gnu::always_inline]] inline double tail_density_fwd(
+    KernelCtx& ctx, const stan::math::var& density, const Args&... args) {
+  const double value = density.val();
+  if (!values_only()) {
+    stan::math::grad(density.vi_);
+    double* s = ctx.scratch;
+    ((s = tail_stash(s, args)), ...);
+  }
+  return value;
+}
+
+// Mirror of tail_density_fwd's layout: one partial per element of the first
+// NArgs inputs, in slot order.
+template <int NArgs>
+void tail_density_bwd(KernelCtx& ctx) {
+  const double* s = ctx.scratch;
+  const double w = ctx.out_adj;
+  for (int k = 0; k < NArgs; ++k) {
+    if (ctx.in_adj[k].data)
+      Eigen::Map<Eigen::ArrayXd>(ctx.in_adj[k].data, ctx.in[k].len) +=
+          w * Eigen::Map<const Eigen::ArrayXd>(s, ctx.in[k].len);
+    s += ctx.in[k].len;
+  }
+}
+
+template <int NArgs>
+int64_t tail_density_scratch(const Op& op, const Slot* slots) {
+  int64_t t = 0;
+  for (int k = 0; k < NArgs && k < op.n_in; ++k) {
+    if (op.in[k] < 0) return 0;
+    t += slots[op.in[k]].len;
+  }
+  return t;
 }
 
 // ---- multi_normal_lpdf(y | mu, Sigma) -------------------------------------
@@ -237,19 +482,23 @@ double mn_eval(KernelCtx& ctx) {
     else
       v_out = aS ? (am ? call(ysd, mu, S) : call(ysd, mud, S))
                  : (am ? call(ysd, mu, Sd) : call(ysd, mud, Sd));
-    const double vv = v_out.val();
-    if constexpr (Grad) {
-      var jj = v_out * ctx.out_adj;
-      stan::math::grad(jj.vi_);
-      // y stays hand-written here: it is a std::vector<VarV>, not a VarV.
-      if (ay && ctx.in_adj[0].data)
-        for (int64_t k = 0; k < m; ++k)
-          for (int64_t i = 0; i < n; ++i)
-            ctx.in_adj[0].data[k * n + i] += ys[k](i).adj();
-      if (am) tail_scatter(ctx, 1, mu);
-      if (aS) tail_scatter(ctx, 2, S);
+    if constexpr (Kind == kMnPrec) {
+      const double vv = v_out.val();
+      if constexpr (Grad) {
+        var jj = v_out * ctx.out_adj;
+        stan::math::grad(jj.vi_);
+        // y stays hand-written here: it is a std::vector<VarV>, not a VarV.
+        if (ay && ctx.in_adj[0].data)
+          for (int64_t k = 0; k < m; ++k)
+            for (int64_t i = 0; i < n; ++i)
+              ctx.in_adj[0].data[k * n + i] += ys[k](i).adj();
+        if (am) tail_scatter(ctx, 1, mu);
+        if (aS) tail_scatter(ctx, 2, S);
+      }
+      return vv;
+    } else {
+      return tail_density_fwd(ctx, v_out, ys, mu, S);
     }
-    return vv;
   }
   if (ay && am && aS)
     out = call(y, mu, S);
@@ -268,24 +517,118 @@ double mn_eval(KernelCtx& ctx) {
   else
     return call(yd, mud, Sd);
 
-  const double v = out.val();
-  if constexpr (Grad) {
-    var j = out * ctx.out_adj;
-    stan::math::grad(j.vi_);
-    if (ay) tail_scatter(ctx, 0, y);
-    if (am) tail_scatter(ctx, 1, mu);
-    if (aS) tail_scatter(ctx, 2, S);
+  if constexpr (Kind == kMnPrec) {
+    const double v = out.val();
+    if constexpr (Grad) {
+      var j = out * ctx.out_adj;
+      stan::math::grad(j.vi_);
+      if (ay) tail_scatter(ctx, 0, y);
+      if (am) tail_scatter(ctx, 1, mu);
+      if (aS) tail_scatter(ctx, 2, S);
+    }
+    return v;
+  } else {
+    return tail_density_fwd(ctx, out, y, mu, S);
   }
-  return v;
 }
 void mn_fwd(KernelCtx& ctx) { ctx.out.data[0] = mn_eval<false>(ctx); }
-void mn_bwd(KernelCtx& ctx) { mn_eval<true>(ctx); }
+void mn_bwd(KernelCtx& ctx) { tail_density_bwd<3>(ctx); }
 void mnprec_fwd(KernelCtx& ctx) {
   ctx.out.data[0] = mn_eval<false, kMnPrec>(ctx);
 }
 void mnprec_bwd(KernelCtx& ctx) { mn_eval<true, kMnPrec>(ctx); }
-void mnc_fwd(KernelCtx& ctx) { ctx.out.data[0] = mn_eval<false, kMnChol>(ctx); }
-void mnc_bwd(KernelCtx& ctx) { mn_eval<true, kMnChol>(ctx); }
+
+// gp_regr's single-observation Cholesky density has data y and mu, active L,
+// and propto=true. In that exact instantiation Stan Math's partials
+// propagator computes a closed-form L pullback in doubles, then builds a var
+// edge around it. Retain that matrix in scratch during the forward instead of
+// rebuilding an AoS var matrix and nested tape in both sweeps. The equality
+// checks here are deliberately strict: every other activity, propto, and
+// vectorized shape stays on mn_eval's generic replay.
+inline bool mnc_native_variant(uint8_t variant, const int* idata,
+                               int64_t n_idata) {
+  return variant == 0x84u && idata != nullptr && n_idata == 2 &&
+         idata[0] >= 0 && idata[1] == 1;
+}
+
+bool mnc_native_shape(const KernelCtx& ctx) {
+  if (!mnc_native_variant(ctx.variant, ctx.idata, ctx.n_idata) ||
+      ctx.n_in != 3 || ctx.out.len != 1)
+    return false;
+  const int64_t n = ctx.idata[0];
+  return ctx.in[0].len == n && ctx.in[1].len == n && ctx.in[2].len == n * n;
+}
+
+double mnc_native_fwd(KernelCtx& ctx) {
+  static constexpr const char* function = "multi_normal_cholesky_lpdf";
+  const int64_t n = ctx.idata[0];
+  CMapV y(ctx.in[0].data, n), mu(ctx.in[1].data, n);
+  CMapM L(ctx.in[2].data, n, n);
+
+  // Copy the pinned single-vector Stan Math overload's checks and
+  // arithmetic order. That overload intentionally does not call
+  // check_cholesky_factor; changing its observable domain here would make the
+  // native and fallback paths disagree.
+  stan::math::check_size_match(function, "Size of random variable", y.size(),
+                               "size of location parameter", mu.size());
+  stan::math::check_size_match(function, "Size of random variable", y.size(),
+                               "rows of covariance parameter", L.rows());
+  stan::math::check_size_match(function, "Size of random variable", y.size(),
+                               "columns of covariance parameter", L.cols());
+  stan::math::check_finite(function, "Location parameter", mu);
+  stan::math::check_not_nan(function, "Random variable", y);
+  if (n == 0) return 0.0;
+
+  VecD y_minus_mu = y - mu;
+  MatD inv_L = stan::math::mdivide_left_tri<Eigen::Lower>(L);
+  Eigen::RowVectorXd half;
+  half = (inv_L.template triangularView<Eigen::Lower>() *
+          y_minus_mu.template cast<double>())
+             .transpose();
+
+  VecD scaled_diff;
+  if (!values_only()) {
+    scaled_diff =
+        (half * inv_L.template triangularView<Eigen::Lower>()).transpose();
+  }
+
+  double logp(0.0);
+  logp += stan::math::sum(stan::math::log(inv_L.diagonal()));
+  if (!values_only())
+    MapM(ctx.scratch, n, n) = scaled_diff * half - inv_L.transpose();
+  logp -= 0.5 * stan::math::sum(stan::math::dot_self(half));
+  return logp;
+}
+
+void mnc_fwd(KernelCtx& ctx) {
+  ctx.out.data[0] = mnc_native_shape(ctx) ? mnc_native_fwd(ctx)
+                                          : mn_eval<false, kMnChol>(ctx);
+}
+void mnc_bwd(KernelCtx& ctx) {
+  if (!mnc_native_shape(ctx)) {
+    tail_density_bwd<3>(ctx);
+    return;
+  }
+  if (!ctx.in_adj[2].data) return;
+  const int64_t n = ctx.idata[0];
+  for (int64_t i = 0; i < n * n; ++i)
+    ctx.in_adj[2].data[i] += ctx.out_adj * ctx.scratch[i];
+}
+
+// Everything that misses the native gate replays through mn_eval, which
+// stashes one partial per input element instead of the pullback's n*n.
+int64_t mnc_scratch(const Op& op, const Slot* slots) {
+  if (op.n_in != 3 || op.out < 0 || slots == nullptr || op.in[0] < 0 ||
+      op.in[1] < 0 || op.in[2] < 0)
+    return 0;
+  if (!mnc_native_variant(op.variant, op.idata, op.n_idata))
+    return tail_density_scratch<3>(op, slots);
+  const int64_t n = op.idata[0];
+  if (slots[op.in[0]].len != n || slots[op.in[1]].len != n ||
+      slots[op.in[2]].len != n * n || slots[op.out].len != 1)
+    return tail_density_scratch<3>(op, slots);
+  return n * n;
+}
 
 // ---- general matrix product: out = A * B ----------------------------------
 // idata = {rows_a, cols_a, cols_b}; either side may carry adjoints.
@@ -306,6 +649,28 @@ void gemm_bwd(KernelCtx& ctx) {
     MapM(ctx.in_adj[1].data, ca, cb) += A.transpose() * dO;
 }
 
+// ---- crossprod(A): out = A' * A ------------------------------------------
+// idata = {rows, cols}; variant bit 0 records an autodiff result. Stan Math's
+// double overload uses a symmetric rank update, while its reverse-mode
+// overload computes the value as a general matrix product. Both groupings are
+// observable, so forward-only evaluation takes the former and a gradient
+// evaluation takes the latter, matching the overload CmdStan instantiates.
+void crossprod_fwd(KernelCtx& ctx) {
+  const int64_t rows = ctx.idata[0], cols = ctx.idata[1];
+  const CMapM a(ctx.in[0].data, rows, cols);
+  if ((ctx.variant & 1u) && !values_only())
+    MapM(ctx.out.data, cols, cols) = a.transpose() * a;
+  else
+    MapM(ctx.out.data, cols, cols) = stan::math::crossprod(a);
+}
+void crossprod_bwd(KernelCtx& ctx) {
+  const int64_t rows = ctx.idata[0], cols = ctx.idata[1];
+  nary_bwd(ctx, [rows, cols](std::vector<VarV>& xs) {
+    Eigen::Map<VarM> a(xs[0].data(), rows, cols);
+    return stan::math::crossprod(a);
+  });
+}
+
 // ---- matrix solves: `A \ B` and `B / A` -----------------------------------
 // Argument order is the operator's, so in = {A, B} for the left solve and
 // {B, A} for the right one; idata = {n, k} with n the divisor's order and k
@@ -318,7 +683,10 @@ void gemm_bwd(KernelCtx& ctx) {
 //     it is the hand-written rev overload, whose value is a HouseholderQR
 //     solve instead. mdivide_right has no rev overload at all, so the prim
 //     template runs at whatever scalar type reaches it. Variant bit 0 says
-//     CmdStan would have typed this expression `var`.
+//     the result is active, bits 2 and 3 preserve the divisor and dividend
+//     scalar types independently. That distinction also selects stan-math's
+//     vv/vd/dv SPD and triangular pullbacks, whose floating-point association
+//     is observably different.
 //   * Eigen shape. A vector dividend passed as a one-column matrix takes
 //     Eigen's matrix code paths, which reassociate: 1 ULP on the value and
 //     on the adjoint, measured on `A \ v`. Variant bit 1 says the dividend
@@ -328,12 +696,33 @@ void gemm_bwd(KernelCtx& ctx) {
 // The MIR interpreter makes both distinctions too -- the scalar one falls
 // out of overload resolution on its own T -- which is what keeps the two
 // halves of the runtime answering the same thing.
-template <bool Left, typename A, typename B>
+//   * factorisation family. The Stan language names three, and they are
+//     different answers rather than different speeds: the plain solve
+//     factors a general matrix, `_spd` takes an LLT of a symmetric positive
+//     definite one, and `_tri_low` reads only the lower triangle and never
+//     looks at the rest. Each gets its own opcode; `Kind` selects the call.
+enum class SolveKind { Plain, Spd, TriLow };
+
+template <bool Left, SolveKind Kind, typename A, typename B>
 auto solve_at(const A& a, const B& b) {
-  if constexpr (Left) {
-    return stan::math::mdivide_left(a, b);
+  if constexpr (Kind == SolveKind::Spd) {
+    if constexpr (Left) {
+      return stan::math::mdivide_left_spd(a, b);
+    } else {
+      return stan::math::mdivide_right_spd(b, a);
+    }
+  } else if constexpr (Kind == SolveKind::TriLow) {
+    if constexpr (Left) {
+      return stan::math::mdivide_left_tri_low(a, b);
+    } else {
+      return stan::math::mdivide_right_tri_low(b, a);
+    }
   } else {
-    return stan::math::mdivide_right(b, a);
+    if constexpr (Left) {
+      return stan::math::mdivide_left(a, b);
+    } else {
+      return stan::math::mdivide_right(b, a);
+    }
   }
 }
 
@@ -343,20 +732,27 @@ using Dividend = std::conditional_t<
     !Vec, Eigen::Matrix<T, -1, -1>,
     std::conditional_t<Left, Eigen::Matrix<T, -1, 1>, Eigen::Matrix<T, 1, -1>>>;
 
-// Promote both operands on a nested tape, write the value out, and -- when
-// the caller wants gradients -- seed the output adjoints and scatter back.
-// The var replay is the whole point: it is the call CmdStan makes.
-template <bool Left, bool Vec, bool Grad>
+// Replay the exact operand scalar types on a nested tape, write the value out,
+// and -- when the caller wants gradients -- seed the output adjoints and
+// scatter back. The mixed stan-math overloads are numerically distinct from
+// promoting their data operand to var, so the two activity flags are template
+// parameters rather than a single result-active flag.
+template <bool Left, SolveKind Kind, bool DivisorVar, bool DividendVar,
+          bool Vec, bool Grad>
 void solve_var(KernelCtx& ctx) {
   using stan::math::var;
+  static_assert(DivisorVar || DividendVar);
+  using DivisorScalar = std::conditional_t<DivisorVar, var, double>;
+  using DividendScalar = std::conditional_t<DividendVar, var, double>;
   const int64_t n = ctx.idata[0], k = ctx.idata[1];
   const int ai = Left ? 0 : 1, bi = Left ? 1 : 0;
   const int64_t br = Left ? n : k, bc = Left ? k : n;
   stan::math::nested_rev_autodiff nested;
-  VarM a = tail_m(ctx, ai, n, n);
-  Dividend<Left, Vec, var> b(br, bc);
+  Eigen::Matrix<DivisorScalar, -1, -1> a(n, n);
+  for (int64_t i = 0; i < n * n; ++i) a.data()[i] = ctx.in[ai].data[i];
+  Dividend<Left, Vec, DividendScalar> b(br, bc);
   for (int64_t i = 0; i < br * bc; ++i) b.data()[i] = ctx.in[bi].data[i];
-  auto out = solve_at<Left>(a, b);
+  auto out = solve_at<Left, Kind>(a, b);
   for (Eigen::Index i = 0; i < out.size(); ++i)
     ctx.out.data[i] = out.data()[i].val();
   if constexpr (Grad) {
@@ -367,16 +763,20 @@ void solve_var(KernelCtx& ctx) {
       seed.data()[i] = ctx.out_adj_vec.data[i];
     var j = stan::math::sum(stan::math::elt_multiply(out, seed));
     stan::math::grad(j.vi_);
-    if (ctx.in_adj[ai].data)
-      for (int64_t i = 0; i < n * n; ++i)
-        ctx.in_adj[ai].data[i] += a.data()[i].adj();
-    if (ctx.in_adj[bi].data)
-      for (int64_t i = 0; i < br * bc; ++i)
-        ctx.in_adj[bi].data[i] += b.data()[i].adj();
+    if constexpr (DivisorVar) {
+      if (ctx.in_adj[ai].data)
+        for (int64_t i = 0; i < n * n; ++i)
+          ctx.in_adj[ai].data[i] += a.data()[i].adj();
+    }
+    if constexpr (DividendVar) {
+      if (ctx.in_adj[bi].data)
+        for (int64_t i = 0; i < br * bc; ++i)
+          ctx.in_adj[bi].data[i] += b.data()[i].adj();
+    }
   }
 }
 
-template <bool Left, bool Vec>
+template <bool Left, SolveKind Kind, bool Vec>
 void solve_double(KernelCtx& ctx) {
   const int64_t n = ctx.idata[0], k = ctx.idata[1];
   const int ai = Left ? 0 : 1, bi = Left ? 1 : 0;
@@ -384,28 +784,64 @@ void solve_double(KernelCtx& ctx) {
   MatD a = CMapM(ctx.in[ai].data, n, n);
   Dividend<Left, Vec, double> b(br, bc);
   for (int64_t i = 0; i < br * bc; ++i) b.data()[i] = ctx.in[bi].data[i];
-  auto out = solve_at<Left>(a, b);
+  auto out = solve_at<Left, Kind>(a, b);
   for (Eigen::Index i = 0; i < out.size(); ++i) ctx.out.data[i] = out.data()[i];
 }
 
-template <bool Left>
-void solve_fwd(KernelCtx& ctx) {
-  const bool vec = (ctx.variant & 2u) != 0;
-  if (ctx.variant & 1u) {
-    vec ? solve_var<Left, true, false>(ctx)
-        : solve_var<Left, false, false>(ctx);
-  } else {
-    vec ? solve_double<Left, true>(ctx) : solve_double<Left, false>(ctx);
+template <bool Left, SolveKind Kind = SolveKind::Plain>
+void solve_active_fwd(KernelCtx& ctx, bool vec) {
+  // Bits 2 and 3 are the exact divisor/dividend scalar types. Activity 0 on
+  // an active result is the pre-detail encoding; retain its old vv behavior
+  // for an in-memory graph built by an older caller.
+  switch ((ctx.variant >> 2u) & 3u) {
+    case 1u:
+      vec ? solve_var<Left, Kind, true, false, true, false>(ctx)
+          : solve_var<Left, Kind, true, false, false, false>(ctx);
+      return;
+    case 2u:
+      vec ? solve_var<Left, Kind, false, true, true, false>(ctx)
+          : solve_var<Left, Kind, false, true, false, false>(ctx);
+      return;
+    default:
+      vec ? solve_var<Left, Kind, true, true, true, false>(ctx)
+          : solve_var<Left, Kind, true, true, false, false>(ctx);
+      return;
   }
 }
 
-template <bool Left>
-void solve_bwd(KernelCtx& ctx) {
-  // Reached only from a gradient, which is a var context by definition.
-  if (ctx.variant & 2u) {
-    solve_var<Left, true, true>(ctx);
+template <bool Left, SolveKind Kind = SolveKind::Plain>
+void solve_fwd(KernelCtx& ctx) {
+  const bool vec = (ctx.variant & 2u) != 0;
+  // forward_value_only() is CmdStan's log_prob<double> path. Even when the
+  // same graph carries adjoints for gradient(), it must take the prim solve:
+  // mdivide_left's active overload uses HouseholderQR while its double
+  // overload uses FullPivLU, and those are observably different answers on
+  // ill-conditioned inputs.
+  if ((ctx.variant & 1u) && !values_only()) {
+    solve_active_fwd<Left, Kind>(ctx, vec);
   } else {
-    solve_var<Left, false, true>(ctx);
+    vec ? solve_double<Left, Kind, true>(ctx)
+        : solve_double<Left, Kind, false>(ctx);
+  }
+}
+
+template <bool Left, SolveKind Kind = SolveKind::Plain>
+void solve_bwd(KernelCtx& ctx) {
+  const bool vec = (ctx.variant & 2u) != 0;
+  switch ((ctx.variant >> 2u) & 3u) {
+    case 1u:
+      vec ? solve_var<Left, Kind, true, false, true, true>(ctx)
+          : solve_var<Left, Kind, true, false, false, true>(ctx);
+      return;
+    case 2u:
+      vec ? solve_var<Left, Kind, false, true, true, true>(ctx)
+          : solve_var<Left, Kind, false, true, false, true>(ctx);
+      return;
+    default:
+      // Includes the legacy active encoding with neither detail bit set.
+      vec ? solve_var<Left, Kind, true, true, true, true>(ctx)
+          : solve_var<Left, Kind, true, true, false, true>(ctx);
+      return;
   }
 }
 
@@ -543,32 +979,66 @@ void transpose_bwd(KernelCtx& ctx) {
 // SelfAdjointEigenSolver, which is what stan-math uses.
 void eigvals_fwd(KernelCtx& ctx) {
   const int64_t n = ctx.idata[0];
+  if (n == 0) return;
   MatD a = CMapM(ctx.in[0].data, n, n);
-  Eigen::Map<VecD>(ctx.out.data, n) = stan::math::eigenvalues_sym(a);
+  if (values_only()) {
+    Eigen::Map<VecD>(ctx.out.data, n) = stan::math::eigenvalues_sym(a);
+    return;
+  }
+  // Keep the decomposition that stan-math's reverse callback would retain.
+  // The old backward rebuilt a nested var matrix and decomposed it again;
+  // retaining the vectors makes the pullback the same two GEMMs with no
+  // second eigensolve or tape.  Use stan-math's exact check spelling before
+  // dropping to the Eigen solver its prim implementation wraps.
+  stan::math::check_symmetric("eigenvalues_sym", "m", a);
+  Eigen::SelfAdjointEigenSolver<MatD> solver(a);
+  Eigen::Map<VecD>(ctx.out.data, n) = solver.eigenvalues();
+  MapM(ctx.scratch, n, n) = solver.eigenvectors();
 }
 void eigvals_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data) return;
   const int64_t n = ctx.idata[0];
-  nary_bwd(ctx, [&](std::vector<VarV>& xs) {
-    VarM a(n, n);
-    for (int64_t j = 0; j < n; ++j)
-      for (int64_t i = 0; i < n; ++i) a(i, j) = xs[0](j * n + i);
-    return stan::math::eigenvalues_sym(a);
-  });
+  if (n == 0) return;
+  CMapM eigenvecs(ctx.scratch, n, n);
+  CMapV eigenvals_adj(ctx.out_adj_vec.data, n);
+  // stan/math/rev/fun/eigenvalues_sym.hpp, in the same association order.
+  MapM(ctx.in_adj[0].data, n, n) +=
+      eigenvecs * eigenvals_adj.asDiagonal() * eigenvecs.transpose();
 }
 void eigvecs_fwd(KernelCtx& ctx) {
   const int64_t n = ctx.idata[0];
+  if (n == 0) return;
   MatD a = CMapM(ctx.in[0].data, n, n);
-  MapM(ctx.out.data, n, n) = stan::math::eigenvectors_sym(a);
+  // eigenvectors_sym's prim check deliberately names eigenvalues_sym; retain
+  // that observable spelling together with its underlying full solver.
+  stan::math::check_symmetric("eigenvalues_sym", "m", a);
+  Eigen::SelfAdjointEigenSolver<MatD> solver(a);
+  MapM(ctx.out.data, n, n) = solver.eigenvectors();
+  if (!values_only()) Eigen::Map<VecD>(ctx.scratch, n) = solver.eigenvalues();
 }
 void eigvecs_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data) return;
   const int64_t n = ctx.idata[0];
-  nary_bwd(ctx, [&](std::vector<VarV>& xs) {
-    VarM a(n, n);
-    for (int64_t j = 0; j < n; ++j)
-      for (int64_t i = 0; i < n; ++i) a(i, j) = xs[0](j * n + i);
-    return stan::math::eigenvectors_sym(a);
-  });
+  if (n == 0) return;
+  CMapM eigenvecs(ctx.out.data, n, n);
+  CMapV eigenvals(ctx.scratch, n);
+  CMapM eigenvecs_adj(ctx.out_adj_vec.data, n, n);
+  // stan/math/rev/fun/eigenvectors_sym.hpp, expression for expression.
+  Eigen::MatrixXd f = (1 / (eigenvals.rowwise().replicate(n).transpose() -
+                            eigenvals.rowwise().replicate(n))
+                               .array());
+  f.diagonal().setZero();
+  MapM(ctx.in_adj[0].data, n, n) +=
+      eigenvecs * f.cwiseProduct(eigenvecs.transpose() * eigenvecs_adj) *
+      eigenvecs.transpose();
 }
+
+int64_t eigvals_scratch(const Op& op, const Slot*) {
+  const int64_t n = op.idata[0];
+  return n * n;
+}
+
+int64_t eigvecs_scratch(const Op& op, const Slot*) { return op.idata[0]; }
 
 // ---- tail densities: one nested var tape, no hand-written derivative ----
 // Everything below binds EVERY argument as var, calls the unmodified
@@ -805,7 +1275,7 @@ double lkjcov_eval(KernelCtx& ctx) {
 // coefficient matrix, a second int group), so they take the var tape.
 // idata = [outcome..., rows, cols] and, for binomial, the trial counts.
 enum GlmKind { kBinomLogitGlm, kCatLogitGlm, kOrdLogisticGlm };
-template <bool Grad, GlmKind Kind>
+template <GlmKind Kind>
 double tglm_eval(KernelCtx& ctx) {
   const int64_t rows = ctx.idata[ctx.n_idata - 2];
   const int64_t cols = ctx.idata[ctx.n_idata - 1];
@@ -824,7 +1294,7 @@ double tglm_eval(KernelCtx& ctx) {
                                                              beta)
                  : stan::math::binomial_logit_glm_lpmf<false>(nn, NN, X, alpha,
                                                               beta);
-    return finish_tail_density<Grad>(ctx, out, X, alpha, beta);
+    return tail_density_fwd(ctx, out, X, alpha, beta);
   } else {
     std::vector<int> y(ctx.idata, ctx.idata + rows);
     if constexpr (Kind == kCatLogitGlm) {
@@ -834,7 +1304,7 @@ double tglm_eval(KernelCtx& ctx) {
                                                                   beta)
                    : stan::math::categorical_logit_glm_lpmf<false>(y, X, alpha,
                                                                    beta);
-      return finish_tail_density<Grad>(ctx, out, X, alpha, beta);
+      return tail_density_fwd(ctx, out, X, alpha, beta);
     } else {
       // in = {X, beta, cutpoints}; alpha above is beta for this one.
       VarV beta = tail_v(ctx, 1, cols);
@@ -843,7 +1313,7 @@ double tglm_eval(KernelCtx& ctx) {
           propto
               ? stan::math::ordered_logistic_glm_lpmf<true>(y, X, beta, cuts)
               : stan::math::ordered_logistic_glm_lpmf<false>(y, X, beta, cuts);
-      return finish_tail_density<Grad>(ctx, out, X, beta, cuts);
+      return tail_density_fwd(ctx, out, X, beta, cuts);
     }
   }
 }
@@ -851,17 +1321,14 @@ double tglm_eval(KernelCtx& ctx) {
 void lkjcov_fwd(KernelCtx& ctx) { ctx.out.data[0] = lkjcov_eval<false>(ctx); }
 void lkjcov_bwd(KernelCtx& ctx) { lkjcov_eval<true>(ctx); }
 void blglm_fwd(KernelCtx& ctx) {
-  ctx.out.data[0] = tglm_eval<false, kBinomLogitGlm>(ctx);
+  ctx.out.data[0] = tglm_eval<kBinomLogitGlm>(ctx);
 }
-void blglm_bwd(KernelCtx& ctx) { tglm_eval<true, kBinomLogitGlm>(ctx); }
 void clglm_fwd(KernelCtx& ctx) {
-  ctx.out.data[0] = tglm_eval<false, kCatLogitGlm>(ctx);
+  ctx.out.data[0] = tglm_eval<kCatLogitGlm>(ctx);
 }
-void clglm_bwd(KernelCtx& ctx) { tglm_eval<true, kCatLogitGlm>(ctx); }
 void olglm_fwd(KernelCtx& ctx) {
-  ctx.out.data[0] = tglm_eval<false, kOrdLogisticGlm>(ctx);
+  ctx.out.data[0] = tglm_eval<kOrdLogisticGlm>(ctx);
 }
-void olglm_bwd(KernelCtx& ctx) { tglm_eval<true, kOrdLogisticGlm>(ctx); }
 
 // ---- the cdfs the recorder cannot take ---------------------------------
 // Same reason ordered_probit and wiener are here, one step further out:
@@ -964,27 +1431,55 @@ void register_matrix_kernels() {
   STANLI_TAIL_INT_CDF_LIST(STANLI_REGISTER_TAIL_CDF)
 #undef STANLI_REGISTER_TAIL_CDF
   register_kernel(OP_LKJ_COV_LPDF, Kernel{lkjcov_fwd, lkjcov_bwd, nullptr});
-  register_kernel(OP_BINOMIAL_LOGIT_GLM_LPMF,
-                  Kernel{blglm_fwd, blglm_bwd, nullptr});
-  register_kernel(OP_CATEGORICAL_LOGIT_GLM_LPMF,
-                  Kernel{clglm_fwd, clglm_bwd, nullptr});
-  register_kernel(OP_ORDERED_LOGISTIC_GLM_LPMF,
-                  Kernel{olglm_fwd, olglm_bwd, nullptr});
+  register_kernel(
+      OP_BINOMIAL_LOGIT_GLM_LPMF,
+      Kernel{blglm_fwd, tail_density_bwd<3>, tail_density_scratch<3>});
+  register_kernel(
+      OP_CATEGORICAL_LOGIT_GLM_LPMF,
+      Kernel{clglm_fwd, tail_density_bwd<3>, tail_density_scratch<3>});
+  register_kernel(
+      OP_ORDERED_LOGISTIC_GLM_LPMF,
+      Kernel{olglm_fwd, tail_density_bwd<3>, tail_density_scratch<3>});
   register_kernel(OP_DIAG_MATRIX, Kernel{diag_fwd, diag_bwd, nullptr});
   register_kernel(OP_CHOLESKY, Kernel{chol_fwd, chol_bwd, nullptr});
-  register_kernel(OP_MULTI_NORMAL_CHOL_LPDF, Kernel{mnc_fwd, mnc_bwd, nullptr});
-  register_kernel(OP_MULTI_NORMAL_LPDF, Kernel{mn_fwd, mn_bwd, nullptr});
+  register_kernel(OP_MATRIX_EXP,
+                  Kernel{matrix_exp_fwd, matrix_exp_bwd, nullptr});
+  register_kernel(OP_INVERSE, Kernel{inverse_fwd, inverse_bwd, nullptr});
+  register_kernel(OP_INVERSE_SPD,
+                  Kernel{inverse_spd_fwd, inverse_spd_bwd, nullptr});
+  register_kernel(OP_LOG_DETERMINANT,
+                  Kernel{log_det_fwd, log_det_bwd, nullptr});
+  register_kernel(OP_QUAD_FORM, Kernel{qf_fwd, qf_bwd, nullptr});
+  register_kernel(OP_ADD_DIAG, Kernel{add_diag_fwd, add_diag_bwd, nullptr});
+  register_kernel(OP_QUAD_FORM_SYM, Kernel{qfs_fwd, qfs_bwd, nullptr});
+  register_kernel(OP_MULTI_NORMAL_CHOL_LPDF,
+                  Kernel{mnc_fwd, mnc_bwd, mnc_scratch});
+  register_kernel(OP_MULTI_NORMAL_LPDF,
+                  Kernel{mn_fwd, mn_bwd, tail_density_scratch<3>});
   register_kernel(OP_MULTI_NORMAL_PREC_LPDF,
                   Kernel{mnprec_fwd, mnprec_bwd, nullptr});
   register_kernel(OP_GEMM, Kernel{gemm_fwd, gemm_bwd, nullptr});
+  register_kernel(OP_CROSSPROD, Kernel{crossprod_fwd, crossprod_bwd, nullptr});
   register_kernel(OP_MDIVIDE_LEFT,
                   Kernel{solve_fwd<true>, solve_bwd<true>, nullptr});
   register_kernel(OP_MDIVIDE_RIGHT,
                   Kernel{solve_fwd<false>, solve_bwd<false>, nullptr});
+  register_kernel(OP_MDIVIDE_LEFT_SPD,
+                  Kernel{solve_fwd<true, SolveKind::Spd>,
+                         solve_bwd<true, SolveKind::Spd>, nullptr});
+  register_kernel(OP_MDIVIDE_RIGHT_SPD,
+                  Kernel{solve_fwd<false, SolveKind::Spd>,
+                         solve_bwd<false, SolveKind::Spd>, nullptr});
+  register_kernel(OP_MDIVIDE_LEFT_TRI_LOW,
+                  Kernel{solve_fwd<true, SolveKind::TriLow>,
+                         solve_bwd<true, SolveKind::TriLow>, nullptr});
+  register_kernel(OP_MDIVIDE_RIGHT_TRI_LOW,
+                  Kernel{solve_fwd<false, SolveKind::TriLow>,
+                         solve_bwd<false, SolveKind::TriLow>, nullptr});
   register_kernel(OP_EIGENVALUES_SYM,
-                  Kernel{eigvals_fwd, eigvals_bwd, nullptr});
+                  Kernel{eigvals_fwd, eigvals_bwd, eigvals_scratch});
   register_kernel(OP_EIGENVECTORS_SYM,
-                  Kernel{eigvecs_fwd, eigvecs_bwd, nullptr});
+                  Kernel{eigvecs_fwd, eigvecs_bwd, eigvecs_scratch});
   register_kernel(OP_TRANSPOSE, Kernel{transpose_fwd, transpose_bwd, nullptr});
   register_kernel(OP_LKJ_CORR_CHOL_LPDF, Kernel{lkj_fwd, lkj_bwd, nullptr});
   register_kernel(OP_LKJ_CORR_LPDF, Kernel{lkjc_fwd, lkjc_bwd, nullptr});

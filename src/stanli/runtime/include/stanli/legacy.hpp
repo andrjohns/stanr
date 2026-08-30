@@ -53,7 +53,7 @@ void legacy_bwd_vec_in(KernelCtx& ctx, F&& f) {
 // output adjoint later is equivalent to replaying with the real seed --
 // and it leaves the backward reading only scratch, never the input
 // values. That is what lets these ops opt into the destructive-update
-// trait in optable.hpp (see backward_ignores_input_values).
+// trait in optable.hpp (see backward_ignores_values).
 template <typename F>
 double legacy_fwd_partials_vec(KernelCtx& ctx, F&& f) {
   stan::math::nested_rev_autodiff nested;

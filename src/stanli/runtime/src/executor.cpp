@@ -14,6 +14,9 @@
 
 namespace stanli {
 
+using ForwardFn = void (*)(KernelCtx&);
+ForwardFn resolve_forward_fn(const Op& op);
+
 static Kernel g_table[OP_COUNT_];
 
 Kernel& kernel(uint16_t opcode) {
@@ -84,13 +87,14 @@ KernelCtx call_fwd_ctx(const Program::Call& call, double* reg) {
 void run_call(const Program::Call& call, double* reg) {
   KernelCtx ctx = call_fwd_ctx(call, reg);
   const Kernel* k = find_kernel(call.opcode);
-  k->forward(ctx);  // the carver only emits registered opcodes
+  k->forward(ctx);
 }
 
 void register_elementwise_kernels();
 void register_density_kernels();
 void register_legacy_kernels();
 void register_matrix_kernels();
+void register_algebra_kernels();
 void register_ode_kernels();
 void register_constrain_kernels();
 void register_eltwise_kernels();
@@ -98,6 +102,7 @@ void register_scalar_binary_kernels();
 void register_scalar_unary_ad_kernels();
 void register_mixture_kernels();
 void register_message_kernels();
+void register_rng_kernel();
 void register_island_kernel();
 
 static void ensure_registered() {
@@ -106,9 +111,11 @@ static void ensure_registered() {
     register_density_kernels();
     register_legacy_kernels();
     register_matrix_kernels();
+    register_algebra_kernels();
     register_ode_kernels();
     register_constrain_kernels();
     register_message_kernels();
+    register_rng_kernel();
     register_eltwise_kernels();
     register_scalar_binary_kernels();
     register_scalar_unary_ad_kernels();
@@ -153,7 +160,6 @@ void Executor::bind_() {
     }
   }
   values_.assign(off, 0.0);
-  adjoints_.assign(off, 0.0);
 
   // A slot carries adjoint if it is a parameter or an op writes it. Slots
   // that are neither are data: kernels see a null adjoint Desc and skip them.
@@ -163,10 +169,38 @@ void Executor::bind_() {
     if (op.out2 >= 0) written[op.out2] = 1;
   }
 
+  // Adjoint addresses never escape the executor, so unlike values they do
+  // not need a hole for every externally addressable data slot or for slots
+  // whose producer an optimization pass removed. Pack the active cells into
+  // one arena. Keeping parameters first preserves the contiguous memcpy of
+  // the returned gradient; keeping one arena preserves the single fast
+  // memset on dense graphs.
+  std::vector<int64_t> adjoint_offsets(graph_.slots.size(), -1);
+  int64_t adj_off = 0;
+  for (size_t i = 0; i < graph_.slots.size(); ++i) {
+    const Slot& s = graph_.slots[i];
+    if (s.is_param) {
+      adjoint_offsets[i] = adj_off;
+      adj_off += s.len;
+    }
+  }
+  for (size_t i = 0; i < graph_.slots.size(); ++i) {
+    const Slot& s = graph_.slots[i];
+    if (!s.is_param && (written[i] || (int)i == graph_.result_slot)) {
+      adjoint_offsets[i] = adj_off;
+      adj_off += s.len;
+    }
+  }
+  adjoints_.assign(adj_off, 0.0);
+  result_adjoint_offset_ = -1;
+  if (graph_.result_slot >= 0) {
+    result_adjoint_offset_ = adjoint_offsets[graph_.result_slot];
+  }
+
   int64_t scratch = 0;
   for (auto& op : graph_.ops) {
     const Kernel& k = kernel(op.opcode);
-    if (k.forward == nullptr)
+    if (op.opcode == OP_NONE_ || k.forward == nullptr)
       // Name it. A browser build can be missing a kernel because its
       // density pack has not been loaded yet, and the caller decides what
       // to do from this string.
@@ -187,9 +221,11 @@ void Executor::bind_() {
   ctx_.resize(graph_.ops.size());
   out2_adj_ptr_.assign(graph_.ops.size(), nullptr);
   for (size_t i = 0; i < graph_.ops.size(); ++i) {
-    ctx_[i] = make_ctx_(graph_.ops[i], written);
+    ctx_[i] = make_ctx_(graph_.ops[i], written, adjoint_offsets);
     const int o2 = graph_.ops[i].out2;
-    if (o2 >= 0) out2_adj_ptr_[i] = adjoints_.data() + graph_.slots[o2].offset;
+    if (o2 >= 0) {
+      out2_adj_ptr_[i] = adjoints_.data() + adjoint_offsets[o2];
+    }
   }
   // Resolve dispatch now that ctx_ is final (it never reallocates after
   // this, so BwdStep may hold pointers into it).
@@ -197,14 +233,15 @@ void Executor::bind_() {
   bwd_.clear();
   bwd_.reserve(graph_.ops.size());
   for (size_t i = 0; i < graph_.ops.size(); ++i)
-    fwd_fn_[i] = kernel(graph_.ops[i].opcode).forward;
+    fwd_fn_[i] = resolve_forward_fn(graph_.ops[i]);
   for (size_t i = graph_.ops.size(); i-- > 0;) {
     void (*b)(KernelCtx&) = kernel(graph_.ops[i].opcode).backward;
     if (b) bwd_.push_back(BwdStep{b, &ctx_[i], out2_adj_ptr_[i]});
   }
 }
 
-KernelCtx Executor::make_ctx_(const Op& op, const std::vector<char>& written) {
+KernelCtx Executor::make_ctx_(const Op& op, const std::vector<char>& written,
+                              const std::vector<int64_t>& adjoint_offsets) {
   KernelCtx ctx;
   ctx.n_in = op.n_in;
   for (int i = 0; i < op.n_in; ++i) {
@@ -221,16 +258,21 @@ KernelCtx Executor::make_ctx_(const Op& op, const std::vector<char>& written) {
   ctx.scratch = scratch_.data() + op.scratch_off;
   ctx.idata = op.idata;
   ctx.udata = op.udata;
+  ctx.eval_state = &eval_state_;
   ctx.n_idata = op.n_idata;
   for (int i = 0; i < op.n_in; ++i) {
     const int si = op.in[i];
     const Slot& s = graph_.slots[si];
     const bool active = s.is_param || written[si];
-    ctx.in_adj[i] = Desc{active ? adjoints_.data() + s.offset : nullptr, s.len};
+    ctx.in_adj[i] =
+        Desc{active ? adjoints_.data() + adjoint_offsets[si] : nullptr, s.len};
   }
-  if (so.len == 1) ctx.out_adj = adjoints_[so.offset];
-  ctx.out_adj_vec = Desc{adjoints_.data() + so.offset, so.len};
-  if (op.out2 >= 0) ctx.out2_adj = adjoints_[graph_.slots[op.out2].offset];
+  const int64_t out_adj_off = adjoint_offsets[op.out];
+  if (so.len == 1) ctx.out_adj = adjoints_[out_adj_off];
+  ctx.out_adj_vec = Desc{adjoints_.data() + out_adj_off, so.len};
+  if (op.out2 >= 0) {
+    ctx.out2_adj = adjoints_[adjoint_offsets[op.out2]];
+  }
   return ctx;
 }
 
@@ -272,9 +314,21 @@ std::string Executor::profile_report() const {
   return out;
 }
 
-void Executor::run_forward_only() {
+void Executor::run_forward_only() { run_forward_only(EvalState{}); }
+
+void Executor::run_forward_only(EvalState state) {
+  struct RestoreState {
+    EvalState& slot;
+    EvalState previous;
+    ~RestoreState() { slot = previous; }
+  } restore{eval_state_, eval_state_};
+  eval_state_ = state;
   // The profiled path keeps the opcode-keyed loop (attribution needs the
-  // opcode anyway, and the timing calls dwarf dispatch cost).
+  // opcode anyway, and the timing calls dwarf dispatch cost). This bypasses
+  // resolve_forward_fn, so a variant-specialized op is timed through its
+  // canonical kernel. island.hpp requires the two forwards to leave bitwise-
+  // identical outputs and scratch; switch this loop to fwd_fn_ only when the
+  // executor's layout is next re-gated.
   if (profile_) {
     const size_t np = graph_.ops.size();
     for (size_t i = 0; i < np; ++i) {
@@ -324,7 +378,7 @@ double Executor::gradient(double* grad_out) {
   ++n_grad_evals_;
   const double v = forward();
   std::memset(adjoints_.data(), 0, sizeof(double) * adjoints_.size());
-  adjoints_[graph_.slots[graph_.result_slot].offset] = 1.0;
+  adjoints_[result_adjoint_offset_] = 1.0;
   if (profile_) {
     for (size_t pi = graph_.ops.size(); pi-- > 0;) {
       const Kernel& k = kernel(graph_.ops[pi].opcode);

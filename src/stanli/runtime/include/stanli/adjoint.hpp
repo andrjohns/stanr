@@ -44,6 +44,10 @@ namespace stanli {
 // generator had to checkpoint them.
 struct AdjInstr {
   Program::Code code = Program::CONST;
+  // DENSITY only: bit k set where argument k is downstream of a parameter.
+  // Rides in the padding after `code`, as the graph's density ops carry
+  // their activity in Op::variant.
+  uint8_t mask = 0xf;
   int32_t dst = 0, a = 0, b = 0, c = 0;
   int32_t len = 0;
   int32_t vd = 0, va = 0, vb = 0, vc = 0;
@@ -59,6 +63,11 @@ struct AdjProgram {
   // copy's contributions separately and transferring them in one lump would
   // regroup the sum and cost the last few bits.
   std::vector<int32_t> adj_reg;
+  // Number of cells in the adjoint file. `adj_reg` is indexed by forward
+  // register, but its entries are compact: registers made equivalent by a
+  // copy share one cell, and the remaining equivalence classes are packed
+  // densely. Checkpoint registers hold values only and are absent entirely.
+  int n_regs = 0;
   bool empty() const { return adj_reg.empty(); }
 };
 

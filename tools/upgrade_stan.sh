@@ -1,28 +1,42 @@
 #!/bin/sh
-# Vendors the headers provided by the `stan` and `math` submodules directly
-# into inst/include, using the files bundled in a CmdStan release tarball.
-#
-# The CmdStan release bundles:
-#   cmdstan-<VER>/stan/                  -> the `stan` submodule (stan-dev/stan)
-#   cmdstan-<VER>/stan/lib/stan_math/    -> the `math` submodule (stan-dev/math)
+# Vendors headers from pinned `stan` and `math` git refs directly into
+# inst/include. Keep these refs aligned with deps/fetch.sh in the stanli ref
+# pinned by upgrade_stanli.sh; stanli's generated/runtime code is tested
+# against these exact dependency revisions.
 #
 # This replicates the header copies that src/Makevars' `package:` target
 # currently performs at install time, so that step can be removed from
 # Makevars and the headers are vendored into the package instead.
 set -e
 
-CMDSTAN_VER="2.39.0"
-CMDSTAN_DIR="cmdstan-$CMDSTAN_VER"
-STAN_SRC="$CMDSTAN_DIR/stan"
-MATH_SRC="$CMDSTAN_DIR/stan/lib/stan_math"
+MATH_REF="8f326d14599d3030c626c46532d8e8534c1cdbec"
+STAN_REF="c96d04115d35cb04f42e45c5a69a82f9704798f1"
+MATH_SRC="math-$MATH_REF"
+STAN_SRC="stan-$STAN_REF"
 INC=../inst/include
 
-# --- 1. Download and extract the CmdStan release ---------------------------
-if [ ! -f "cmdstan-$CMDSTAN_VER.tar.gz" ]; then
-  wget https://github.com/stan-dev/cmdstan/releases/download/v$CMDSTAN_VER/cmdstan-$CMDSTAN_VER.tar.gz
-fi
-rm -rf "$CMDSTAN_DIR"
-tar -xf cmdstan-$CMDSTAN_VER.tar.gz
+# --- 1. Fetch the pinned Stan and Math sources -----------------------------
+fetch() { # destination repository-url ref sparse-paths...
+  destination=$1
+  url=$2
+  ref=$3
+  shift 3
+
+  if [ ! -d "$destination/.git" ]; then
+    if [ -e "$destination" ]; then
+      echo "$destination exists but is not a git checkout" >&2
+      exit 1
+    fi
+    git clone --filter=blob:none --no-checkout "$url" "$destination"
+    git -C "$destination" sparse-checkout init --cone
+  fi
+  git -C "$destination" sparse-checkout set "$@"
+  git -C "$destination" fetch -q origin "$ref"
+  git -C "$destination" checkout -q --detach "$ref"
+}
+
+fetch "$MATH_SRC" https://github.com/stan-dev/math.git "$MATH_REF" stan lib
+fetch "$STAN_SRC" https://github.com/stan-dev/stan.git "$STAN_REF" src/stan
 
 # --- 2. Vendor the `stan` headers ------------------------------------------
 # Makevars: cp -Rf stan/src/stan ../inst/include/stan
@@ -368,6 +382,7 @@ cp -Rf "$MATH_SRC"/lib/eigen_*/unsupported/Eigen "$INC/unsupported/"
 
 for file in \
   "$INC/CL/cl_platform.h" \
+  "$INC/Eigen/src/Core/arch/AltiVec/PacketMath.h" \
   "$INC/Eigen/src/Core/util/DisableStupidWarnings.h" \
   "$INC/boost/math/ccmath/isinf.hpp" \
   "$INC/boost/container/allocator_traits.hpp" \
@@ -413,4 +428,4 @@ do
   fi
 done
 
-echo "Done. Vendored stan and math headers into inst/include from CmdStan $CMDSTAN_VER."
+echo "Done. Vendored math@$MATH_REF and stan@$STAN_REF into inst/include."

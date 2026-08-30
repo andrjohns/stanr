@@ -63,6 +63,58 @@ inline void add_bound_adj(KernelCtx& ctx, int k, const double* terms,
     ctx.in_adj[k].data[0] += seq_sum(terms, n);
 }
 
+// An infinite bound is not a bound: every *_constrain overload short-circuits
+// it to the identity, so the element passes through untouched and contributes
+// no jacobian term. stan-math spells that as a `select` over an `is_inf` mask;
+// here it earns a branch of its own instead, because an infinite bound is rare
+// and the finite path has to stay the exact arithmetic the ULP calibration in
+// the header comment was measured against.
+constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+constexpr double kPosInf = std::numeric_limits<double>::infinity();
+
+inline bool has_inf(const Bound& b, int64_t n, double inf) {
+  if (!b.varies()) return b[0] == inf;
+  for (int64_t i = 0; i < n; ++i)
+    if (b.p[i] == inf) return true;
+  return false;
+}
+
+// Jacobian for a per-element bound with identity elements masked to a literal
+// zero -- rev's `select(x, 0).sum()` -- reduced the way seq_sum reduces, so
+// the elements that do transform still land where they did.
+inline double masked_sum(const double* x, const double* bound, int64_t n,
+                         double inf) {
+  if (packet_math())
+    return (CMapA(bound, n) != inf).select(CMapA(x, n), 0.0).sum();
+  double s = 0.0;
+  for (int64_t i = 0; i < n; ++i) s += bound[i] == inf ? 0.0 : x[i];
+  return s;
+}
+
+// A bound adjoint lands per element when the bound varies. A shared bound
+// first reduces all terms from zero and then adds that reduction once, which
+// preserves stan-math's `.sum()` callback rounding even when the lane already
+// has an adjoint from another use.
+struct BoundAdj {
+  double* p;
+  bool varies;
+  double lane = 0.0;
+  bool touched = false;
+  BoundAdj(KernelCtx& ctx, int k)
+      : p(ctx.in_adj[k].data), varies(Bound(ctx.in[k]).varies()) {}
+  void add(int64_t i, double v) {
+    if (!p) return;
+    touched = true;
+    if (varies)
+      p[i] += v;
+    else
+      lane += v;
+  }
+  void commit() {
+    if (p && !varies && touched) p[0] += lane;
+  }
+};
+
 // rev lb_constrain(matrix, scalar, lp):
 //   exp_x = x.val().array().exp() (strided -> scalar std::exp);
 //   ret = exp_x + lb;  lp += x.val().sum() (sequential);
@@ -74,6 +126,20 @@ void clower_fwd(KernelCtx& ctx) {
   const double* x = ctx.in[0].data;
   double* exp_x = ctx.scratch;
   const Bound lb(ctx.in[1]);
+  if (has_inf(lb, n, kNegInf)) {
+    if (!lb.varies()) {
+      // One shared -inf: the container is the identity end to end.
+      for (int64_t i = 0; i < n; ++i) ctx.out.data[i] = x[i];
+      ctx.out2.data[0] = 0.0;
+      return;
+    }
+    for (int64_t i = 0; i < n; ++i) {
+      exp_x[i] = std::exp(x[i]);
+      ctx.out.data[i] = lb[i] == kNegInf ? x[i] : exp_x[i] + lb[i];
+    }
+    ctx.out2.data[0] = masked_sum(x, lb.p, n, kNegInf);
+    return;
+  }
   if (packet_math() && n > 1) {
     MapA(exp_x, n) = CMapA(x, n).exp();
     if (lb.varies())
@@ -92,6 +158,25 @@ void clower_bwd(KernelCtx& ctx) {
   const int64_t n = ctx.in[0].len;
   const double* exp_x = ctx.scratch;
   const double* dout = ctx.out_adj_vec.data;
+  const Bound lb(ctx.in[1]);
+  if (has_inf(lb, n, kNegInf)) {
+    // Identity elements pass ret.adj straight through and take no jacobian
+    // share; their bound, having stayed out of the value, collects nothing.
+    if (ctx.in_adj[0].data) {
+      if (!lb.varies())
+        for (int64_t i = 0; i < n; ++i) ctx.in_adj[0].data[i] += dout[i];
+      else
+        for (int64_t i = 0; i < n; ++i)
+          ctx.in_adj[0].data[i] +=
+              lb[i] == kNegInf ? dout[i] : dout[i] * exp_x[i] + ctx.out2_adj;
+    }
+    if (lb.varies()) {
+      BoundAdj lba(ctx, 1);
+      for (int64_t i = 0; i < n; ++i)
+        if (lb[i] != kNegInf) lba.add(i, dout[i]);
+    }
+    return;
+  }
   if (ctx.in_adj[0].data) {
     for (int64_t i = 0; i < n; ++i)
       ctx.in_adj[0].data[i] += dout[i] * exp_x[i] + ctx.out2_adj;
@@ -109,6 +194,19 @@ void cupper_fwd(KernelCtx& ctx) {
   const double* x = ctx.in[0].data;
   double* exp_x = ctx.scratch;
   const Bound ub(ctx.in[1]);
+  if (has_inf(ub, n, kPosInf)) {
+    if (!ub.varies()) {
+      for (int64_t i = 0; i < n; ++i) ctx.out.data[i] = x[i];
+      ctx.out2.data[0] = 0.0;
+      return;
+    }
+    for (int64_t i = 0; i < n; ++i) {
+      exp_x[i] = std::exp(x[i]);
+      ctx.out.data[i] = ub[i] == kPosInf ? x[i] : ub[i] - exp_x[i];
+    }
+    ctx.out2.data[0] = masked_sum(x, ub.p, n, kPosInf);
+    return;
+  }
   if (packet_math() && n > 1) {
     MapA(exp_x, n) = CMapA(x, n).exp();
     if (ub.varies())
@@ -127,11 +225,100 @@ void cupper_bwd(KernelCtx& ctx) {
   const int64_t n = ctx.in[0].len;
   const double* exp_x = ctx.scratch;
   const double* dout = ctx.out_adj_vec.data;
+  const Bound ub(ctx.in[1]);
+  if (has_inf(ub, n, kPosInf)) {
+    if (ctx.in_adj[0].data) {
+      if (!ub.varies())
+        for (int64_t i = 0; i < n; ++i) ctx.in_adj[0].data[i] += dout[i];
+      else
+        for (int64_t i = 0; i < n; ++i)
+          ctx.in_adj[0].data[i] +=
+              ub[i] == kPosInf ? dout[i] : -dout[i] * exp_x[i] + ctx.out2_adj;
+    }
+    if (ub.varies()) {
+      BoundAdj uba(ctx, 1);
+      for (int64_t i = 0; i < n; ++i)
+        if (ub[i] != kPosInf) uba.add(i, dout[i]);
+    }
+    return;
+  }
   if (ctx.in_adj[0].data) {
     for (int64_t i = 0; i < n; ++i)
       ctx.in_adj[0].data[i] += -dout[i] * exp_x[i] + ctx.out2_adj;
   }
   add_bound_adj(ctx, 1, dout, n);
+}
+
+// The stored inv_logit, by whichever rev overload this slot's length selects.
+inline void clu_inv_logit(const double* x, double* il, int64_t n) {
+  if (n == 1) {
+    // Scalar rev overload: sign-branching stan::math::inv_logit.
+    il[0] = stan::math::inv_logit(x[0]);
+    return;
+  }
+  // Matrix rev overload: Eigen's scalar logistic functor over a strided
+  // .val() expression: e/(1+e) with an inf guard, no sign branch.
+  if (packet_math()) {
+    MapA(il, n) = CMapA(x, n).exp();
+    MapA(il, n) =
+        (MapA(il, n).isInf()).select(1.0, MapA(il, n) / (1.0 + MapA(il, n)));
+  } else {
+    for (int64_t i = 0; i < n; ++i) {
+      const double e = std::exp(x[i]);
+      il[i] = std::isinf(e) ? 1.0 : e / (1.0 + e);
+    }
+  }
+}
+
+// lub_constrain resolves each element by which of its bounds are infinite:
+// both -> identity, lower only -> the upper-bound transform, upper only ->
+// the lower-bound transform, neither -> the logit map. The jacobian follows,
+// contributing nothing, x, x, and log(diff) + logistic respectively.
+void clu_fwd_inf(KernelCtx& ctx, int64_t n, const double* x, double* il,
+                 const Bound& lb, const Bound& ub) {
+  double jac = 0.0;
+  for (int64_t i = 0; i < n; ++i) {
+    const bool li = lb[i] == kNegInf, ui = ub[i] == kPosInf;
+    if (li && ui) continue;
+    if (li || ui) {
+      jac += x[i];
+      continue;
+    }
+    const double nax = -std::abs(x[i]);
+    jac += std::log(ub[i] - lb[i]) + (nax - 2.0 * stan::math::log1p_exp(nax));
+  }
+  ctx.out2.data[0] = jac;
+  clu_inv_logit(x, il, n);
+  for (int64_t i = 0; i < n; ++i) {
+    const bool li = lb[i] == kNegInf, ui = ub[i] == kPosInf;
+    ctx.out.data[i] = li && ui ? x[i]
+                      : li     ? ub[i] - std::exp(x[i])
+                      : ui     ? std::exp(x[i]) + lb[i]
+                               : (ub[i] - lb[i]) * il[i] + lb[i];
+  }
+}
+
+void clu_bwd_inf(KernelCtx& ctx, int64_t n, const double* x, const double* il,
+                 const Bound& lb, const Bound& ub) {
+  const double* dout = ctx.out_adj_vec.data;
+  const double lp_adj = ctx.out2_adj;
+  BoundAdj lba(ctx, 1), uba(ctx, 2);
+  for (int64_t i = 0; i < n; ++i) {
+    const bool li = lb[i] == kNegInf, ui = ub[i] == kPosInf;
+    const double diff = ub[i] - lb[i];
+    if (ctx.in_adj[0].data)
+      ctx.in_adj[0].data[i] += li && ui ? dout[i]
+                               : li     ? -dout[i] * std::exp(x[i]) + lp_adj
+                               : ui ? dout[i] * std::exp(x[i]) + lp_adj
+                                    : dout[i] * diff * il[i] * (1.0 - il[i]) +
+                                          lp_adj * (1.0 - 2.0 * il[i]);
+    if (!li)
+      lba.add(i,
+              ui ? dout[i] : dout[i] * (1.0 - il[i]) - (1.0 / diff) * lp_adj);
+    if (!ui) uba.add(i, li ? dout[i] : dout[i] * il[i] + (1.0 / diff) * lp_adj);
+  }
+  lba.commit();
+  uba.commit();
 }
 
 // rev lub_constrain(matrix, scalar, scalar, lp):
@@ -144,6 +331,10 @@ void clu_fwd(KernelCtx& ctx) {
   const double* x = ctx.in[0].data;
   double* il = ctx.scratch;
   const Bound lb(ctx.in[1]), ub(ctx.in[2]);
+  if (has_inf(lb, n, kNegInf) || has_inf(ub, n, kPosInf)) {
+    clu_fwd_inf(ctx, n, x, il, lb, ub);
+    return;
+  }
   // Shared bounds make log(diff) loop-invariant, and std::log is opaque
   // enough that only hoisting it by hand keeps a parameter block at one
   // call rather than one per element.
@@ -157,23 +348,7 @@ void clu_fwd(KernelCtx& ctx) {
     jac += log_diff + (nax - 2.0 * stan::math::log1p_exp(nax));
   }
   ctx.out2.data[0] = jac;
-  if (n == 1) {
-    // Scalar rev overload: sign-branching stan::math::inv_logit.
-    il[0] = stan::math::inv_logit(x[0]);
-  } else {
-    // Matrix rev overload: Eigen's scalar logistic functor over a strided
-    // .val() expression: e/(1+e) with an inf guard, no sign branch.
-    if (packet_math()) {
-      MapA(il, n) = CMapA(x, n).exp();
-      MapA(il, n) =
-          (MapA(il, n).isInf()).select(1.0, MapA(il, n) / (1.0 + MapA(il, n)));
-    } else {
-      for (int64_t i = 0; i < n; ++i) {
-        const double e = std::exp(x[i]);
-        il[i] = std::isinf(e) ? 1.0 : e / (1.0 + e);
-      }
-    }
-  }
+  clu_inv_logit(x, il, n);
   for (int64_t i = 0; i < n; ++i)
     ctx.out.data[i] = (varies ? ub[i] - lb[i] : diff0) * il[i] + lb[i];
 }
@@ -182,6 +357,10 @@ void clu_bwd(KernelCtx& ctx) {
   const double* il = ctx.scratch;
   const double* dout = ctx.out_adj_vec.data;
   const Bound lb(ctx.in[1]), ub(ctx.in[2]);
+  if (has_inf(lb, n, kNegInf) || has_inf(ub, n, kPosInf)) {
+    clu_bwd_inf(ctx, n, ctx.in[0].data, il, lb, ub);
+    return;
+  }
   const bool varies = lb.varies() || ub.varies();
   const double diff0 = ub[0] - lb[0];
   if (ctx.in_adj[0].data) {
@@ -396,9 +575,10 @@ void offset_mult_bwd(KernelCtx& ctx) {
       // lp term (sum(log(sigma))) before the value (fma), so the reverse
       // sweep contracts fma's contribution into sigma.adj first and the
       // jacobian's second -- and a += b += c does not round like a += (b + c).
-      for (int64_t i = 0; i < n; ++i) ctx.in_adj[2].data[i] += dout[i] * x[i];
-      for (int64_t i = 0; i < n; ++i)
+      for (int64_t i = 0; i < n; ++i) {
+        ctx.in_adj[2].data[i] += dout[i] * x[i];
         ctx.in_adj[2].data[i] += ctx.out2_adj / sg[i];
+      }
     } else {
       double s = 0.0;
       for (int64_t i = 0; i < n; ++i) s += dout[i] * x[i];

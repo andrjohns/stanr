@@ -9,6 +9,7 @@
 #include <stanli/ode_prog.hpp>
 
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,7 +39,9 @@ struct OdeSpec {
   std::vector<int> x_i;
   double rtol = 1e-6, atol = 1e-6;
   long max_steps = 1000000;
-  bool stiff = false;  // bdf when true, rk45 otherwise (deprecated path)
+  // Whether this solver uses the legacy multistep defaults
+  // (BDF/Adams: 1e-10, 1e8 rather than RK45's 1e-6, 1e6).
+  bool stiff = false;
   // Which integrator, for the modern ode_* family. These are genuinely
   // different methods, not aliases: Adams and BDF are both CVODES
   // multistep but with different stability, and CKRK is a different
@@ -47,11 +50,10 @@ struct OdeSpec {
   // pass a casual test and fail the user who chose it for stiffness.
   enum Solver { RK45, BDF, ADAMS, CKRK };
   Solver solver = RK45;
-  // True for integrate_ode_*, whose call goes through the deprecated
-  // stan-math entry points. Those delegate to the same *_tol_impl the
-  // modern ones use, but keeping the call site distinct is what leaves
-  // the four corpus ODE models running the exact code they were
-  // verified against.
+  // True for integrate_ode_*. The kernel preserves that interface's solver
+  // defaults and function-name labels while calling the same *_tol_impl the
+  // deprecated Stan Math wrappers delegate to, avoiding their per-callback
+  // std::vector/Eigen adapter.
   bool legacy = false;
   // The right-hand side's arguments after (t, y), in declaration order.
   // The deprecated interface always fills this with exactly three --
@@ -66,6 +68,15 @@ struct OdeSpec {
   // The right-hand side, compiled. Falls back to the MIR interpreter when
   // `prog.ok` is false; `prog.why` says what stopped it.
   RhsProgram prog;
+  // Branchless double-forward/generated-reverse derivative payload for the
+  // direct coupled RK45/CKRK path. Null is an ordinary structural refusal;
+  // `prog` remains the exact nested-autodiff oracle and fallback.
+  std::shared_ptr<const IslandProg> direct_rk;
+  std::string direct_rk_why;
+  // Selection is fixed at lowering so the repeated kernel does no environment
+  // lookup. STANLI_NO_ODE_DIRECT_RK leaves the payload present for a clean
+  // same-binary oracle comparison while disabling its use.
+  bool direct_rk_enabled = false;
 };
 
 }  // namespace stanli

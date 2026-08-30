@@ -71,7 +71,6 @@
 #include <stan/math/prim/meta/ad_promotable.hpp>
 #include <stan/math/prim/meta/append_return_type.hpp>
 #include <stan/math/prim/meta/base_type.hpp>
-#include <stan/math/prim/meta/common_container_type.hpp>
 #include <stan/math/prim/meta/contains_std_vector.hpp>
 #include <stan/math/prim/meta/contains_tuple.hpp>
 #include <stan/math/prim/meta/error_index.hpp>
@@ -118,6 +117,7 @@
 #include <stan/math/prim/meta/is_real.hpp>
 #include <stan/math/prim/meta/is_stan_scalar.hpp>
 #include <stan/math/prim/meta/is_stan_scalar_or_eigen.hpp>
+#include <stan/math/prim/meta/lazy_select_evaluator.hpp>
 #include <stan/math/prim/meta/modify_eigen_options.hpp>
 #include <stan/math/prim/meta/partials_return_type.hpp>
 #include <stan/math/prim/meta/partials_type.hpp>

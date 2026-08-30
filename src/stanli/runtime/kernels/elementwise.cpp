@@ -2,7 +2,14 @@
 #include <stanli/graph.hpp>
 #include <stanli/optable.hpp>
 
+#include <stan/math/prim/fun/prod.hpp>
+#include <stan/math/prim/fun/max.hpp>
+#include <stan/math/prim/fun/min.hpp>
+#include <stan/math/rev/core.hpp>
+
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 
 namespace stanli {
 namespace {
@@ -142,6 +149,104 @@ void sum_vec_bwd(KernelCtx& ctx) {
       ctx.in_adj[0].data[i] += ctx.out_adj;
 }
 
+// OP_PROD_VEC: product of a vector/row-vector.
+// Bit 0 preserves the ascending scalar reduction selected by Eigen when the
+// source expression contains a strided matrix row. Bit 1 marks an active
+// expression: Matrix<var> has no double packet reducer, so its value follows
+// the same ascending scalar order even for a contiguous named vector.
+// Eigen's redux normally chooses its packet boundary from the input address.
+// Graph slots share one arena, so that would make the arithmetic grouping
+// depend on every slot laid out before this one.  The explicit same-type
+// CwiseUnary expression has no DirectAccessBit but retains packet access:
+// first_default_aligned is consequently lane zero, matching the Eigen value
+// CmdStan passes to stan::math::prod without allocating a copy here.
+void prod_vec_fwd(KernelCtx& ctx) {
+  if (ctx.variant != 0) {
+    double product = ctx.in[0].data[0];
+    for (int64_t i = 1; i < ctx.in[0].len; ++i) product *= ctx.in[0].data[i];
+    ctx.out.data[0] = product;
+  } else {
+    using Vec = Eigen::Matrix<double, Eigen::Dynamic, 1>;
+    const Eigen::Map<const Vec> input(ctx.in[0].data, ctx.in[0].len);
+    ctx.out.data[0] = stan::math::prod(
+        input.unaryExpr(Eigen::internal::core_cast_op<double, double>()));
+  }
+}
+void prod_vec_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data) return;
+  stan::math::nested_rev_autodiff nested;
+  Eigen::Matrix<stan::math::var, Eigen::Dynamic, 1> input(ctx.in[0].len);
+  for (int64_t i = 0; i < ctx.in[0].len; ++i) input(i) = ctx.in[0].data[i];
+  stan::math::var product;
+  if (ctx.variant & 1u) {
+    // A strided row expression takes Eigen's ascending scalar reducer.
+    product = input(0);
+    for (int64_t i = 1; i < ctx.in[0].len; ++i) product *= input(i);
+  } else {
+    product = stan::math::prod(input);
+  }
+  stan::math::var seeded = product * ctx.out_adj;
+  stan::math::grad(seeded.vi_);
+  for (int64_t i = 0; i < ctx.in[0].len; ++i)
+    ctx.in_adj[0].data[i] += input(i).adj();
+}
+
+// OP_EXTREMA_VEC: min/max of a direct named vector/row-vector. Bit 0 selects
+// max and bit 1 marks an active expression.
+// Stan Math defines extrema of an empty real
+// Eigen container as +/- infinity.  For nonempty inputs, the same-type unary
+// expression deliberately clears DirectAccessBit while retaining packet
+// access, so Eigen begins its packet reduction at lane zero just as it does
+// for CmdStan's aligned owning VectorXd.  A direct Map would instead make
+// signed-zero/NaN tie grouping depend on this slot's arena address.
+void extrema_vec_fwd(KernelCtx& ctx) {
+  const bool maximum = ctx.variant & 1u;
+  if (ctx.in[0].len == 0) {
+    ctx.out.data[0] = maximum ? -std::numeric_limits<double>::infinity()
+                              : std::numeric_limits<double>::infinity();
+    return;
+  }
+  if (ctx.variant & 2u) {
+    // Matrix<var> has no packet extrema reducer. Eigen retains coefficient
+    // zero, then replaces it only on a strict comparison while scanning in
+    // order. This distinction controls signed-zero bits, interior NaNs, and
+    // which tied coefficient receives the adjoint.
+    int64_t selected = 0;
+    double value = ctx.in[0].data[0];
+    for (int64_t i = 1; i < ctx.in[0].len; ++i) {
+      const double candidate = ctx.in[0].data[i];
+      if (maximum ? value < candidate : candidate < value) {
+        value = candidate;
+        selected = i;
+      }
+    }
+    ctx.out.data[0] = value;
+    if (ctx.scratch != nullptr) ctx.scratch[0] = static_cast<double>(selected);
+    return;
+  }
+  using Vec = Eigen::Matrix<double, Eigen::Dynamic, 1>;
+  const Eigen::Map<const Vec> input(ctx.in[0].data, ctx.in[0].len);
+  const auto owning_grouping =
+      input.unaryExpr(Eigen::internal::core_cast_op<double, double>());
+  Eigen::Index selected = 0;
+  // Keep Stan Math's exact value path. Eigen's index-returning overload can
+  // select a different packet evaluator for NaNs and signed-zero ties, so it
+  // is used only to remember the reverse destination.
+  ctx.out.data[0] = maximum ? stan::math::max(owning_grouping)
+                            : stan::math::min(owning_grouping);
+  if (!maximum)
+    (void)owning_grouping.minCoeff(&selected);
+  else
+    (void)owning_grouping.maxCoeff(&selected);
+  if (ctx.scratch != nullptr) ctx.scratch[0] = static_cast<double>(selected);
+}
+void extrema_vec_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data || ctx.in[0].len == 0) return;
+  ctx.in_adj[0].data[static_cast<int64_t>(ctx.scratch[0])] += ctx.out_adj;
+}
+
+int64_t scalar_scratch(const Op&, const Slot*) { return 1; }
+
 // OP_INDEX: scalar out = in[flat], idata = {flat}. Backward scatters.
 void index_fwd(KernelCtx& ctx) {
   ctx.out.data[0] = ctx.in[0].data[ctx.idata[0]];
@@ -189,6 +294,34 @@ void slice_fwd(KernelCtx& ctx) {
 void slice_bwd(KernelCtx& ctx) {
   if (!ctx.in_adj[0].data) return;
   const int64_t start = ctx.idata[0];
+  for (int64_t i = 0; i < ctx.out.len; ++i)
+    ctx.in_adj[0].data[start + i] += ctx.out_adj_vec.data[i];
+}
+
+// OP_DYNAMIC_SLICE: the 1-based integer in[1] selects one fixed-width block
+// from in[0]. Generated quantities use this for an RNG-produced state index;
+// idata[0] is the number of blocks and out.len is their common width.
+int64_t dynamic_slice_start(const KernelCtx& ctx) {
+  if (ctx.n_in != 2 || ctx.n_idata != 1 || ctx.in[1].len != 1 ||
+      ctx.idata == nullptr || ctx.idata[0] <= 0 || ctx.out.len <= 0 ||
+      ctx.in[0].len % ctx.idata[0] != 0 ||
+      ctx.in[0].len / ctx.idata[0] != ctx.out.len)
+    throw std::logic_error("malformed dynamic slice descriptor");
+  const double raw = ctx.in[1].data[0];
+  const int64_t count = ctx.idata[0];
+  if (!std::isfinite(raw) || std::trunc(raw) != raw || raw < 1.0 ||
+      raw > static_cast<double>(count))
+    throw std::out_of_range("dynamic slice index out of range");
+  return (static_cast<int64_t>(raw) - 1) * ctx.out.len;
+}
+void dynamic_slice_fwd(KernelCtx& ctx) {
+  const int64_t start = dynamic_slice_start(ctx);
+  for (int64_t i = 0; i < ctx.out.len; ++i)
+    ctx.out.data[i] = ctx.in[0].data[start + i];
+}
+void dynamic_slice_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data) return;
+  const int64_t start = dynamic_slice_start(ctx);
   for (int64_t i = 0; i < ctx.out.len; ++i)
     ctx.in_adj[0].data[start + i] += ctx.out_adj_vec.data[i];
 }
@@ -276,6 +409,22 @@ void set_slice_bwd(KernelCtx& ctx) {
       ctx.in_adj[1].data[i] += ctx.out_adj_vec.data[start + i];
 }
 
+// OP_SET_SLICE_INPLACE: out IS in[0]. Untouched adjoints already pass
+// through because those two adjoint buffers alias. Overwritten cells belong
+// to the RHS instead, so route them there and clear them from the base.
+void set_slice_inplace_fwd(KernelCtx& ctx) {
+  const int64_t start = ctx.idata[0];
+  for (int64_t i = 0; i < ctx.in[1].len; ++i)
+    ctx.out.data[start + i] = ctx.in[1].data[i];
+}
+void set_slice_inplace_bwd(KernelCtx& ctx) {
+  const int64_t start = ctx.idata[0], len = ctx.in[1].len;
+  if (ctx.in_adj[1].data)
+    for (int64_t i = 0; i < len; ++i)
+      ctx.in_adj[1].data[i] += ctx.out_adj_vec.data[start + i];
+  for (int64_t i = 0; i < len; ++i) ctx.out_adj_vec.data[start + i] = 0.0;
+}
+
 // OP_SET_SLICE_STRIDED: out = copy(in[0]) with
 // out[start + i*stride] = in[1][i], idata = {start, stride}. The write-side
 // mirror of OP_SLICE_STRIDED: a loop filling a column-major matrix row by
@@ -308,6 +457,23 @@ void set_slice_strided_bwd(KernelCtx& ctx) {
   }
 }
 
+// OP_SET_SLICE_STRIDED_INPLACE: the comb-shaped counterpart above, with
+// out and in[0] sharing both value and adjoint storage.
+void set_slice_strided_inplace_fwd(KernelCtx& ctx) {
+  const int64_t start = ctx.idata[0], stride = ctx.idata[1];
+  for (int64_t i = 0; i < ctx.in[1].len; ++i)
+    ctx.out.data[start + i * stride] = ctx.in[1].data[i];
+}
+void set_slice_strided_inplace_bwd(KernelCtx& ctx) {
+  const int64_t start = ctx.idata[0], stride = ctx.idata[1],
+                len = ctx.in[1].len;
+  if (ctx.in_adj[1].data)
+    for (int64_t i = 0; i < len; ++i)
+      ctx.in_adj[1].data[i] += ctx.out_adj_vec.data[start + i * stride];
+  for (int64_t i = 0; i < len; ++i)
+    ctx.out_adj_vec.data[start + i * stride] = 0.0;
+}
+
 }  // namespace
 
 // Called from Executor's constructor path; a static registrar object in a
@@ -318,14 +484,24 @@ void register_elementwise_kernels() {
   register_kernel(OP_BCAST_FMA, Kernel{fma_fwd, fma_bwd, nullptr});
   register_kernel(OP_MATVEC, Kernel{matvec_fwd, matvec_bwd, nullptr});
   register_kernel(OP_SUM_VEC, Kernel{sum_vec_fwd, sum_vec_bwd, nullptr});
+  register_kernel(OP_PROD_VEC, Kernel{prod_vec_fwd, prod_vec_bwd, nullptr});
+  register_kernel(OP_EXTREMA_VEC,
+                  Kernel{extrema_vec_fwd, extrema_vec_bwd, scalar_scratch});
   register_kernel(OP_INDEX, Kernel{index_fwd, index_bwd, nullptr});
   register_kernel(OP_SET_INDEX, Kernel{set_index_fwd, set_index_bwd, nullptr});
   register_kernel(OP_SET_INDEX_INPLACE, Kernel{set_index_inplace_fwd,
                                                set_index_inplace_bwd, nullptr});
   register_kernel(OP_SLICE, Kernel{slice_fwd, slice_bwd, nullptr});
+  register_kernel(OP_DYNAMIC_SLICE,
+                  Kernel{dynamic_slice_fwd, dynamic_slice_bwd, nullptr});
   register_kernel(OP_SET_SLICE, Kernel{set_slice_fwd, set_slice_bwd, nullptr});
+  register_kernel(OP_SET_SLICE_INPLACE, Kernel{set_slice_inplace_fwd,
+                                               set_slice_inplace_bwd, nullptr});
   register_kernel(OP_SET_SLICE_STRIDED, Kernel{set_slice_strided_fwd,
                                                set_slice_strided_bwd, nullptr});
+  register_kernel(OP_SET_SLICE_STRIDED_INPLACE,
+                  Kernel{set_slice_strided_inplace_fwd,
+                         set_slice_strided_inplace_bwd, nullptr});
   register_kernel(OP_SLICE_STRIDED,
                   Kernel{slice_strided_fwd, slice_strided_bwd, nullptr});
   register_kernel(OP_GATHER, Kernel{gather_fwd, gather_bwd, nullptr});

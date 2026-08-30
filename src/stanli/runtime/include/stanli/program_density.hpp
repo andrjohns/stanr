@@ -1,5 +1,5 @@
-// The scalar continuous densities, once, for everything that is not a
-// graph kernel.
+// The scalar continuous densities and distribution functions, once, for
+// everything that is not a graph kernel.
 //
 // There used to be two lists. The graph had all of them
 // (STANLI_SCALAR_DENSITY_LIST, optable.hpp); the register machine carried
@@ -13,11 +13,13 @@
 // everywhere else. `target += chi_square_lpdf(y | nu)` inside an
 // `if (theta > 0)` did not compile; the same line outside the `if` did.
 //
-// So there is one list now, and this is the one place that switches on it.
-// Three callers share these definitions rather than instantiating 27
-// densities apiece: the register machine's interpreter (program.hpp), its
-// generated adjoint (adjoint.cpp), and the MIR interpreter
-// (mir_interp.hpp).
+// So there is one shared dispatch now, and this is the one place that
+// switches on it. CDF/LCDF/LCCDF functions use the same scalar argument and
+// partials contract and are included as well, which lets truncation inside a
+// runtime-control region use the same implementation as the graph.
+// Three callers share these definitions rather than instantiating the whole
+// set apiece: the register machine's interpreter (program.hpp), its generated
+// adjoint (adjoint.cpp), and the MIR interpreter (mir_interp.hpp).
 #ifndef STANLI_PROGRAM_DENSITY_HPP
 #define STANLI_PROGRAM_DENSITY_HPP
 
@@ -28,8 +30,9 @@
 
 namespace stanli {
 
-// The widest Stan gives a scalar continuous density: student_t,
-// skew_normal, exp_mod_normal, pareto_type_2, skew_double_exponential.
+// The widest scalar probability functions here take four arguments
+// (student_t, skew_normal, exp_mod_normal, pareto_type_2, and
+// skew_double_exponential).
 constexpr int kMaxDensityArgs = 4;
 
 // How many densities there are; ids run over [0, count).
@@ -66,7 +69,17 @@ extern template stan::math::var program_density<stan::math::var>(
 // Returns whether Stan Math built a dependency edge. A constant early return
 // fills zero partials and returns false so reverse mode can skip, rather than
 // form an indeterminate infinite-adjoint-times-zero product.
-bool program_density_partials(int id, const double* args, double* partials);
+//
+// Bit k of `mask` says argument k needs a partial; a clear bit binds it as a
+// plain double, which is what makes stan-math drop that argument's partial
+// expression, and leaves partials[k] untouched. The value is not affected --
+// propto is off and this function's value is discarded anyway, the forward
+// having computed it -- so a mask only removes arithmetic whose result the
+// caller discards. Masks are dispatched for the densities whose tier carries
+// STANLI_DENSITY_FULL_MASKS (optable.hpp) and ignored for the rest, the same
+// trade the graph's density kernels make.
+bool program_density_partials(int id, unsigned mask, const double* args,
+                              double* partials);
 
 }  // namespace stanli
 

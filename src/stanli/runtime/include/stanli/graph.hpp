@@ -13,6 +13,15 @@
 
 namespace stanli {
 
+class WaRng;
+
+// Per-evaluation resources that are neither graph structure nor arena state.
+// The caller owns every pointed-to resource. In particular, an RNG stream
+// belongs to one chain/drawing thread, never to a compiled model or executor.
+struct EvalState {
+  WaRng* wa_rng = nullptr;
+};
+
 // A view of one contiguous buffer. len == 1 means scalar.
 struct Desc {
   double* data;
@@ -22,16 +31,17 @@ struct Desc {
 // A value in the graph. Slots with is_param are the unconstrained parameter
 // vector, in declaration order; everything else is data or an intermediate.
 struct Slot {
-  int64_t offset = 0;  // into the value / adjoint arenas (filled at bind)
+  int64_t offset = 0;  // into the value arena (filled at bind)
   int64_t len = 0;
   bool is_param = false;
 };
 
 struct Op {
   uint16_t opcode = 0;
-  uint8_t variant = 0;  // density kernels: bits 0..5 per-arg activity
-                        // (1 = autodiff), bit 6 = elementwise lp (out is
-                        // len N, out[n] = element n's lp), bit 7 = propto
+  // Opcode-specific compact mode. Density kernels use bits 0..5 for
+  // per-argument activity, bit 6 for elementwise lp, and bit 7 for propto;
+  // other kernels use it for contracts such as ODE scalar types or RNG family.
+  uint8_t variant = 0;
   int out = -1;
   int out2 = -1;  // optional second output (e.g. constrain jacobian term)
   int in[6] = {-1, -1, -1, -1, -1, -1};
@@ -94,6 +104,7 @@ struct KernelCtx {
   const int* idata = nullptr;
   int64_t n_idata = 0;
   const void* udata = nullptr;
+  EvalState* eval_state = nullptr;
   Desc out2{nullptr, 0};  // second output value (scalar), if any
   // Backward only. Data inputs get {nullptr, len}: kernels skip them.
   Desc in_adj[6];
@@ -145,6 +156,12 @@ class Executor {
   Executor& operator=(const Executor&) = delete;
 
   int64_t n_params() const { return n_params_; }
+  // Number of doubles in the reverse-mode arena. This is intentionally
+  // observable: inactive data and slots left behind by graph rewrites must
+  // not silently return to the per-gradient clear path.
+  int64_t adjoint_storage_size() const {
+    return static_cast<int64_t>(adjoints_.size());
+  }
   // The bound graph, so a second executor over the same model can be
   // built without re-lowering. Multi-chain sampling needs one executor
   // per chain -- the arenas are mutable per-evaluation state -- and
@@ -172,8 +189,11 @@ class Executor {
   // Safe to interleave with gradient(): that always runs a full forward
   // first, so nothing stale survives into a reverse sweep.
   double forward_value_only();
-  // Forward for graphs whose result is not a scalar (tests only).
+  // Forward for graphs whose result is not a scalar, chiefly write_array.
+  // The overload supplies caller-owned per-evaluation resources such as the
+  // generated-quantities RNG stream.
   void run_forward_only();
+  void run_forward_only(EvalState state);
   // forward() + reverse sweep. grad_out receives d result / d params in
   // param-slot declaration order. Returns the forward value.
   double gradient(double* grad_out);
@@ -190,7 +210,8 @@ class Executor {
 
  private:
   void bind_();
-  KernelCtx make_ctx_(const Op& op, const std::vector<char>& written);
+  KernelCtx make_ctx_(const Op& op, const std::vector<char>& written,
+                      const std::vector<int64_t>& adjoint_offsets);
 
   struct ProfEntry {
     int64_t calls = 0;  // forward invocations
@@ -202,6 +223,7 @@ class Executor {
   Graph graph_;
   std::vector<double> values_;
   std::vector<double> adjoints_;
+  int64_t result_adjoint_offset_ = -1;
   std::vector<double> scratch_;
   // One context per op, assembled once at bind. Every field in it is a
   // pointer into an arena that never moves after binding, or an immediate
@@ -226,6 +248,10 @@ class Executor {
   std::vector<ProfEntry> prof_;  // indexed by opcode; empty until enabled
   int64_t n_grad_evals_ = 0;
   int64_t n_params_ = 0;
+  // Every bound KernelCtx points here. A run copies the caller's lightweight
+  // state into this stable cell, so contexts stay preassembled and only the
+  // caller-owned resources behind the pointers are mutated.
+  EvalState eval_state_;
 };
 
 }  // namespace stanli

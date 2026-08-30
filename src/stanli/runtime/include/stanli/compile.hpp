@@ -1,6 +1,6 @@
-// The graph compiler: transformed-MIR sexp text -> executable graph, sized
-// against a concrete dataset. Scope: straight-line log_prob; unsupported
-// constructs raise CompileError naming the construct.
+// The graph compiler: portable or legacy transformed-MIR text -> executable
+// graph, sized against a concrete dataset. Scope: straight-line log_prob;
+// unsupported constructs raise CompileError naming the construct.
 //
 // Generated lower/upper checks keep their source phase: prepare_data checks
 // run at construction, while log_prob/write_array checks stay ordered graph
@@ -177,12 +177,14 @@ struct CompiledModel {
     size_t n_gq_start = 0;
     std::vector<std::pair<int, std::vector<double>>> fills;
     int64_t n_unconstrained = 0;  // must agree with the log_prob graph's
-    // Non-empty when lowering stopped early (an RNG in generated quantities,
-    // say). `columns` then holds the prefix that did lower, and this says
-    // what stopped it -- silently short CSV rows would be worse.
+    // Non-empty when lowering stopped early (an unsupported RNG family or
+    // draw-dependent branch, say). `columns` then holds the prefix that did
+    // lower, and this says what stopped it -- silently short CSV rows would
+    // be worse.
     std::string truncated;
     // Set alongside `truncated`: the per-draw interpreter that runs the
-    // whole section, RNG draws and draw-dependent branches included.
+    // whole section, unsupported RNG draws and draw-dependent branches
+    // included.
     // Drivers prefer it over the truncated graph (see wa_interp.hpp);
     // the graph remains the fast path whenever lowering completes.
     std::shared_ptr<WaInterp> interp;
@@ -197,7 +199,7 @@ struct CompiledModel {
   std::optional<WriteArray> write_array;
 };
 
-CompiledModel compile_model(const std::string& tmir_text, const DataMap& data);
+CompiledModel compile_model(const std::string& mir_text, const DataMap& data);
 
 }  // namespace stanli
 

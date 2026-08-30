@@ -30,6 +30,7 @@
 
 #include <stan/math.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -91,6 +92,14 @@ class MirInterp {
 
   std::map<std::string, Value>& env() { return env_; }
 
+  // A host may bind a typed value directly and skip stanc's generated input
+  // declaration/rebuild statements. Keep the declaration-owned geometry
+  // that FnCheck needs separately: an empty JSON array cannot encode trailing
+  // extents such as array[0] vector[3].
+  void set_declared_dims(const std::string& name, std::vector<int64_t> dims) {
+    decl_dims_[name] = std::move(dims);
+  }
+
   Value* find(const std::string& n) {
     auto it = env_.find(n);
     return it == env_.end() ? nullptr : &it->second;
@@ -104,26 +113,36 @@ class MirInterp {
     fail("expected int scalar", e.raw);
   }
 
-  // Bind arguments positionally by declared type and evaluate the body to
-  // its return value. This is the ODE entry point: real-typed parameters
-  // consume `args` in order, int-typed ones consume `int_args`.
+  // Bind arguments positionally by their declared logical views and evaluate
+  // the body to its return value. This is the ODE entry point: real-typed
+  // parameters consume `args` in order, int-typed ones consume `int_args`.
   std::vector<T> call(const mir::FunDef& f,
                       const std::vector<std::vector<T>>& args,
                       const std::vector<std::vector<int>>& int_args) {
+    if (udf_depth_ > 64) fail("UDF recursion too deep");
     MirInterp sub(funs_, where_, hooks_);
+    // Positional calls are used by the ODE/RHS fallback, but their formals
+    // have the same unknown Eigen-view provenance as an ordinary UDF's.
+    // Keeping them below top-level depth prevents product lowering from
+    // assuming a formal is an owning, address-zero vector.
+    sub.udf_depth_ = udf_depth_ + 1;
     sub.propto_ctx_ = propto_ctx_;
+    if (f.arg_views.size() != f.arg_names.size())
+      fail("function has incomplete unsized argument metadata: " + f.name);
     size_t ai = 0, ii = 0;
     for (size_t k = 0; k < f.arg_names.size(); ++k) {
-      const bool is_int = f.arg_types[k].find("UInt") != std::string::npos;
+      const mir::UnsizedView& view = f.arg_views[k];
+      const bool is_int = view.leaf == mir::UnsizedLeaf::Int;
       Value v;
       if (is_int && ii < int_args.size()) {
         v.is_int = true;
         v.i = int_args[ii++];
         v.r.assign(v.i.begin(), v.i.end());
-        if (f.arg_types[k] != "UInt") v.dims = {(int64_t)v.i.size()};
+        if (view.depth != 0) v.dims = {(int64_t)v.i.size()};
       } else if (ai < args.size()) {
         v.r = args[ai++];
-        if (f.arg_types[k] != "UReal") v.dims = {(int64_t)v.r.size()};
+        if (view.depth != 0 || view.leaf != mir::UnsizedLeaf::Real)
+          v.dims = {(int64_t)v.r.size()};
       }
       sub.env_[f.arg_names[k]] = std::move(v);
     }
@@ -236,17 +255,20 @@ class MirInterp {
           // uninitialized value: hmm_drive writes best_logp[1, K] where it
           // means best_logp[1, k], and its Viterbi only matches CmdStan's
           // because the never-written element loses every comparison.
-          if (e.is_int) e.i = {0};
-          e.r = {e.is_int ? T(0.0)
-                          : T(std::numeric_limits<double>::quiet_NaN())};
+          if (e.is_int) e.i = {std::numeric_limits<int>::min()};
+          e.r = {e.is_int
+                     ? T(static_cast<double>(std::numeric_limits<int>::min()))
+                     : T(std::numeric_limits<double>::quiet_NaN())};
         } else if (!st.decl_type.base.empty()) {
           // Bare sized decl: allocate so element writes work; real elements
           // are NaN until written (see the scalar case above).
           int64_t n = 1;
           for (int64_t d : declared_dims) n *= d;
-          e.r.assign(n, e.is_int ? T(0.0)
-                                 : T(std::numeric_limits<double>::quiet_NaN()));
-          if (e.is_int) e.i.assign(n, 0);
+          e.r.assign(
+              n, e.is_int
+                     ? T(static_cast<double>(std::numeric_limits<int>::min()))
+                     : T(std::numeric_limits<double>::quiet_NaN()));
+          if (e.is_int) e.i.assign(n, std::numeric_limits<int>::min());
           e.dims = declared_dims;
         }
         env_[st.decl_id] = std::move(e);
@@ -281,6 +303,69 @@ class MirInterp {
         Value* en = find(st.lhs);
         if (!en) fail("assignment to unknown " + st.lhs);
         Value v = eval(st.rhs);
+        // A lone All replaces the complete container. Retain the declared
+        // geometry and integer specialization owned by the destination:
+        // replacing the Value object wholesale would let malformed MIR
+        // resize or retag the declaration. The two-index matrix column form
+        // remains on its existing path below.
+        if (st.lhs_idx.size() == 1 && st.lhs_idx[0].name == "IndexAll") {
+          if (en->dims.empty())
+            fail("full-span assignment needs a container", st.raw);
+          if (v.r.size() != en->r.size())
+            fail("full-span assignment size mismatch", st.raw);
+          if (v.dims != en->dims)
+            fail("full-span assignment shape mismatch", st.raw);
+          const bool target_is_int = en->is_int;
+          en->r = std::move(v.r);
+          en->i.clear();
+          en->is_int = target_is_int;
+          if (target_is_int) {
+            en->i.reserve(en->r.size());
+            if (v.is_int && v.i.size() == en->r.size()) {
+              en->i = std::move(v.i);
+            } else {
+              for (const T& value : en->r)
+                en->i.push_back(static_cast<int>(val(value)));
+            }
+          }
+          return;
+        }
+        // Fix one or more leading dimensions of an N-D array and replace
+        // the complete remaining container. For array[3] matrix[2,4] x,
+        // x[i,j] is a row_vector[4]. First-index-fast storage makes those
+        // trailing values a strided sequence at offset + prefix_stride*k.
+        if (en->dims.size() > 2 && !st.lhs_idx.empty() &&
+            st.lhs_idx.size() < en->dims.size()) {
+          bool all_single = true;
+          for (const auto& index : st.lhs_idx)
+            if (index.name != "IndexSingle") all_single = false;
+          if (all_single) {
+            int64_t offset = 0, prefix_stride = 1;
+            for (size_t d = 0; d < st.lhs_idx.size(); ++d) {
+              const long i = as_int(st.lhs_idx[d].args[0]);
+              if (i < 1 || i > en->dims[d])
+                fail("indexed assignment index out of bounds", st.raw);
+              offset += (i - 1) * prefix_stride;
+              prefix_stride *= en->dims[d];
+            }
+            int64_t rest = 1;
+            for (size_t d = st.lhs_idx.size(); d < en->dims.size(); ++d)
+              rest *= en->dims[d];
+            if (static_cast<int64_t>(v.r.size()) != rest)
+              fail("indexed assignment size mismatch", st.raw);
+            for (int64_t k = 0; k < rest; ++k) {
+              const size_t dst =
+                  static_cast<size_t>(offset + prefix_stride * k);
+              en->r.at(dst) = v.r.at(static_cast<size_t>(k));
+              if (en->is_int)
+                en->i.at(dst) =
+                    v.is_int && static_cast<size_t>(k) < v.i.size()
+                        ? v.i[static_cast<size_t>(k)]
+                        : static_cast<int>(val(v.r.at(static_cast<size_t>(k))));
+            }
+            return;
+          }
+        }
         if (st.lhs_idx.size() == 1 && st.lhs_idx[0].name == "IndexSingle") {
           const long ix = as_int(st.lhs_idx[0].args[0]);
           if (en->dims.size() == 2) {
@@ -302,6 +387,100 @@ class MirInterp {
           }
           return;
         }
+        // Contiguous subrange write into a 1-D value: x[a:b] = rhs.
+        if (st.lhs_idx.size() == 1 && st.lhs_idx[0].name == "IndexBetween" &&
+            en->dims.size() == 1) {
+          const long a = as_int(st.lhs_idx[0].args[0]);
+          const long b = as_int(st.lhs_idx[0].args[1]);
+          const int64_t n = b >= a ? b - a + 1 : 0;
+          if (n > 0 && (a < 1 || b > en->dims[0] || b > (long)en->r.size()))
+            fail("range assignment index out of bounds", st.raw);
+          if ((int64_t)v.r.size() != n)
+            fail("range assignment size mismatch", st.raw);
+          for (int64_t k = 0; k < n; ++k) {
+            const size_t dst = static_cast<size_t>(a - 1 + k);
+            en->r.at(dst) = v.r.at(static_cast<size_t>(k));
+            if (en->is_int)
+              en->i.at(dst) =
+                  v.is_int && static_cast<size_t>(k) < v.i.size()
+                      ? v.i[static_cast<size_t>(k)]
+                      : static_cast<int>(val(v.r.at(static_cast<size_t>(k))));
+          }
+          return;
+        }
+        // General scatter write with at least one integer-array selector.
+        // MirInterp storage is first-index-fast, so enumerate the last axis
+        // outside and the first axis inside, matching eval_indexed and the
+        // RHS's logical order. Repeated indices deliberately retain Stan's
+        // last-write-wins behavior. Validate the complete selection before
+        // mutating the destination so a malformed index remains atomic.
+        bool has_multi = false;
+        for (const auto& index : st.lhs_idx)
+          has_multi = has_multi || index.name == "IndexMulti";
+        if (has_multi && st.lhs_idx.size() <= en->dims.size()) {
+          std::vector<std::vector<int64_t>> selected(en->dims.size());
+          std::vector<int64_t> out_dims;
+          for (size_t d = 0; d < en->dims.size(); ++d) {
+            const int64_t extent = en->dims[d];
+            const mir::Expr* index =
+                d < st.lhs_idx.size() ? &st.lhs_idx[d] : nullptr;
+            if (!index || index->name == "IndexAll") {
+              selected[d].reserve((size_t)extent);
+              for (int64_t k = 0; k < extent; ++k) selected[d].push_back(k);
+              out_dims.push_back(extent);
+            } else if (index->name == "IndexSingle") {
+              const long one = as_int(index->args[0]);
+              if (one < 1 || one > extent)
+                fail("multi-index assignment index out of bounds", st.raw);
+              selected[d].push_back(one - 1);
+            } else if (index->name == "IndexBetween") {
+              const long lo = as_int(index->args[0]);
+              const long hi = as_int(index->args[1]);
+              if (hi >= lo && (lo < 1 || hi > extent))
+                fail("multi-index assignment range out of bounds", st.raw);
+              for (long k = lo; k <= hi; ++k) selected[d].push_back(k - 1);
+              out_dims.push_back(hi >= lo ? hi - lo + 1 : 0);
+            } else if (index->name == "IndexMulti") {
+              const Value positions = eval(index->args[0]);
+              if (!positions.is_int)
+                fail("multi-index assignment needs an int index array", st.raw);
+              selected[d].reserve(positions.i.size());
+              for (int one : positions.i) {
+                if (one < 1 || one > extent)
+                  fail("multi-index assignment index out of bounds", st.raw);
+                selected[d].push_back(one - 1);
+              }
+              out_dims.push_back((int64_t)positions.i.size());
+            } else {
+              fail("unsupported multi-index assignment selector", st.raw);
+            }
+          }
+          std::vector<int64_t> stride(en->dims.size(), 1);
+          for (size_t d = 1; d < en->dims.size(); ++d)
+            stride[d] = stride[d - 1] * en->dims[d - 1];
+          std::vector<size_t> destinations;
+          std::function<void(int64_t, int64_t)> gather = [&](int64_t d,
+                                                             int64_t offset) {
+            if (d < 0) {
+              destinations.push_back((size_t)offset);
+              return;
+            }
+            for (int64_t position : selected[(size_t)d])
+              gather(d - 1, offset + position * stride[(size_t)d]);
+          };
+          gather((int64_t)en->dims.size() - 1, 0);
+          if (v.r.size() != destinations.size() ||
+              (!out_dims.empty() && v.dims != out_dims))
+            fail("multi-index assignment size mismatch", st.raw);
+          for (size_t k = 0; k < destinations.size(); ++k) {
+            const size_t dst = destinations[k];
+            en->r.at(dst) = v.r[k];
+            if (en->is_int)
+              en->i.at(dst) =
+                  v.is_int && k < v.i.size() ? v.i[k] : (int)val(v.r[k]);
+          }
+          return;
+        }
         // General all-Single N-D element write.
         if (st.lhs_idx.size() == en->dims.size()) {
           bool all_single = true;
@@ -320,6 +499,25 @@ class MirInterp {
             return;
           }
         }
+        // Explicit row write X[i, :] = row_vector / array.
+        if (st.lhs_idx.size() == 2 && st.lhs_idx[0].name == "IndexSingle" &&
+            st.lhs_idx[1].name == "IndexAll" && en->dims.size() == 2) {
+          const long i = as_int(st.lhs_idx[0].args[0]);
+          const int64_t R = en->dims[0], C = en->dims[1];
+          if (i < 1 || i > R)
+            fail("matrix row assignment index out of bounds", st.raw);
+          if ((int64_t)v.r.size() != C)
+            fail("matrix row assignment size mismatch", st.raw);
+          for (int64_t j = 0; j < C; ++j) {
+            const size_t dst = (size_t)(j * R + i - 1);
+            en->r.at(dst) = v.r.at((size_t)j);
+            if (en->is_int)
+              en->i.at(dst) = v.is_int && (size_t)j < v.i.size()
+                                  ? v.i[(size_t)j]
+                                  : (int)val(v.r.at((size_t)j));
+          }
+          return;
+        }
         // Column write Xc[:, j] = vector.
         if (st.lhs_idx.size() == 2 && st.lhs_idx[0].name == "IndexAll" &&
             st.lhs_idx[1].name == "IndexSingle" && en->dims.size() == 2) {
@@ -335,8 +533,44 @@ class MirInterp {
           const long b = as_int(st.lhs_idx[0].args[1]);
           const long j = as_int(st.lhs_idx[1].args[0]);
           const int64_t R = en->dims[0];
-          for (long k = a; k <= b; ++k)
-            en->r.at((j - 1) * R + (k - 1)) = v.r.at((size_t)(k - a));
+          const int64_t n = b >= a ? b - a + 1 : 0;
+          if (j < 1 || j > en->dims[1] || (n > 0 && (a < 1 || b > R)))
+            fail("matrix range assignment index out of bounds", st.raw);
+          if ((int64_t)v.r.size() != n)
+            fail("matrix range assignment size mismatch", st.raw);
+          for (int64_t k = 0; k < n; ++k) {
+            const size_t dst = static_cast<size_t>((j - 1) * R + (a - 1) + k);
+            en->r.at(dst) = v.r.at(static_cast<size_t>(k));
+            if (en->is_int)
+              en->i.at(dst) =
+                  v.is_int && static_cast<size_t>(k) < v.i.size()
+                      ? v.i[static_cast<size_t>(k)]
+                      : static_cast<int>(val(v.r.at(static_cast<size_t>(k))));
+          }
+          return;
+        }
+        // Row-segment write X[i, a:b] = row_vector / array.  The selected
+        // elements are strided in first-index-fast storage.
+        if (st.lhs_idx.size() == 2 && st.lhs_idx[0].name == "IndexSingle" &&
+            st.lhs_idx[1].name == "IndexBetween" && en->dims.size() == 2) {
+          const long i = as_int(st.lhs_idx[0].args[0]);
+          const long a = as_int(st.lhs_idx[1].args[0]);
+          const long b = as_int(st.lhs_idx[1].args[1]);
+          const int64_t R = en->dims[0];
+          const int64_t n = b >= a ? b - a + 1 : 0;
+          if (i < 1 || i > R || (n > 0 && (a < 1 || b > en->dims[1])))
+            fail("matrix range assignment index out of bounds", st.raw);
+          if ((int64_t)v.r.size() != n)
+            fail("matrix range assignment size mismatch", st.raw);
+          for (int64_t k = 0; k < n; ++k) {
+            const size_t dst = static_cast<size_t>((a - 1 + k) * R + (i - 1));
+            en->r.at(dst) = v.r.at(static_cast<size_t>(k));
+            if (en->is_int)
+              en->i.at(dst) =
+                  v.is_int && static_cast<size_t>(k) < v.i.size()
+                      ? v.i[static_cast<size_t>(k)]
+                      : static_cast<int>(val(v.r.at(static_cast<size_t>(k))));
+          }
           return;
         }
         {
@@ -354,7 +588,13 @@ class MirInterp {
           lv.i = {(int)v};
           lv.r = {T((double)v)};
           env_[st.loopvar] = lv;
-          for (const auto& k : st.body) exec(k);
+          try {
+            for (const auto& k : st.body) exec(k);
+          } catch (ContinueV&) {
+            continue;
+          } catch (BreakV&) {
+            break;
+          }
         }
         env_.erase(st.loopvar);
         return;
@@ -373,12 +613,22 @@ class MirInterp {
         int64_t guard = 0;
         while (val(eval(st.cond).r.at(0)) != 0.0) {
           if (++guard > 100000000) fail("while loop did not terminate");
-          for (const auto& k : st.body) exec(k);
+          try {
+            for (const auto& k : st.body) exec(k);
+          } catch (ContinueV&) {
+            continue;
+          } catch (BreakV&) {
+            break;
+          }
         }
         return;
       }
       case mir::Stmt::Return:
         throw ReturnV{st.has_init ? eval(st.rhs) : Value{}};
+      case mir::Stmt::Break:
+        throw BreakV{};
+      case mir::Stmt::Continue:
+        throw ContinueV{};
       case mir::Stmt::NRFunApp:
         // Constraint checks are not executed here, but reject() and
         // print() are: a `reject` in transformed data is how a model
@@ -425,6 +675,16 @@ class MirInterp {
             st.fn_name == "FnValidateSizePositive" ||
             st.fn_name == "check_greater_or_equal")
           return;
+        if (st.fn_name == "FnValidateSizeUnitVector") {
+          if (st.fn_args.size() != 3 ||
+              st.fn_args[0].kind != mir::Expr::LitStr ||
+              st.fn_args[1].kind != mir::Expr::LitStr)
+            fail("malformed FnValidateSizeUnitVector", st.raw);
+          stan::math::validate_unit_vector_index(
+              st.fn_args[0].lit_s.c_str(), st.fn_args[1].lit_s.c_str(),
+              static_cast<int>(as_int(st.fn_args[2])));
+          return;
+        }
         fail("unsupported statement function " + st.fn_name, st.raw);
       case mir::Stmt::Skip:
         return;  // constraint checks are not executed here
@@ -448,6 +708,8 @@ class MirInterp {
   struct ReturnV {
     Value v;
   };
+  struct BreakV {};
+  struct ContinueV {};
 
   const std::map<std::string, const mir::FunDef*>& funs_;
   std::string where_;
@@ -780,23 +1042,35 @@ class MirInterp {
         r.i.assign(base.i.begin() + (j - 1) * R, base.i.begin() + j * R);
       return r;
     }
-    // Leading-Single slice of an N-D entry (k > 2): first index fixed.
-    // Flat storage is Fortran (first index fastest), so the sub-tensor
-    // elements sit at (i-1) + d0 * t.
-    if (e.args.size() == 2 && e.args[1].name == "IndexSingle" &&
-        base.dims.size() > 2) {
-      const long i = as_int(e.args[1].args[0]);
-      const int64_t d0 = base.dims[0];
-      bounds(i, d0, e);
-      int64_t rest = 1;
-      for (size_t d = 1; d < base.dims.size(); ++d) rest *= base.dims[d];
-      r.is_int = base.is_int;
-      r.dims.assign(base.dims.begin() + 1, base.dims.end());
-      for (int64_t k = 0; k < rest; ++k) {
-        r.r.push_back(base.r.at((i - 1) + d0 * k));
-        if (base.is_int) r.i.push_back(base.i.at((i - 1) + d0 * k));
+    // Leading-Single slice of an N-D entry: fix one or more leading array
+    // dimensions and return the remaining container.  For example,
+    // array[4, 5] matrix[2, 3] indexed as x[i, j] returns a 2x3 matrix.
+    // Flat storage is Fortran (first index fastest), so after fixing q
+    // dimensions the selected elements sit at offset + prefix_stride * t.
+    const size_t n_indices = e.args.size() - 1;
+    if (n_indices > 0 && n_indices < base.dims.size()) {
+      bool all_single = true;
+      for (size_t k = 1; k < e.args.size(); ++k)
+        if (e.args[k].name != "IndexSingle") all_single = false;
+      if (all_single) {
+        int64_t offset = 0, prefix_stride = 1;
+        for (size_t d = 0; d < n_indices; ++d) {
+          const long i = as_int(e.args[1 + d].args[0]);
+          bounds(i, base.dims[d], e);
+          offset += (i - 1) * prefix_stride;
+          prefix_stride *= base.dims[d];
+        }
+        int64_t rest = 1;
+        for (size_t d = n_indices; d < base.dims.size(); ++d)
+          rest *= base.dims[d];
+        r.is_int = base.is_int;
+        r.dims.assign(base.dims.begin() + n_indices, base.dims.end());
+        for (int64_t k = 0; k < rest; ++k) {
+          r.r.push_back(base.r.at(offset + prefix_stride * k));
+          if (base.is_int) r.i.push_back(base.i.at(offset + prefix_stride * k));
+        }
+        return r;
       }
-      return r;
     }
     // Gather v[idx] by an int-array index on a 1-D value.
     if (e.args.size() == 2 && e.args[1].name == "IndexMulti" &&
@@ -869,6 +1143,90 @@ class MirInterp {
         if (base.is_int) r.i.push_back(base.i.at((j - 1) * R + (k - 1)));
       }
       return r;
+    }
+    // General mixed N-D read. DataMap uses one first-index-fast layout for
+    // arrays and Eigen leaves alike, so each index selects positions along
+    // its corresponding physical dimension. Single drops that dimension;
+    // the other index kinds preserve it, and omitted trailing indices keep
+    // the complete suffix. Iterating the last source dimension outermost
+    // emits the selected value in the same first-index-fast layout.
+    if (n_indices > 0 && n_indices <= base.dims.size()) {
+      std::vector<std::vector<int64_t>> selected(base.dims.size());
+      std::vector<int64_t> out_dims;
+      bool supported = true;
+      for (size_t d = 0; d < base.dims.size(); ++d) {
+        const int64_t extent = base.dims[d];
+        if (d >= n_indices) {
+          out_dims.push_back(extent);
+          selected[d].reserve(static_cast<size_t>(extent));
+          for (int64_t i = 0; i < extent; ++i) selected[d].push_back(i);
+          continue;
+        }
+
+        const mir::Expr& index = e.args[1 + d];
+        if (index.name == "IndexSingle") {
+          const long i = as_int(index.args[0]);
+          bounds(i, extent, e);
+          selected[d].push_back(i - 1);
+        } else if (index.name == "IndexAll") {
+          out_dims.push_back(extent);
+          selected[d].reserve(static_cast<size_t>(extent));
+          for (int64_t i = 0; i < extent; ++i) selected[d].push_back(i);
+        } else if (index.name == "IndexMulti") {
+          const Value positions = eval(index.args[0]);
+          const size_t n = std::max(positions.i.size(), positions.r.size());
+          out_dims.push_back(static_cast<int64_t>(n));
+          selected[d].reserve(n);
+          for (size_t k = 0; k < n; ++k) {
+            const long i = k < positions.i.size()
+                               ? positions.i[k]
+                               : static_cast<long>(val(positions.r.at(k)));
+            bounds(i, extent, e);
+            selected[d].push_back(i - 1);
+          }
+        } else if (index.name == "IndexBetween") {
+          const long lo = as_int(index.args[0]);
+          const long hi = as_int(index.args[1]);
+          if (hi >= lo) {
+            bounds(lo, extent, e);
+            bounds(hi, extent, e);
+          }
+          const int64_t n = hi >= lo ? hi - lo + 1 : 0;
+          out_dims.push_back(n);
+          selected[d].reserve(static_cast<size_t>(n));
+          for (long i = lo; i <= hi; ++i) selected[d].push_back(i - 1);
+        } else if (index.name == "IndexUpfrom") {
+          const long lo = as_int(index.args[0]);
+          bounds(lo, extent, e);
+          const int64_t n = extent - lo + 1;
+          out_dims.push_back(n);
+          selected[d].reserve(static_cast<size_t>(n));
+          for (long i = lo; i <= extent; ++i) selected[d].push_back(i - 1);
+        } else {
+          supported = false;
+          break;
+        }
+      }
+      if (supported) {
+        std::vector<int64_t> strides(base.dims.size(), 1);
+        for (size_t d = 1; d < base.dims.size(); ++d)
+          strides[d] = strides[d - 1] * base.dims[d - 1];
+        r.is_int = base.is_int;
+        r.dims = std::move(out_dims);
+        std::function<void(int64_t, int64_t)> gather = [&](int64_t d,
+                                                           int64_t flatpos) {
+          if (d < 0) {
+            r.r.push_back(base.r.at(static_cast<size_t>(flatpos)));
+            if (base.is_int)
+              r.i.push_back(base.i.at(static_cast<size_t>(flatpos)));
+            return;
+          }
+          for (int64_t i : selected[static_cast<size_t>(d)])
+            gather(d - 1, flatpos + i * strides[static_cast<size_t>(d)]);
+        };
+        gather(static_cast<int64_t>(base.dims.size()) - 1, 0);
+        return r;
+      }
     }
     {
       std::string what =
@@ -989,6 +1347,18 @@ class MirInterp {
         const int64_t Rb = b_mat ? b.dims[0] : (int64_t)b.r.size();
         const int64_t Cb = b_mat ? b.dims[1] : 1;
         if (Ca != Rb) fail(e.name + ": inner dimension mismatch", e.raw);
+        // Matrix * matrix must use Eigen's product evaluator, just as the
+        // graph GEMM and generated Stan do. A hand-written scalar loop has
+        // a measurably different association for a one-column product.
+        if (a_mat && b_mat) {
+          using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+          r.r.resize((size_t)(Ra * Cb));
+          Eigen::Map<const Mat> am(a.r.data(), Ra, Ca);
+          Eigen::Map<const Mat> bm(b.r.data(), Rb, Cb);
+          Eigen::Map<Mat>(r.r.data(), Ra, Cb) = am * bm;
+          r.dims = {Ra, Cb};
+          return r;
+        }
         // Col-major storage on both sides.
         r.r.assign((size_t)(Ra * Cb), T(0.0));
         for (int64_t j = 0; j < Cb; ++j)
@@ -1044,9 +1414,33 @@ class MirInterp {
     // `A \ v` and `rv / A` are linear solves. stanc spells them with the
     // ordinary division operators, so the divisor's type is what tells a
     // solve from elementwise division by a scalar; `./` is never a solve.
-    if (e.name == "LDivide__" ||
+    // The named spellings arrive with the same argument order the operators
+    // use, and pick a factorisation family with them: the plain solve, the
+    // LLT of a symmetric positive definite matrix, or a triangular solve
+    // that reads only the lower triangle.
+    enum class SolveKind { Plain, Spd, TriLow };
+    SolveKind kind = SolveKind::Plain;
+    bool named_left = false;
+    bool named_solve = false;
+    if (e.args.size() == 2 && e.name.rfind("mdivide_", 0) == 0) {
+      const std::string tail = e.name.substr(8);
+      if (tail.rfind("left", 0) == 0 || tail.rfind("right", 0) == 0) {
+        named_left = tail.rfind("left", 0) == 0;
+        const std::string family = tail.substr(named_left ? 4 : 5);
+        if (family.empty()) {
+          named_solve = true;
+        } else if (family == "_spd") {
+          named_solve = true;
+          kind = SolveKind::Spd;
+        } else if (family == "_tri_low") {
+          named_solve = true;
+          kind = SolveKind::TriLow;
+        }
+      }
+    }
+    if (named_solve || e.name == "LDivide__" ||
         (e.name == "Divide__" && e.args.at(1).type_ == "UMatrix")) {
-      const bool left = e.name == "LDivide__";
+      const bool left = named_solve ? named_left : e.name == "LDivide__";
       Value a = eval(e.args[0]), b = eval(e.args[1]);
       const Value& divisor = left ? a : b;
       const Value& dividend = left ? b : a;
@@ -1077,20 +1471,40 @@ class MirInterp {
       //
       // stan-math checks squareness and the shared extent, and throws the
       // std::invalid_argument CmdStan would.
+      const auto left_solve = [&](const auto& x) {
+        switch (kind) {
+          case SolveKind::Spd:
+            return Mat(stan::math::mdivide_left_spd(d, x));
+          case SolveKind::TriLow:
+            return Mat(stan::math::mdivide_left_tri_low(d, x));
+          default:
+            return Mat(stan::math::mdivide_left(d, x));
+        }
+      };
+      const auto right_solve = [&](const auto& x) {
+        switch (kind) {
+          case SolveKind::Spd:
+            return Mat(stan::math::mdivide_right_spd(x, d));
+          case SolveKind::TriLow:
+            return Mat(stan::math::mdivide_right_tri_low(x, d));
+          default:
+            return Mat(stan::math::mdivide_right(x, d));
+        }
+      };
       Mat out;
       if (dividend.dims.size() == 2) {
-        out = left ? stan::math::mdivide_left(d, shaped(dividend, left))
-                   : stan::math::mdivide_right(shaped(dividend, left), d);
+        out = left ? left_solve(shaped(dividend, left))
+                   : right_solve(shaped(dividend, left));
       } else if (left) {
         Eigen::Matrix<T, Eigen::Dynamic, 1> x(dividend.r.size());
         for (size_t i = 0; i < dividend.r.size(); ++i)
           x((Eigen::Index)i) = dividend.r[i];
-        out = stan::math::mdivide_left(d, x);
+        out = left_solve(x);
       } else {
         Eigen::Matrix<T, 1, Eigen::Dynamic> x(dividend.r.size());
         for (size_t i = 0; i < dividend.r.size(); ++i)
           x((Eigen::Index)i) = dividend.r[i];
-        out = stan::math::mdivide_right(x, d);
+        out = right_solve(x);
       }
       r.r.resize((size_t)(out.rows() * out.cols()));
       for (Eigen::Index j = 0; j < out.cols(); ++j)
@@ -1146,7 +1560,7 @@ class MirInterp {
       r.r = {T((double)q)};
       return r;
     }
-    if (e.name == "Pow__" || e.name == "pow")
+    if (e.name == "Pow__" || e.name == "EltPow__" || e.name == "pow")
       return bin([](const T& x, const T& y) { return stan::math::pow(x, y); });
     if (e.name == "fmax")
       return bin([](const T& x, const T& y) { return stan::math::fmax(x, y); });
@@ -1296,6 +1710,8 @@ class MirInterp {
       return un([](const T& x) { return stan::math::log(x); });
     if (e.name == "sqrt")
       return un([](const T& x) { return stan::math::sqrt(x); });
+    if (e.name == "ceil")
+      return un([](const T& x) { return stan::math::ceil(x); });
     if (e.name == "square")
       return un([](const T& x) { return stan::math::square(x); });
     if (e.name == "inv_logit")
@@ -1334,6 +1750,146 @@ class MirInterp {
                                      v.r.at((size_t)j);
       return o;
     }
+    if (e.name == "matrix_exp" && e.args.size() == 1) {
+      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+      Value a = eval(e.args[0]);
+      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
+        fail("matrix_exp: needs a square matrix", e.raw);
+      const int64_t n = a.dims[0];
+      if (n < 0 || (n != 0 && n > std::numeric_limits<int64_t>::max() / n) ||
+          n * n != static_cast<int64_t>(a.r.size()))
+        fail("matrix_exp: matrix shape does not match storage", e.raw);
+      Mat A(n, n);
+      for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r[(size_t)(j * n + i)];
+      const Mat c = stan::math::matrix_exp(A);
+      Value o;
+      o.dims = {n, n};
+      o.r.resize((size_t)(n * n));
+      for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) o.r[(size_t)(j * n + i)] = c(i, j);
+      return o;
+    }
+    if ((e.name == "inverse" || e.name == "inverse_spd") &&
+        e.args.size() == 1) {
+      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+      Value a = eval(e.args[0]);
+      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
+        fail(e.name + ": needs a square matrix", e.raw);
+      const int64_t n = a.dims[0];
+      Mat A(n, n);
+      for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r.at((size_t)(j * n + i));
+      const Mat c = e.name == "inverse" ? stan::math::inverse(A)
+                                        : stan::math::inverse_spd(A);
+      Value o;
+      o.dims = {n, n};
+      o.r.resize((size_t)(n * n));
+      for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) o.r[(size_t)(j * n + i)] = c(i, j);
+      return o;
+    }
+    if (e.name == "log_determinant" && e.args.size() == 1) {
+      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+      Value a = eval(e.args[0]);
+      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
+        fail("log_determinant: needs a square matrix", e.raw);
+      const int64_t n = a.dims[0];
+      Mat A(n, n);
+      for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r.at((size_t)(j * n + i));
+      r.r = {stan::math::log_determinant(A)};
+      return r;
+    }
+    if (e.name == "quad_form" && e.args.size() == 2) {
+      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+      Value a = eval(e.args[0]);
+      Value b = eval(e.args[1]);
+      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
+        fail("quad_form: needs a square matrix", e.raw);
+      const int64_t n = a.dims[0];
+      Mat A(n, n);
+      for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r.at((size_t)(j * n + i));
+      Value o;
+      if (b.dims.size() != 2) {
+        Eigen::Matrix<T, Eigen::Dynamic, 1> B((Eigen::Index)b.r.size());
+        for (size_t i = 0; i < b.r.size(); ++i) B((Eigen::Index)i) = b.r[i];
+        o.r = {stan::math::quad_form(A, B)};
+        return o;
+      }
+      const int64_t rb = b.dims[0], m = b.dims[1];
+      Mat B(rb, m);
+      for (int64_t j = 0; j < m; ++j)
+        for (int64_t i = 0; i < rb; ++i) B(i, j) = b.r.at((size_t)(j * rb + i));
+      const Mat c = stan::math::quad_form(A, B);
+      o.dims = {m, m};
+      o.r.resize((size_t)(m * m));
+      for (int64_t j = 0; j < m; ++j)
+        for (int64_t i = 0; i < m; ++i) o.r[(size_t)(j * m + i)] = c(i, j);
+      return o;
+    }
+    if (e.name == "add_diag" && e.args.size() == 2) {
+      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+      Value a = eval(e.args[0]);
+      Value d = eval(e.args[1]);
+      if (a.dims.size() != 2) fail("add_diag: needs a matrix", e.raw);
+      const int64_t rows = a.dims[0], cols = a.dims[1];
+      Mat A(rows, cols);
+      for (int64_t j = 0; j < cols; ++j)
+        for (int64_t i = 0; i < rows; ++i)
+          A(i, j) = a.r.at((size_t)(j * rows + i));
+      Mat c;
+      if (d.r.size() == 1 && d.dims.empty()) {
+        c = stan::math::add_diag(A, d.r[0]);
+      } else {
+        Eigen::Matrix<T, Eigen::Dynamic, 1> D((Eigen::Index)d.r.size());
+        for (size_t i = 0; i < d.r.size(); ++i) D((Eigen::Index)i) = d.r[i];
+        c = stan::math::add_diag(A, D);
+      }
+      Value o;
+      o.dims = {rows, cols};
+      o.r.resize((size_t)(rows * cols));
+      for (int64_t j = 0; j < cols; ++j)
+        for (int64_t i = 0; i < rows; ++i)
+          o.r[(size_t)(j * rows + i)] = c(i, j);
+      return o;
+    }
+    if (e.name == "quad_form_sym" && e.args.size() == 2) {
+      // B' A B, symmetrised. Overload resolution on T reaches the same
+      // stan-math call the graph kernel makes -- prim's B.dot(A * B) at
+      // double, quad_form_vari's B' * A * B at var -- so the two paths
+      // group the arithmetic the same way. stan-math checks A for symmetry
+      // and throws the std::domain_error CmdStan would.
+      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+      Value a = eval(e.args[0]);
+      Value b = eval(e.args[1]);
+      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
+        fail("quad_form_sym: needs a square matrix", e.raw);
+      const int64_t n = a.dims[0];
+      Mat A(n, n);
+      for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r.at((size_t)(j * n + i));
+      Value o;
+      if (b.dims.size() != 2) {
+        // A vector goes in as a vector: the one-column matrix would take
+        // Eigen's matrix paths and associate the product differently.
+        Eigen::Matrix<T, Eigen::Dynamic, 1> B((Eigen::Index)b.r.size());
+        for (size_t i = 0; i < b.r.size(); ++i) B((Eigen::Index)i) = b.r[i];
+        o.r = {stan::math::quad_form_sym(A, B)};
+        return o;
+      }
+      const int64_t rb = b.dims[0], m = b.dims[1];
+      Mat B(rb, m);
+      for (int64_t j = 0; j < m; ++j)
+        for (int64_t i = 0; i < rb; ++i) B(i, j) = b.r.at((size_t)(j * rb + i));
+      const Mat c = stan::math::quad_form_sym(A, B);
+      o.dims = {m, m};
+      o.r.resize((size_t)(m * m));
+      for (int64_t j = 0; j < m; ++j)
+        for (int64_t i = 0; i < m; ++i) o.r[(size_t)(j * m + i)] = c(i, j);
+      return o;
+    }
     if (e.name == "gp_exp_quad_cov" && e.args.size() == 3) {
       // K(i,j) = alpha^2 exp(-|x_i - x_j|^2 / (2 rho^2)); x is array[N]
       // real or array[N] vector[D] in Fortran storage.
@@ -1370,6 +1926,11 @@ class MirInterp {
     }
     if (e.name == "sd") {
       Value a = eval(e.args[0]);
+      if (a.r.empty()) fail("sd: input must have a positive size", e.raw);
+      if (a.r.size() == 1) {
+        r.r = {T(0.0)};
+        return r;
+      }
       T m = T(0.0);
       for (const T& v : a.r) m += v;
       m /= (double)a.r.size();
@@ -1378,11 +1939,34 @@ class MirInterp {
       r.r = {stan::math::sqrt(s2 / (double)(a.r.size() - 1))};
       return r;
     }
-    if (e.name == "sum") {
+    if (e.name == "variance") {
       Value a = eval(e.args[0]);
+      if (a.r.empty()) fail("variance: input must have a positive size", e.raw);
+      if (a.r.size() == 1) {
+        r.r = {T(0.0)};
+        return r;
+      }
       T m = T(0.0);
       for (const T& v : a.r) m += v;
-      r.r = {m};
+      m /= (double)a.r.size();
+      T s2 = T(0.0);
+      for (const T& v : a.r) s2 += (v - m) * (v - m);
+      r.r = {s2 / (double)(a.r.size() - 1)};
+      return r;
+    }
+    if (e.name == "sum") {
+      Value a = eval(e.args[0]);
+      if (a.is_int && a.i.size() == a.r.size()) {
+        int total = 0;
+        for (int x : a.i) total += x;
+        r.is_int = true;
+        r.i = {total};
+        r.r = {T((double)total)};
+      } else {
+        T total = T(0.0);
+        for (const T& x : a.r) total += x;
+        r.r = {total};
+      }
       return r;
     }
     // The matrix slice family, all on col-major storage.
@@ -1466,6 +2050,64 @@ class MirInterp {
       r.r = {s};
       return r;
     }
+    if (e.name == "tcrossprod" && e.args.size() == 1) {
+      Value a = eval(e.args[0]);
+      if (a.dims.size() != 2) fail("tcrossprod: needs a matrix", e.raw);
+      const int64_t rows = a.dims[0], cols = a.dims[1];
+      r.dims = {rows, rows};
+      r.r.assign((size_t)(rows * rows), T(0.0));
+      for (int64_t j = 0; j < rows; ++j)
+        for (int64_t k = 0; k < cols; ++k) {
+          const T& rhs = a.r.at((size_t)(k * rows + j));
+          for (int64_t i = 0; i < rows; ++i)
+            r.r[(size_t)(j * rows + i)] += a.r.at((size_t)(k * rows + i)) * rhs;
+        }
+      return r;
+    }
+    if (e.name == "crossprod" && e.args.size() == 1) {
+      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+      Value a = eval(e.args[0]);
+      if (a.dims.size() != 2) fail("crossprod: needs a matrix", e.raw);
+      const int64_t rows = a.dims[0], cols = a.dims[1];
+      if (rows < 0 || cols < 0 ||
+          (rows != 0 && cols > std::numeric_limits<int64_t>::max() / rows) ||
+          rows * cols != static_cast<int64_t>(a.r.size()))
+        fail("crossprod: matrix shape does not match storage", e.raw);
+      Mat matrix(rows, cols);
+      for (int64_t j = 0; j < cols; ++j)
+        for (int64_t i = 0; i < rows; ++i)
+          matrix(i, j) = a.r[(size_t)(j * rows + i)];
+      const Mat product = stan::math::crossprod(matrix);
+      r.dims = {cols, cols};
+      r.r.resize((size_t)(cols * cols));
+      for (int64_t j = 0; j < cols; ++j)
+        for (int64_t i = 0; i < cols; ++i)
+          r.r[(size_t)(j * cols + i)] = product(i, j);
+      return r;
+    }
+    if (e.name == "diag_matrix" && e.args.size() == 1) {
+      Value diagonal = eval(e.args[0]);
+      const int64_t n = (int64_t)diagonal.r.size();
+      r.dims = {n, n};
+      r.r.assign((size_t)(n * n), T(0.0));
+      for (int64_t i = 0; i < n; ++i)
+        r.r[(size_t)(i * n + i)] = diagonal.r[(size_t)i];
+      return r;
+    }
+    if (e.name == "diagonal") {
+      if (e.args.size() != 1)
+        fail("diagonal: needs exactly one argument", e.raw);
+      Value matrix = eval(e.args[0]);
+      if (matrix.dims.size() != 2) fail("diagonal: needs a matrix", e.raw);
+      const int64_t rows = matrix.dims[0], cols = matrix.dims[1];
+      const int64_t n = std::min(rows, cols);
+      const int64_t stride = rows + 1;
+      r.dims = {n};
+      r.r.reserve((size_t)n);
+      for (int64_t i = 0; i < n; ++i)
+        r.r.push_back(matrix.r.at((size_t)(i * stride)));
+      return r;
+    }
     if (e.name == "cholesky_decompose" && e.args.size() == 1) {
       // Standard column-oriented Cholesky on the templated scalar.
       Value a = eval(e.args[0]);
@@ -1496,9 +2138,73 @@ class MirInterp {
     }
     if (e.name == "prod") {
       Value a = eval(e.args[0]);
-      T m = T(1.0);
-      for (const T& v : a.r) m *= v;
-      r.r = {m};
+      if (a.r.empty()) {
+        r.r = {T(1.0)};
+        return r;
+      }
+      const bool eigen_container =
+          e.args[0].unsized.depth == 0 &&
+          (e.args[0].unsized.leaf == mir::UnsizedLeaf::Vector ||
+           e.args[0].unsized.leaf == mir::UnsizedLeaf::RowVector);
+      const mir::ProdGrouping grouping = udf_depth_ == 0
+                                             ? mir::prod_grouping(e.args[0])
+                                             : mir::ProdGrouping::Legacy;
+      if (!eigen_container || grouping == mir::ProdGrouping::Legacy) {
+        T product = T(1.0);
+        for (const T& value : a.r) product *= value;
+        r.r = {product};
+        return r;
+      }
+      if (grouping == mir::ProdGrouping::Scalar) {
+        T product = a.r[0];
+        for (size_t i = 1; i < a.r.size(); ++i) product *= a.r[i];
+        r.r = {product};
+        return r;
+      }
+      // Match the address-independent packet grouping used by the compiled
+      // generated-quantities kernel.  A direct Map (including the Map used
+      // by stan::math::prod(std::vector)) can pick a different alignedStart
+      // when this vector's allocation is shifted under AVX.
+      using Vec = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+      const Eigen::Map<const Vec> input(a.r.data(), a.r.size());
+      r.r = {stan::math::prod(
+          input.unaryExpr(Eigen::internal::core_cast_op<T, T>()))};
+      return r;
+    }
+    if ((e.name == "columns_dot_product" || e.name == "rows_dot_product") &&
+        e.args.size() == 2) {
+      Value a = eval(e.args[0]), b = eval(e.args[1]);
+      if (a.dims.size() != 2 || a.dims != b.dims || a.r.size() != b.r.size())
+        fail(e.name + ": arguments must be matrices of the same size", e.raw);
+      const int64_t rows = a.dims[0], cols = a.dims[1];
+      const bool by_columns = e.name == "columns_dot_product";
+      const int64_t groups = by_columns ? cols : rows;
+      const int64_t width = by_columns ? rows : cols;
+      r.dims = {groups};
+      r.r.assign((size_t)groups, T(0.0));
+      for (int64_t group = 0; group < groups; ++group)
+        for (int64_t k = 0; k < width; ++k) {
+          const int64_t at = by_columns ? group * rows + k : k * rows + group;
+          r.r[(size_t)group] += a.r.at((size_t)at) * b.r.at((size_t)at);
+        }
+      return r;
+    }
+    if ((e.name == "columns_dot_self" || e.name == "rows_dot_self") &&
+        e.args.size() == 1) {
+      Value a = eval(e.args[0]);
+      if (a.dims.size() != 2)
+        fail(e.name + ": argument must be a matrix", e.raw);
+      const int64_t rows = a.dims[0], cols = a.dims[1];
+      const bool by_columns = e.name == "columns_dot_self";
+      const int64_t groups = by_columns ? cols : rows;
+      const int64_t width = by_columns ? rows : cols;
+      r.dims = {groups};
+      r.r.assign((size_t)groups, T(0.0));
+      for (int64_t group = 0; group < groups; ++group)
+        for (int64_t k = 0; k < width; ++k) {
+          const int64_t at = by_columns ? group * rows + k : k * rows + group;
+          r.r[(size_t)group] += a.r.at((size_t)at) * a.r.at((size_t)at);
+        }
       return r;
     }
     // Two arguments is the elementwise form, which Stan vectorizes over
@@ -1564,7 +2270,42 @@ class MirInterp {
       return cmp([](double x, double y) { return x <= y; });
     if (e.name == "PNot__")
       return un([](const T& x) { return T(val(x) == 0.0 ? 1.0 : 0.0); });
+    if (e.name == "is_nan") {
+      Value a = eval(e.args[0]);
+      if (a.r.size() != 1) fail("is_nan: needs a scalar", e.raw);
+      const int answer = std::isnan(val(a.r[0])) ? 1 : 0;
+      r.is_int = true;
+      r.i = {answer};
+      r.r = {T((double)answer)};
+      return r;
+    }
     if (e.name == "max" || e.name == "min") {
+      const bool owning_vector_context =
+          where_ == "write_array" || where_ == "prepare_data";
+      const mir::ExtremaKind native_kind =
+          owning_vector_context && udf_depth_ == 0 ? mir::extrema_kind(e)
+                                                   : mir::ExtremaKind::Legacy;
+      if (native_kind != mir::ExtremaKind::Legacy) {
+        Value a = eval(e.args[0]);
+        if (a.r.empty()) {
+          r.r = {native_kind == mir::ExtremaKind::Min
+                     ? T(std::numeric_limits<double>::infinity())
+                     : T(-std::numeric_limits<double>::infinity())};
+          return r;
+        }
+        // The std::vector backing an interpreted value has no aligned-owning
+        // address contract.  Clear DirectAccessBit but retain packet access,
+        // making lane zero Eigen's packet start just as for CmdStan's owning
+        // vector and the graph kernel.
+        using Vec = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+        const Eigen::Map<const Vec> input(a.r.data(), a.r.size());
+        const auto owning_grouping =
+            input.unaryExpr(Eigen::internal::core_cast_op<T, T>());
+        r.r = {native_kind == mir::ExtremaKind::Min
+                   ? stan::math::min(owning_grouping)
+                   : stan::math::max(owning_grouping)};
+        return r;
+      }
       // std::max/min semantics on values, not fmax/fmin: NaN handling and
       // tie selection must not change under the template.
       const auto vmax = [](const T& x, const T& y) {
@@ -1581,6 +2322,19 @@ class MirInterp {
         r.is_int = a.is_int && b.is_int;
         if (r.is_int) r.i = {(int)val(m)};
         r.r = {m};
+        return r;
+      }
+      if (a.r.empty()) {
+        if (a.is_int) {
+          // Preserve Stan Math's exception class and diagnostic for the
+          // excluded integer-container overload.
+          if (e.name == "min")
+            (void)stan::math::min(a.i);
+          else
+            (void)stan::math::max(a.i);
+        }
+        r.r = {e.name == "min" ? T(std::numeric_limits<double>::infinity())
+                               : T(-std::numeric_limits<double>::infinity())};
         return r;
       }
       T m = a.r.at(0);
@@ -1603,8 +2357,11 @@ class MirInterp {
           rows_mode = true;
           row_len = (int64_t)v2.r.size();
           elem_dims = v2.dims;
-          o.is_int = false;
           o.r.insert(o.r.end(), v2.r.begin(), v2.r.end());
+          if (o.is_int && v2.is_int && v2.i.size() == v2.r.size())
+            o.i.insert(o.i.end(), v2.i.begin(), v2.i.end());
+          else
+            o.is_int = false;
           continue;
         }
         o.r.push_back(v2.r.at(0));
@@ -1624,6 +2381,13 @@ class MirInterp {
         for (int64_t i = 0; i < R; ++i)
           for (int64_t j = 0; j < C; ++j) cm[j * R + i] = o.r[i * C + j];
         o.r = std::move(cm);
+        if (o.is_int) {
+          std::vector<int> cm_i(R * C);
+          for (int64_t i = 0; i < R; ++i)
+            for (int64_t j = 0; j < C; ++j)
+              cm_i[j * R + i] = o.i[(size_t)(i * C + j)];
+          o.i = std::move(cm_i);
+        }
       }
       if (rows_mode) {
         // Keep the element's own extents instead of collapsing them into
@@ -1829,6 +2593,95 @@ class MirInterp {
       return r;
     }
 
+    // A multivariate density consumes its vector and matrix arguments as
+    // whole containers, so the scalar-density broadcaster below cannot
+    // represent it.  ctsem uses both a single vector and array[N] vector[K]
+    // observations, with shared or vectorized locations and one Cholesky
+    // factor. Interpreter storage is first-index-fast: the N array elements
+    // are the fast axis and each observation must therefore be gathered with
+    // stride N before it is handed to Stan Math.
+    if (e.name == "multi_normal_cholesky_lpdf" && e.args.size() == 3) {
+      Value y = eval(e.args[0]), mu_value = eval(e.args[1]),
+            factor = eval(e.args[2]);
+      const auto vector_shape = [&](const mir::Expr& expression,
+                                    const Value& value, const char* role) {
+        const bool vector_leaf =
+            expression.unsized.leaf == mir::UnsizedLeaf::Vector ||
+            expression.unsized.leaf == mir::UnsizedLeaf::RowVector;
+        const size_t rank = (size_t)expression.unsized.depth + 1;
+        if (!vector_leaf || value.dims.size() != rank)
+          fail(e.name + ": " + role + " is not a vector or array of vectors",
+               e.raw);
+        int64_t repetitions = 1;
+        for (size_t d = 0; d < expression.unsized.depth; ++d) {
+          if (value.dims[d] < 0 ||
+              (value.dims[d] != 0 &&
+               repetitions >
+                   std::numeric_limits<int64_t>::max() / value.dims[d]))
+            fail(e.name + ": invalid or overflowing array extent", e.raw);
+          repetitions *= value.dims[d];
+        }
+        const int64_t width = value.dims.back();
+        if (width < 0 ||
+            (repetitions != 0 &&
+             width > std::numeric_limits<int64_t>::max() / repetitions) ||
+            repetitions * width != (int64_t)value.r.size())
+          fail(e.name + ": malformed " + role + " shape", e.raw);
+        return std::pair<int64_t, int64_t>{repetitions, width};
+      };
+      const auto [observations, width] =
+          vector_shape(e.args[0], y, "random variable");
+      const auto [locations, location_width] =
+          vector_shape(e.args[1], mu_value, "location");
+      if (location_width != width)
+        fail(e.name + ": random variable and location sizes differ", e.raw);
+      if (observations != locations && observations != 1 && locations != 1)
+        fail(e.name + ": vectorized argument sizes differ", e.raw);
+      if (e.args[2].unsized.depth != 0 ||
+          e.args[2].unsized.leaf != mir::UnsizedLeaf::Matrix ||
+          factor.dims.size() != 2)
+        fail(e.name + ": Cholesky factor is not a matrix", e.raw);
+      if (width != 0 && width > std::numeric_limits<int64_t>::max() / width)
+        fail(e.name + ": Cholesky factor extent overflows", e.raw);
+      const int64_t factor_size = width * width;
+      if (factor.dims[0] != width || factor.dims[1] != width ||
+          (int64_t)factor.r.size() != factor_size)
+        fail(e.name + ": Cholesky factor has the wrong shape", e.raw);
+
+      using Vec = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+      std::vector<Vec> ys((size_t)observations, Vec((Eigen::Index)width));
+      for (int64_t k = 0; k < observations; ++k)
+        for (int64_t i = 0; i < width; ++i)
+          ys[(size_t)k]((Eigen::Index)i) =
+              y.r.at((size_t)(i * observations + k));
+      std::vector<Vec> mus((size_t)locations, Vec((Eigen::Index)width));
+      for (int64_t k = 0; k < locations; ++k)
+        for (int64_t i = 0; i < width; ++i)
+          mus[(size_t)k]((Eigen::Index)i) =
+              mu_value.r.at((size_t)(i * locations + k));
+      Mat L((Eigen::Index)width, (Eigen::Index)width);
+      for (int64_t j = 0; j < width; ++j)
+        for (int64_t i = 0; i < width; ++i)
+          L((Eigen::Index)i, (Eigen::Index)j) =
+              factor.r[(size_t)(j * width + i)];
+      const bool propto = e.fn_propto && propto_ctx_;
+      const auto density = [&](const auto& yy, const auto& mm) -> T {
+        return propto
+                   ? stan::math::multi_normal_cholesky_lpdf<true>(yy, mm, L)
+                   : stan::math::multi_normal_cholesky_lpdf<false>(yy, mm, L);
+      };
+      if (observations == 1 && locations == 1)
+        r.r = {density(ys[0], mus[0])};
+      else if (locations == 1)
+        r.r = {density(ys, mus[0])};
+      else if (observations == 1)
+        r.r = {density(ys[0], mus)};
+      else
+        r.r = {density(ys, mus)};
+      return r;
+    }
+
     // The continuous scalar ones come from the shared list, so this can
     // never be narrower than what the register-machine compiler accepts
     // -- the compiled path falls back here when compilation fails, and a
@@ -1841,6 +2694,12 @@ class MirInterp {
         e.name == "poisson_log_lpmf" || e.name == "bernoulli_logit_lpmf" ||
         e.name == "binomial_logit_lpmf" || e.name == "hypergeometric_lpmf" ||
         e.name == "discrete_range_lpmf") {
+      if (shared_id >= 0 &&
+          e.args.size() != (size_t)program_density_arity(shared_id))
+        fail(e.name + " takes " +
+                 std::to_string(program_density_arity(shared_id)) +
+                 " arguments in the interpreter",
+             e.raw);
       std::vector<Value> av;
       for (const auto& a : e.args) av.push_back(eval(a));
       size_t n = 1;
@@ -1858,8 +2717,8 @@ class MirInterp {
       for (size_t i = 0; i < n; ++i) {
         // The continuous ones go through the shared dispatch, so this
         // cannot be narrower than what the register machine accepts and
-        // costs one instantiation of 27 densities rather than one per
-        // translation unit that interprets MIR.
+        // costs one shared set of probability-function instantiations rather
+        // than one set per translation unit that interprets MIR.
         if (shared_id >= 0) {
           T argbuf[kMaxDensityArgs];
           const int arity = program_density_arity(shared_id);
@@ -1900,6 +2759,83 @@ class MirInterp {
       r.dims = {n};
       r.r.assign(n, v.r.at(0));
       if (v.is_int) r.i.assign(n, v.i.at(0));
+      return r;
+    }
+    if (e.name == "csr_extract_w" && e.args.size() == 1) {
+      Value a = eval(e.args[0]);
+      if (a.dims.size() != 2)
+        fail("csr_extract_w: argument must be a matrix", e.raw);
+      const int64_t rows = a.dims[0], cols = a.dims[1];
+      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+      Eigen::Map<const Mat> matrix(a.r.data(), rows, cols);
+      const auto weights = stan::math::csr_extract_w(matrix);
+      r.r.assign(weights.data(), weights.data() + weights.size());
+      r.dims = {(int64_t)r.r.size()};
+      return r;
+    }
+    if (e.name == "append_array" && e.args.size() == 2) {
+      Value a = eval(e.args[0]), b = eval(e.args[1]);
+      if (a.dims.empty() || b.dims.empty() || a.dims.size() != b.dims.size())
+        fail("append_array: arguments must be arrays of the same rank", e.raw);
+      const int64_t a_outer = a.dims[0], b_outer = b.dims[0];
+      if (a_outer < 0 || b_outer < 0 ||
+          a_outer > std::numeric_limits<int64_t>::max() - b_outer)
+        fail("append_array: invalid or overflowing outer extent", e.raw);
+      if (a_outer != 0 && b_outer != 0 &&
+          !std::equal(a.dims.begin() + 1, a.dims.end(), b.dims.begin() + 1,
+                      b.dims.end()))
+        fail("append_array: element shapes must match", e.raw);
+
+      const auto checked_product = [&](const std::vector<int64_t>& dims,
+                                       size_t begin,
+                                       const char* what) -> int64_t {
+        int64_t n = 1;
+        for (size_t k = begin; k < dims.size(); ++k) {
+          const int64_t d = dims[k];
+          if (d < 0 || (d != 0 && n > std::numeric_limits<int64_t>::max() / d))
+            fail(std::string("append_array: invalid or overflowing ") + what,
+                 e.raw);
+          n *= d;
+        }
+        return n;
+      };
+      const int64_t a_count = checked_product(a.dims, 0, "left shape");
+      const int64_t b_count = checked_product(b.dims, 0, "right shape");
+      if (a_count != static_cast<int64_t>(a.r.size()) ||
+          b_count != static_cast<int64_t>(b.r.size()))
+        fail("append_array: argument shape does not match storage", e.raw);
+
+      r.dims = a_outer == 0 && b_outer != 0 ? b.dims : a.dims;
+      r.dims[0] = a_outer + b_outer;
+      const int64_t suffix_count = checked_product(r.dims, 1, "element shape");
+      if (a_count > std::numeric_limits<int64_t>::max() - b_count ||
+          (a_outer + b_outer != 0 &&
+           suffix_count >
+               std::numeric_limits<int64_t>::max() / (a_outer + b_outer)) ||
+          (a_outer + b_outer) * suffix_count != a_count + b_count)
+        fail("append_array: storage length overflows", e.raw);
+
+      const auto append_first_axis = [&](const auto& av, const auto& bv,
+                                         auto* out) {
+        using Size = typename std::decay_t<decltype(av)>::size_type;
+        const Size aw = static_cast<Size>(a_outer);
+        const Size bw = static_cast<Size>(b_outer);
+        out->reserve(av.size() + bv.size());
+        const int64_t lanes = a_outer + b_outer == 0 ? 0 : suffix_count;
+        for (int64_t lane = 0; lane < lanes; ++lane) {
+          const Size ai = static_cast<Size>(lane) * aw;
+          const Size bi = static_cast<Size>(lane) * bw;
+          out->insert(out->end(), av.begin() + ai, av.begin() + ai + aw);
+          out->insert(out->end(), bv.begin() + bi, bv.begin() + bi + bw);
+        }
+      };
+      append_first_axis(a.r, b.r, &r.r);
+      r.is_int = a.is_int && b.is_int;
+      if (r.is_int) {
+        if (a.i.size() != a.r.size() || b.i.size() != b.r.size())
+          fail("append_array: integer mirror does not match storage", e.raw);
+        append_first_axis(a.i, b.i, &r.i);
+      }
       return r;
     }
     if (e.name == "rep_matrix" && e.args.size() == 3) {

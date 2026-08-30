@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -143,26 +144,68 @@ bool gen_adjoint(IslandProg& p) {
       return false;
   }
 
+  // Which registers carry a parameter: seeded from the live-ins the carver
+  // marked active, grown forwards. A density argument outside that set gets
+  // no partial (program_density.hpp) -- its adjoint cell reaches nothing the
+  // executor reads. Read at the density rather than after the sweep, because
+  // registers are cells: one holding data here may hold a parameter later.
+  std::vector<uint8_t> dmask(orig.size(), 0xf);
+  {
+    std::vector<char> active((size_t)n0, 0);
+    for (const auto& li : p.ins)
+      if (li.active)
+        for (int k = 0; k < li.len; ++k) active[(size_t)(li.reg + k)] = 1;
+    bool any = false;
+    auto read = [&](int r, int len) {
+      for (int k = 0; k < len && !any; ++k)
+        if (active[(size_t)(r + k)]) any = true;
+    };
+    auto write = [&](int r, int len) {
+      for (int k = 0; k < len; ++k) active[(size_t)(r + k)] = 1;
+    };
+    for (size_t i = 0; i < orig.size(); ++i) {
+      const Program::Instr& I = orig[i];
+      any = false;
+      if (I.code == Program::CALL) {
+        const Program::Call& call = fwd.calls[(size_t)I.a];
+        for (int j = 0; j < call.n_in; ++j) read(call.in[j], call.in_len[j]);
+        if (!any) continue;
+        write(call.out, call.out_len);
+        write(call.scratch, call.scratch_len);
+        continue;
+      }
+      const ProgramOpSpec& spec = program_code_spec(I.code);
+      if (spec.has(kProgramNoInputs)) continue;
+      if (I.code == Program::DENSITY) {
+        const int ar = program_density_arity(I.len);
+        unsigned m = 0;
+        for (int k = 0; k < ar; ++k) {
+          const int r =
+              ar > 3 ? I.a + k : (k == 0 ? I.a : (k == 1 ? I.b : I.c));
+          if (active[(size_t)r]) m |= 1u << k;
+        }
+        dmask[i] = (uint8_t)m;
+        any = m != 0;
+      } else {
+        read(I.a, spec.has(kProgramRangeA) ? I.len : 1);
+        if (spec.has(kProgramReadB))
+          read(I.b, spec.has(kProgramRangeB) ? I.len : 1);
+        if (spec.has(kProgramReadC)) read(I.c, 1);
+      }
+      if (any) write(I.dst, program_output_len(I));
+    }
+  }
+  // STANLI_NO_DENSITY_MASK=1 binds every density argument as a recorder
+  // scalar again, which is the comparison the masks have to survive.
+  if (std::getenv("STANLI_NO_DENSITY_MASK"))
+    std::fill(dmask.begin(), dmask.end(), (uint8_t)0xf);
+
   std::vector<Program::Instr> ncode;
   ncode.reserve(orig.size());
   AdjProgram ap;
   ap.code.reserve(orig.size());
   ap.adj_reg.resize((size_t)n0);
   for (int r = 0; r < n0; ++r) ap.adj_reg[(size_t)r] = r;
-  int n_regs = n0;
-
-  auto checkpoint = [&](int r, int len, bool needed) {
-    if (!needed) return r;
-    const int ck = n_regs;
-    n_regs += len;
-    Program::Instr save;
-    save.code = len == 1 ? Program::MOV : Program::MOVR;
-    save.dst = ck;
-    save.a = r;
-    save.len = len;
-    ncode.push_back(save);
-    return ck;
-  };
 
   // A copy the forward never rewrites shares its source's adjoint cell.
   // This is the replay's vari sharing, written down: `reg[d] = reg[a]` on
@@ -191,6 +234,54 @@ bool gen_adjoint(IslandProg& p) {
     return true;
   };
 
+  // Discover every shared cell before emitting the adjoint instructions.
+  // Besides making their indices final for map1/mapn below, this lets the
+  // file store one double per equivalence class rather than retaining holes
+  // at the copied registers' original ids. Representatives are packed in
+  // numeric order: if an old mapped range was base+k, every integer in that
+  // interval is present, so rank compression preserves base'+k. That is the
+  // contiguity contract the ranged rules and CALL backwards rely on.
+  for (int i = 0; i < (int)orig.size(); ++i) {
+    const Program::Instr& I = orig[(size_t)i];
+    if (!aliasable(I, i)) continue;
+    const int len = I.code == Program::MOV ? 1 : I.len;
+    for (int k = 0; k < len; ++k)
+      ap.adj_reg[(size_t)(I.dst + k)] = ap.adj_reg[(size_t)(I.a + k)];
+  }
+  std::vector<char> used_adj((size_t)n0, 0);
+  for (int32_t r : ap.adj_reg) {
+    if (r < 0 || r >= n0) return false;
+    used_adj[(size_t)r] = 1;
+  }
+  std::vector<int32_t> compact_adj((size_t)n0, -1);
+  for (int r = 0; r < n0; ++r)
+    if (used_adj[(size_t)r]) compact_adj[(size_t)r] = ap.n_regs++;
+  for (int32_t& r : ap.adj_reg) r = compact_adj[(size_t)r];
+
+  bool mapped_ranges_ok = true;
+  auto map1 = [&](int32_t r) { return ap.adj_reg[(size_t)r]; };
+  auto mapn = [&](int32_t r, int len) {
+    if (len == 0) return int32_t{0};
+    const int32_t base = ap.adj_reg[(size_t)r];
+    for (int k = 1; k < len; ++k)
+      if (ap.adj_reg[(size_t)(r + k)] != base + k) mapped_ranges_ok = false;
+    return base;
+  };
+
+  int n_regs = n0;
+  auto checkpoint = [&](int r, int len, bool needed) {
+    if (!needed) return r;
+    const int ck = n_regs;
+    n_regs += len;
+    Program::Instr save;
+    save.code = len == 1 ? Program::MOV : Program::MOVR;
+    save.dst = ck;
+    save.a = r;
+    save.len = len;
+    ncode.push_back(save);
+    return ck;
+  };
+
   // A range needs a checkpoint when any element is overwritten strictly
   // after i; the copy is one MOVR and the backward reads it instead.
   auto save_range = [&](int r, int len, int i) {
@@ -204,12 +295,16 @@ bool gen_adjoint(IslandProg& p) {
     const Program::Instr& I = orig[i];
     if (I.code == Program::CALL) {
       // The kernel's backward may read its input VALUES, not just its
-      // scratch (backward_ignores_input_values is a whitelist, not a
+      // scratch (backward_ignores_values is a whitelist, not a
       // guarantee), and some read their output values too -- so both are
       // checkpointed whenever a later instruction overwrites them.
       Program::Call& call = fwd.calls[(size_t)I.a];
-      for (int j = 0; j < call.n_in; ++j)
+      for (int j = 0; j < call.n_in; ++j) {
+        (void)mapn(call.in[j], call.in_len[j]);
         call.bwd_in[j] = save_range(call.in[j], call.in_len[j], i);
+      }
+      (void)mapn(call.out, call.out_len);
+      if (!mapped_ranges_ok) return false;
       ncode.push_back(I);
       call.bwd_out = save_range(call.out, call.out_len, i);
       AdjInstr A;
@@ -219,14 +314,12 @@ bool gen_adjoint(IslandProg& p) {
       continue;
     }
     if (aliasable(I, i)) {
-      const int len = I.code == Program::MOV ? 1 : I.len;
-      for (int k = 0; k < len; ++k)
-        ap.adj_reg[(size_t)(I.dst + k)] = ap.adj_reg[(size_t)(I.a + k)];
       ncode.push_back(I);
       continue;  // no adjoint instruction: the cells are already shared
     }
     AdjInstr A;
     A.code = I.code;
+    A.mask = dmask[(size_t)i];
     A.dst = I.dst;
     A.a = I.a;
     A.b = I.b;
@@ -276,14 +369,6 @@ bool gen_adjoint(IslandProg& p) {
     // A range has to map to a range: aliasing builds contiguous maps from
     // contiguous copies, so this holds, and refusing is cheaper than
     // scattering the interpreter's loops.
-    bool ok = true;
-    auto map1 = [&](int32_t r) { return ap.adj_reg[(size_t)r]; };
-    auto mapn = [&](int32_t r, int len) {
-      const int32_t base = ap.adj_reg[(size_t)r];
-      for (int k = 1; k < len; ++k)
-        if (ap.adj_reg[(size_t)(r + k)] != base + k) ok = false;
-      return base;
-    };
     A.dst = wl > 1 ? mapn(I.dst, wl) : map1(I.dst);
     if (I.code == Program::DENSITY) {
       const int ar = program_density_arity(I.len);
@@ -299,7 +384,7 @@ bool gen_adjoint(IslandProg& p) {
       A.b = spec.has(kProgramRangeB) ? mapn(I.b, I.len) : map1(I.b);
       A.c = map1(I.c);
     }
-    if (!ok) return false;
+    if (!mapped_ranges_ok) return false;
     ap.code.push_back(A);
   }
 
@@ -310,35 +395,44 @@ bool gen_adjoint(IslandProg& p) {
   return true;
 }
 
+// Ranged arms below map their operand and output ranges. The validator in
+// gen_adjoint admits only disjoint ranges or exactly coincident ones, and the
+// coincident case keeps the scalar loop: reading before clearing is what an
+// in-place `x = exp(x)` needs.
+using AdjA = Eigen::Map<Eigen::ArrayXd>;
+using CAdjA = Eigen::Map<const Eigen::ArrayXd>;
+
 void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
                  double* adj) {
   for (const AdjInstr& I : ap.code) {
     if (I.code == Program::CALL) {
       // The kernel's own backward is the rule: values from the (possibly
       // checkpointed) forward registers, partials from the scratch the
-      // forward stashed inside the file, adjoints accumulated straight
-      // into the adjoint file at the same ranges the values occupy --
-      // every CALL range is excluded from cell sharing, so range index
-      // and cell index agree. Then the output's cells are cleared, the
-      // same consume-and-clear every other rule performs.
+      // forward stashed inside the file, adjoints accumulated into the
+      // compact ranges named by adj_reg -- every CALL range is excluded
+      // from cell sharing, and numeric-order compaction preserves its
+      // contiguity. Then the output's cells are cleared, the same
+      // consume-and-clear every other rule performs.
       const Program::Call& call = fwd.calls[(size_t)I.a];
       KernelCtx ctx;
       ctx.n_in = call.n_in;
       for (int k = 0; k < call.n_in; ++k) {
         ctx.in[k] =
             Desc{const_cast<double*>(val) + call.bwd_in[k], call.in_len[k]};
-        ctx.in_adj[k] = Desc{adj + call.in[k], call.in_len[k]};
+        const int in_adj = call.in_len[k] ? ap.adj_reg[(size_t)call.in[k]] : 0;
+        ctx.in_adj[k] = Desc{adj + in_adj, call.in_len[k]};
       }
       ctx.out = Desc{const_cast<double*>(val) + call.bwd_out, call.out_len};
-      ctx.out_adj_vec = Desc{adj + call.out, call.out_len};
-      if (call.out_len == 1) ctx.out_adj = adj[call.out];
+      const int out_adj = ap.adj_reg[(size_t)call.out];
+      ctx.out_adj_vec = Desc{adj + out_adj, call.out_len};
+      if (call.out_len == 1) ctx.out_adj = adj[out_adj];
       ctx.variant = call.variant;
       ctx.scratch = const_cast<double*>(val) + call.scratch;
       ctx.idata = call.idata.data();
       ctx.n_idata = (int64_t)call.idata.size();
       const Kernel* k = find_kernel(call.opcode);
       k->backward(ctx);
-      for (int j = 0; j < call.out_len; ++j) adj[call.out + j] = 0.0;
+      for (int j = 0; j < call.out_len; ++j) adj[out_adj + j] = 0.0;
       continue;
     }
     // Every instruction consumes its output's adjoint and clears it: the
@@ -353,18 +447,23 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
         adj[I.dst] = 0.0;
         break;
       case Program::CONSTR:
-        for (int32_t k = 0; k < I.len; ++k) adj[I.dst + k] = 0.0;
+        AdjA(adj + I.dst, I.len).setZero();
         break;
       case Program::MOV:
         adj[I.dst] = 0.0;
         adj[I.a] += t;
         break;
       case Program::MOVR:
-        for (int32_t k = 0; k < I.len; ++k) {
-          const double u = adj[I.dst + k];
-          adj[I.dst + k] = 0.0;
-          adj[I.a + k] += u;
+        if (I.a == I.dst) {
+          for (int32_t k = 0; k < I.len; ++k) {
+            const double u = adj[I.dst + k];
+            adj[I.dst + k] = 0.0;
+            adj[I.a + k] += u;
+          }
+          break;
         }
+        AdjA(adj + I.a, I.len) += AdjA(adj + I.dst, I.len);
+        AdjA(adj + I.dst, I.len).setZero();
         break;
       case Program::ADD:
         adj[I.dst] = 0.0;
@@ -470,6 +569,13 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
         adj[I.dst] = 0.0;
         adj[I.a] += t / (val[I.va] - 1.0);
         break;
+      // The derivative stan-math precomputes for its own reverse rule, and
+      // the one OP_LOG1P_EXP carries on the graph side: the two paths have
+      // to agree to the bit, and one expression is how that stays true.
+      case Program::LOG1P_EXP:
+        adj[I.dst] = 0.0;
+        adj[I.a] += t * stan::math::inv_logit(val[I.va]);
+        break;
       case Program::TANH: {
         adj[I.dst] = 0.0;
         const double ch = std::cosh(val[I.va]);
@@ -487,18 +593,30 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
         adj[I.dst] = 0.0;
         break;
       case Program::LOG_RANGE:
-        for (int32_t k = 0; k < I.len; ++k) {
-          const double u = adj[I.dst + k];
-          adj[I.dst + k] = 0.0;
-          adj[I.a + k] += u / val[I.va + k];
+        if (I.a == I.dst) {
+          for (int32_t k = 0; k < I.len; ++k) {
+            const double u = adj[I.dst + k];
+            adj[I.dst + k] = 0.0;
+            adj[I.a + k] += u / val[I.va + k];
+          }
+          break;
         }
+        AdjA(adj + I.a, I.len) +=
+            AdjA(adj + I.dst, I.len) / CAdjA(val + I.va, I.len);
+        AdjA(adj + I.dst, I.len).setZero();
         break;
       case Program::EXP_RANGE:
-        for (int32_t k = 0; k < I.len; ++k) {
-          const double u = adj[I.dst + k];
-          adj[I.dst + k] = 0.0;
-          adj[I.a + k] += u * val[I.vd + k];
+        if (I.a == I.dst) {
+          for (int32_t k = 0; k < I.len; ++k) {
+            const double u = adj[I.dst + k];
+            adj[I.dst + k] = 0.0;
+            adj[I.a + k] += u * val[I.vd + k];
+          }
+          break;
         }
+        AdjA(adj + I.a, I.len) +=
+            AdjA(adj + I.dst, I.len) * CAdjA(val + I.vd, I.len);
+        AdjA(adj + I.dst, I.len).setZero();
         break;
       case Program::DOT:
         adj[I.dst] = 0.0;
@@ -542,6 +660,14 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
         adj[I.a] += t * stan::math::inv_logit(val[I.va] - val[I.vb]);
         adj[I.b] += t * stan::math::inv_logit(val[I.vb] - val[I.va]);
         break;
+      case Program::LOG_DIFF_EXP:
+        adj[I.dst] = 0.0;
+        // Match rev/fun/log_diff_exp.hpp exactly. Besides being stable when
+        // the arguments are close, expm1 has observably different rounding
+        // from spelling either denominator with exp.
+        adj[I.a] -= t / stan::math::expm1(val[I.vb] - val[I.va]);
+        adj[I.b] -= t / stan::math::expm1(val[I.va] - val[I.vb]);
+        break;
       case Program::LOG_MIX: {
         adj[I.dst] = 0.0;
         // rev/fun/log_mix.hpp: partials through the helper, with the arms
@@ -583,22 +709,33 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
         // register, and then it is the difference between matching the
         // replay and nearly matching it.
         adj[I.dst] = 0.0;
+        if (I.mask == 0) break;
         const int ar = program_density_arity(I.len);
         double part[kMaxDensityArgs] = {0, 0, 0, 0};
         if (ar > 3) {
-          if (program_density_partials(I.len, val + I.va, part))
-            for (int k = ar; k-- > 0;) adj[I.a + k] += t * part[k];
+          if (program_density_partials(I.len, I.mask, val + I.va, part))
+            for (int k = ar; k-- > 0;)
+              if ((I.mask >> k) & 1u) adj[I.a + k] += t * part[k];
           break;
         }
         const double args[3] = {val[I.va], val[I.vb], val[I.vc]};
-        if (!program_density_partials(I.len, args, part)) break;
-        if (ar > 2) adj[I.c] += t * part[2];
-        if (ar > 1) adj[I.b] += t * part[1];
-        adj[I.a] += t * part[0];
+        if (!program_density_partials(I.len, I.mask, args, part)) break;
+        if (ar > 2 && (I.mask & 4u)) adj[I.c] += t * part[2];
+        if (ar > 1 && (I.mask & 2u)) adj[I.b] += t * part[1];
+        if (I.mask & 1u) adj[I.a] += t * part[0];
         break;
       }
+      case Program::DYN_INDEX:
+      case Program::IDIV:
+      case Program::MAX_RANGE:
       case Program::JZ:
       case Program::JMP:
+      case Program::DIAG_PRE_MULTIPLY:
+      case Program::DIAG_POST_MULTIPLY:
+      case Program::MATRIX_EXP:
+      case Program::MDIVIDE_LEFT:
+      case Program::MDIVIDE_RIGHT_SPD:
+      case Program::QUAD_FORM_SYM:
         break;  // gen_adjoint refuses these; unreachable
       case Program::CALL:
         break;  // handled before this switch

@@ -1,13 +1,15 @@
 // Interpreted write_array: the fallback when the write_array graph cannot
 // express the whole generate_quantities section.
 //
-// The graph is the fast path and stays it. What defeats it is anything
-// whose VALUE only exists per draw: RNG calls (including int-valued ones
-// that then size or index things), and branches on quantities computed
-// from the draw (the hmm models' Viterbi recursions). Those are exactly
-// what a per-draw interpreter does naturally, and generated quantities run
-// once per stored draw on plain doubles, so slow is acceptable: the
-// sampler never goes through here.
+// The graph is the fast path and stays it. It directly carries a first set of
+// scalar-result RNG calls, including their caller-owned stream. What still
+// defeats it is an unsupported or container-valued-result RNG, using an int
+// draw as dynamic geometry/index/control flow, or a branch on a value computed
+// during the draw (the HMM models' Viterbi recursions). A categorical draw's
+// one probability-vector argument is graph-native. The remaining cases are
+// exactly what a per-draw interpreter does naturally, and generated quantities
+// run once per stored draw on plain doubles: the sampler's leapfrog path never
+// goes through here.
 //
 // Per draw the host supplies the CONSTRAINED parameter values by name (the
 // log_prob executor already computes them for its views); FnReadParam
@@ -20,16 +22,20 @@
 
 #include <stanli/compile.hpp>
 #include <stanli/mir.hpp>
-#include <stanli/mir_interp.hpp>
 
-#include <boost/random/additive_combine.hpp>
+#include <stan/services/util/create_rng.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace stanli {
+
+template <typename T>
+class MirInterp;
 
 // The generated-quantities RNG stream. The CALLER owns it, because a
 // stream belongs to whoever is drawing rather than to the model: two
@@ -38,13 +44,45 @@ namespace stanli {
 // thread, which is also what BridgeStan's bs_rng asks of its callers.
 class WaRng {
  public:
-  explicit WaRng(unsigned seed) : gen_(seed) {}
-  void seed(unsigned s) { gen_.seed(s); }
-  boost::ecuyer1988& gen() { return gen_; }
+  explicit WaRng(unsigned seed, unsigned chain = 0)
+      : gen_(stan::services::util::create_rng(seed, chain)) {}
+  void seed(unsigned s, unsigned chain = 0) {
+    gen_ = stan::services::util::create_rng(s, chain);
+  }
+  stan::rng_t& gen() { return gen_; }
 
  private:
-  boost::ecuyer1988 gen_;
+  stan::rng_t gen_;
 };
+
+// The scalar-argument graph-native RNG tranche. One enum and one draw helper
+// are shared by OP_RNG and WaInterp, so both paths invoke the exact same Stan
+// Math function with the exact same stream.
+enum class ScalarRng : uint8_t {
+  PoissonLog,
+  Uniform,
+  Bernoulli,
+  Normal,
+  Lognormal,
+  Binomial,
+};
+
+// OP_RNG's first non-scalar-argument variant. Keep it outside ScalarRng:
+// scalar_rng_draw's `nargs` counts scalar doubles, whereas categorical has
+// one logical argument containing an arbitrary number of probabilities.
+inline constexpr uint8_t kCategoricalRngVariant =
+    static_cast<uint8_t>(ScalarRng::Binomial) + 1;
+inline constexpr uint8_t kMultiNormalRngVariant = kCategoricalRngVariant + 1;
+
+size_t scalar_rng_arity(ScalarRng family);
+bool scalar_rng_is_int(ScalarRng family);
+double scalar_rng_draw(ScalarRng family, const double* args, size_t nargs,
+                       WaRng& rng);
+int categorical_rng_draw(const double* probabilities, size_t size, WaRng& rng);
+void multi_normal_rng_draw(const double* location, size_t location_size,
+                           const double* covariance, size_t covariance_size,
+                           size_t covariance_rows, size_t covariance_cols,
+                           double* output, size_t output_size, WaRng& rng);
 
 // The columns only exist after one evaluation, so every driver that wants
 // them at construction time has to probe. These two are that probe, shared
@@ -81,6 +119,8 @@ class WaInterp {
   bool rng_fun(MirInterp<double>& in, const mir::Expr& e, DataMap::Entry* out,
                WaRng& rng);
   bool ode_fun(MirInterp<double>& in, const mir::Expr& e, DataMap::Entry* out);
+  bool algebra_fun(MirInterp<double>& in, const mir::Expr& e,
+                   DataMap::Entry* out);
 
   std::shared_ptr<const mir::Program> prog_;
   std::map<std::string, const mir::FunDef*> funs_;

@@ -23,10 +23,11 @@
 // exists for its adjoints.
 //
 // Densities appear only in propto-OFF form (the carver refuses propto):
-// with no term-dropping, the instantiation is type-uniform and one
-// templated call serves both passes. Propto term-dropping depends on
-// argument TYPES (see legacy_fns.cpp's dirichlet note), which would need
-// per-mask binding -- out of scope until islands absorb target terms.
+// with no term-dropping, the forward is type-uniform and one templated
+// call serves both passes. The backward does bind per mask, to skip the
+// partials of data arguments, but propto term-dropping needs the same
+// masks on the VALUE (see legacy_fns.cpp's dirichlet note) -- out of
+// scope until islands absorb target terms.
 #ifndef STANLI_ISLAND_HPP
 #define STANLI_ISLAND_HPP
 
@@ -34,6 +35,7 @@
 #include <stanli/program.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace stanli {
@@ -45,6 +47,16 @@ struct IslandProg : Program {
   struct LiveIn {
     int reg = 0;
     int len = 0;
+    // Normally live-in k reads ctx.in[k] at offset zero. Necessity regions
+    // with more graph values than Op::in can hold pack a leading group with
+    // OP_CONCAT2 and point several register ranges into that one descriptor.
+    int input = -1;
+    int offset = 0;
+    // Whether the slot it seeds is downstream of a parameter. The carver
+    // knows; the adjoint generator propagates it to reach the densities.
+    // True where nobody says otherwise, which is the all-active binding
+    // this was before.
+    bool active = true;
   };
   std::vector<LiveIn> ins;
   // The generated backward (adjoint.hpp), empty for a program the generator
@@ -57,9 +69,45 @@ struct IslandProg : Program {
   bool native_adj = false;
 };
 
+// Payload used only by OP_ISLAND with kIslandSoftmax3Variant. Ordinary islands
+// retain the exact IslandProg size and allocation they had before this
+// optimization existed.
+// The inherited canonical Program stays untouched and remains the replay
+// oracle wherever var replay is supported.
+struct Softmax3IslandProg : IslandProg {
+  std::shared_ptr<const Program> optimized_double;
+};
+
+// OP_ISLAND's variant is otherwise unused. This value selects the derived
+// payload's double-only plan while retaining the ordinary island opcode and
+// kernel-table layout. Setting it on a plain IslandProg violates the tagged
+// payload contract; the graph carver is the only production producer. Its
+// forward must leave outputs and scratch bitwise-identical to OP_ISLAND's
+// canonical forward: the profiled executor and direct kernel-table callers
+// use that path, and the generated adjoint consumes either register file.
+// test_softmax3_double_exact enforces this contract.
+constexpr uint8_t kIslandSoftmax3Variant = 1;
+
+// Run compact_program (program.hpp) over the region's forward code, live-ins
+// included, before the adjoint generator reads it -- so the backward is
+// generated from the compacted program rather than remapped onto it.
+// STANLI_NO_ISLAND_COMPACT=1 disables this pass only.
+void compact_island(IslandProg& p);
+
+// Explicitly gate producer-destination forwarding and report whether it
+// changed the program. The one-argument entry point remains the public default.
+bool compact_island_gated(IslandProg& p, bool enable_destination_forwarding);
+
 // Generate p.adj, appending checkpoint saves to p's forward code. False
 // leaves p untouched and keeps the replay.
 bool gen_adjoint(IslandProg& p);
+
+// After gen_adjoint has captured the original forward program, return a
+// double-only clone that replaces sufficiently common SOFTMAX(3) instructions
+// with calls to an allocation-free private Program kernel. Null means refused;
+// the canonical bytecode stays unchanged.
+std::shared_ptr<const Program> specialize_softmax3(const IslandProg& p,
+                                                   size_t min_count = 32);
 
 // Evaluate on T = double (forward) or stan::math::var (backward replay,
 // inside the caller's nested_rev_autodiff). The register file is reused
@@ -68,9 +116,11 @@ template <typename T>
 void run_island(const IslandProg& p, const T* const* in, T* out) {
   static thread_local std::vector<T> reg;
   if ((int64_t)reg.size() < p.n_regs) reg.resize((size_t)p.n_regs);
-  for (size_t k = 0; k < p.ins.size(); ++k)
+  for (size_t k = 0; k < p.ins.size(); ++k) {
+    const int input = p.ins[k].input >= 0 ? p.ins[k].input : (int)k;
     for (int i = 0; i < p.ins[k].len; ++i)
-      reg[(size_t)(p.ins[k].reg + i)] = in[k][i];
+      reg[(size_t)(p.ins[k].reg + i)] = in[input][p.ins[k].offset + i];
+  }
 
   run_program(p, reg);
 
