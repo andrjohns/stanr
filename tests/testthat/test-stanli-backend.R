@@ -65,6 +65,10 @@ test_that("sampling a stanli-backend model produces a usable fit", {
   # 5/10 successes (bernoulli_data$y) with a beta(1,1) prior: posterior is
   # beta(6, 6), mean 0.5.
   expect_equal(theta_mean, 0.5, tolerance = 0.05)
+  expect_error(
+    fit$log_prob(0, jacobian = FALSE),
+    "stanli supports only jacobian = TRUE"
+  )
 })
 
 # ---------------------------------------------------------------------------
@@ -225,7 +229,7 @@ test_that("NA/NaN/Inf real data errors", {
         seed = 1,
         show_messages = FALSE
       ),
-      "stanli data cannot contain NA, NaN, or Inf"
+      "contains NA or NaN|stanli data cannot contain NA, NaN, or Inf"
     )
   }
 })
@@ -244,7 +248,7 @@ test_that("NA integer data errors for a multi-dim int array", {
       seed = 1,
       show_messages = FALSE
     ),
-    "stanli data cannot contain NA"
+    "Integer variable 'im' contains NA"
   )
 })
 
@@ -266,22 +270,26 @@ test_that("complex data is rejected", {
   )
 })
 
-test_that("data.frame data is rejected", {
+test_that("numeric data.frame data is accepted as a matrix", {
   mod <- stan_model(
-    code = "data { real x; } parameters { real theta; } model { theta ~ normal(0, 1); }",
+    code = "
+      data { matrix[2, 2] x; }
+      parameters { real theta; }
+      model { theta ~ normal(0, 1); }
+      generated quantities { real total = sum(x); }
+    ",
     backend = "stanli"
   )
-  expect_error(
-    mod$sample(
-      data = list(x = data.frame(a = 1)),
-      chains = 1,
-      iter_warmup = 5,
-      iter_sampling = 5,
-      seed = 1,
-      show_messages = FALSE
-    ),
-    "stanli data does not support data.frames yet"
+  fit <- mod$sample(
+    data = list(x = data.frame(a = c(1, 2), b = c(3, 4))),
+    chains = 1,
+    iter_warmup = 5,
+    iter_sampling = 1,
+    seed = 1,
+    show_messages = FALSE,
+    fixed_param = TRUE
   )
+  expect_equal(fit$summary()$mean[fit$summary()$variable == "total"], 10)
 })
 
 test_that("tuple-typed (list) data is rejected", {
@@ -298,41 +306,49 @@ test_that("tuple-typed (list) data is rejected", {
       seed = 1,
       show_messages = FALSE
     ),
-    "tuple-typed"
+    "is not declared as a tuple"
   )
 })
 
-test_that("arrays with more than 3 dimensions are rejected, real and int", {
-  mod_real <- stan_model(
-    code = "data { array[2, 2, 2, 2] real a; } parameters { real theta; } model { theta ~ normal(0, 1); }",
+test_that("higher-rank real and integer arrays are accepted", {
+  mod <- stan_model(
+    code = "
+      data {
+        array[2, 2, 2, 2] real a;
+        array[2, 2, 2, 2] int b;
+      }
+      transformed data {
+        real a_value = a[2, 1, 2, 1];
+        int b_value = b[1, 2, 1, 2];
+      }
+      parameters { real theta; }
+      model { theta ~ normal(0, 1); }
+      generated quantities {
+        real a_out = a_value;
+        int b_out = b_value;
+      }
+    ",
     backend = "stanli"
   )
-  expect_error(
-    mod_real$sample(
-      data = list(a = array(1, dim = c(2, 2, 2, 2))),
-      chains = 1,
-      iter_warmup = 5,
-      iter_sampling = 5,
-      seed = 1,
-      show_messages = FALSE
-    ),
-    "more than 3 dimensions"
+  a <- array(seq_len(16) + 0.5, dim = c(2, 2, 2, 2))
+  b <- array(seq_len(16), dim = c(2, 2, 2, 2))
+  fit <- mod$sample(
+    data = list(a = a, b = b),
+    chains = 1,
+    iter_warmup = 5,
+    iter_sampling = 1,
+    seed = 1,
+    show_messages = FALSE,
+    fixed_param = TRUE
   )
-
-  mod_int <- stan_model(
-    code = "data { array[2, 2, 2, 2] int a; } parameters { real theta; } model { theta ~ normal(0, 1); }",
-    backend = "stanli"
+  summary <- fit$summary()
+  expect_equal(
+    summary$mean[summary$variable == "a_out"],
+    a[2, 1, 2, 1]
   )
-  expect_error(
-    mod_int$sample(
-      data = list(a = array(1L, dim = c(2, 2, 2, 2))),
-      chains = 1,
-      iter_warmup = 5,
-      iter_sampling = 5,
-      seed = 1,
-      show_messages = FALSE
-    ),
-    "more than 3 dimensions"
+  expect_equal(
+    summary$mean[summary$variable == "b_out"],
+    b[1, 2, 1, 2]
   )
 })
 

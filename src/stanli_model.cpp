@@ -26,81 +26,33 @@
 namespace stanr {
 namespace {
 
-// R's REAL()/INTEGER() buffers are already column-major for up to 3 dims,
-// the same layout stan::io::var_context (and stanli::DataMap::Entry) expect
-// -- so this restriction is stanr's own, not stanli's or r_data_context's.
-void check_dims(const std::string& name, SEXP value) {
-  SEXP dim = Rf_getAttrib(value, R_DimSymbol);
-  if (Rf_length(dim) > 3)
-    throw std::runtime_error(
-        "stanli data arrays with more than 3 dimensions are not supported: " +
-        name);
-}
-
-// stanli restricts data to what DataMap::from_var_context() below can
-// actually represent: no tuples (no from_var_context caller has declared
-// types to guide flattening), and no complex (from_var_context reads only
-// vals_r()/vals_i(), so a complex-only r_data_context entry would silently
-// come through empty rather than erroring).
-void check_supported(const std::string& name, SEXP value) {
-  if (Rf_isNull(value))
-    throw std::runtime_error("stanli data value cannot be NULL: " + name);
-  if (Rf_inherits(value, "data.frame"))
-    throw std::runtime_error("stanli data does not support data.frames yet");
+// r_data_context handles list, type, dimension, and missing-value validation.
+// These are the two cases its var_context representation cannot reject for us.
+void check_stanli_value(const std::string& name, SEXP value) {
   if (TYPEOF(value) == CPLXSXP)
     throw std::runtime_error("stanli data does not support complex values yet");
-  if (TYPEOF(value) != INTSXP && TYPEOF(value) != LGLSXP &&
-      TYPEOF(value) != REALSXP) {
-    throw std::runtime_error(
-        "stanli data must be numeric, logical, or an array (tuple-typed "
-        "data is not yet supported): " + name);
-  }
-  check_dims(name, value);
-}
-
-// stanli has no sink for r_data_context's NaN-only check (it silently
-// treats Inf as a valid real), so NA/NaN/Inf get their own stricter,
-// stanli-flavored pass here before that context ever sees the value.
-void check_finite(const std::string& name, SEXP value) {
-  const R_xlen_t n = XLENGTH(value);
-  if (TYPEOF(value) == REALSXP) {
-    for (R_xlen_t i = 0; i < n; ++i) {
-      if (!std::isfinite(REAL_ELT(value, i)))
-        throw std::runtime_error(
-            "stanli data cannot contain NA, NaN, or Inf: " + name);
-    }
+  if (TYPEOF(value) == VECSXP) {
+    for (R_xlen_t i = 0; i < XLENGTH(value); ++i)
+      check_stanli_value(name, VECTOR_ELT(value, i));
     return;
   }
+  if (TYPEOF(value) != REALSXP) return;
+  const R_xlen_t n = XLENGTH(value);
   for (R_xlen_t i = 0; i < n; ++i) {
-    const int x =
-        TYPEOF(value) == LGLSXP ? LOGICAL_ELT(value, i) : INTEGER_ELT(value, i);
-    if (x == NA_INTEGER)
-      throw std::runtime_error("stanli data cannot contain NA: " + name);
+    if (!std::isfinite(REAL_ELT(value, i)))
+      throw std::runtime_error(
+          "stanli data cannot contain NA, NaN, or Inf: " + name);
   }
 }
 
-// SEXP -> stanli::DataMap. stanli-specific restrictions (no tuples, no
-// complex, no NA/NaN/Inf, at most 3 array dims) are checked up front with
-// stanli's own error messages; once a list clears that, it is exactly what
-// stanr::r_data_context (the same var_context the compiled backend builds
-// from R data) already knows how to read, so DataMap::from_var_context()
-// -- stanli's adapter for a caller that already has a var_context, rather
-// than JSON text -- does the actual conversion.
 stanli::DataMap sexp_to_data_map(SEXP data) {
   if (Rf_isNull(data) || XLENGTH(data) == 0) return stanli::DataMap();
-  SEXP names = Rf_getAttrib(data, R_NamesSymbol);
-  if (TYPEOF(data) != VECSXP || Rf_isNull(names))
-    throw std::runtime_error("stanli data must be a named list");
-  for (R_xlen_t i = 0; i < XLENGTH(data); ++i) {
-    const char* name = CHAR(STRING_ELT(names, i));
-    if (name[0] == '\0')
-      throw std::runtime_error("stanli data list names must be non-empty");
-    SEXP value = VECTOR_ELT(data, i);
-    check_supported(name, value);
-    check_finite(name, value);
-  }
   cpp11::list data_list(data);
   stanr::r_data_context context(data_list);
+  const auto names = cpp11::as_cpp<std::vector<std::string>>(data_list.names());
+  for (R_xlen_t i = 0; i < XLENGTH(data); ++i) {
+    check_stanli_value(names[i], data_list[i]);
+  }
   return stanli::DataMap::from_var_context(context);
 }
 
@@ -140,6 +92,14 @@ size_t scalar_count(const std::vector<stanli::CompiledModel::ParamView>& views,
   return n;
 }
 
+bool require_jacobian(SEXP value) {
+  if (!stanr::as_cpp<bool>(value))
+    throw std::runtime_error(
+        "stanli supports only jacobian = TRUE; its density graph includes "
+        "the change-of-variables terms");
+  return true;
+}
+
 }  // namespace
 
 // Hidden visibility: compiled into libstanr_runner.a, statically linked into
@@ -149,13 +109,16 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     : public stan::model::model_base {
  public:
   stanli_model_base(const std::string& mir, const stanli::DataMap& data,
-                    std::string model_name, unsigned int seed)
-      : stan::model::model_base(0), name_(std::move(model_name)), seed_(seed) {
+                    std::string model_name)
+      : stan::model::model_base(0), name_(std::move(model_name)) {
     cm_ = stanli::compile_model(mir, data);
     proto_ = std::make_unique<stanli::Executor>(std::move(cm_.graph));
     cm_.bind(*proto_);
     num_params_r__ = static_cast<size_t>(proto_->n_params());
     pool_ = std::make_unique<stanli::ExecutorPool>(*proto_);
+    columns_ = cm_.views;
+    n_tp_start_ = columns_.size();
+    n_gq_start_ = columns_.size();
     prepare_write_array();
   }
 
@@ -169,34 +132,24 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
                        bool include_tparams = true,
                        bool include_gqs = true) const override {
     names.clear();
-    if (has_write_array_) {
-      for (size_t i = 0; i < selected_column_end(include_tparams, include_gqs); ++i)
-        names.push_back(wa_columns_[i].name);
-    } else {
-      for (const auto& v : cm_.views) names.push_back(v.name);
-    }
+    for_each_selected(include_tparams, include_gqs,
+                      [&](const auto& v) { names.push_back(v.name); });
   }
 
   void get_dims(std::vector<std::vector<size_t>>& dims,
                 bool include_tparams = true,
                 bool include_gqs = true) const override {
     dims.clear();
-    if (has_write_array_) {
-      for (size_t i = 0; i < selected_column_end(include_tparams, include_gqs); ++i)
-        dims.push_back(column_dims(wa_columns_[i]));
-    } else {
-      for (const auto& v : cm_.views) dims.push_back(view_dims(v));
-    }
+    for_each_selected(include_tparams, include_gqs, [&](const auto& v) {
+      dims.push_back(has_write_array() ? column_dims(v) : view_dims(v));
+    });
   }
 
   void constrained_param_names(std::vector<std::string>& names,
                                bool include_tparams = true,
                                bool include_gqs = true) const override {
-    if (has_write_array_) {
-      append_columns(names, 0, selected_column_end(include_tparams, include_gqs));
-    } else {
-      for (const auto& v : cm_.views) v.append_names(names);
-    }
+    for_each_selected(include_tparams, include_gqs,
+                      [&](const auto& v) { v.append_names(names); });
   }
 
   void unconstrained_param_names(std::vector<std::string>& names,
@@ -204,25 +157,19 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     for (const auto& p : cm_.unc_params) append_unc_names(p, names);
   }
 
-  template <bool propto, bool jacobian>
-  double log_prob_impl(Eigen::VectorXd& q, std::ostream*) const {
-    (void)propto;
-    (void)jacobian;
+  double density(Eigen::VectorXd& q) const {
     auto lease = pool_->acquire();
     check_size(q.size());
     for (Eigen::Index i = 0; i < q.size(); ++i) lease->params_data()[i] = q(i);
     try {
       return lease->forward();
-    } catch (const std::exception&) {
+    } catch (const std::domain_error&) {
       return -std::numeric_limits<double>::infinity();
     }
   }
 
-  template <bool propto, bool jacobian>
-  stan::math::var log_prob_impl(Eigen::Matrix<stan::math::var, -1, 1>& q,
-                                std::ostream*) const {
-    (void)propto;
-    (void)jacobian;
+  stan::math::var density(
+      Eigen::Matrix<stan::math::var, -1, 1>& q) const {
     auto lease = pool_->acquire();
     check_size(q.size());
     std::vector<double> gradient(static_cast<size_t>(q.size()));
@@ -231,48 +178,45 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     double value;
     try {
       value = lease->gradient(gradient.data());
-    } catch (const std::exception&) {
+    } catch (const std::domain_error&) {
       return stan::math::var(-std::numeric_limits<double>::infinity());
     }
     std::vector<stan::math::var> operands(q.data(), q.data() + q.size());
     return stan::math::precomputed_gradients(value, operands, gradient);
   }
 
-#define STANLI_EIGEN_LOG_PROB(NAME, PRO, JAC) \
-  double NAME(Eigen::VectorXd& q, std::ostream* msgs) const override { \
-    return log_prob_impl<PRO, JAC>(q, msgs); \
+#define STANLI_EIGEN_LOG_PROB(NAME) \
+  double NAME(Eigen::VectorXd& q, std::ostream*) const override { \
+    return density(q); \
   } \
   stan::math::var NAME( \
-      Eigen::Matrix<stan::math::var, -1, 1>& q, std::ostream* msgs) const override { \
-    return log_prob_impl<PRO, JAC>(q, msgs); \
+      Eigen::Matrix<stan::math::var, -1, 1>& q, std::ostream*) const override { \
+    return density(q); \
   }
 
-  STANLI_EIGEN_LOG_PROB(log_prob, false, false)
-  STANLI_EIGEN_LOG_PROB(log_prob_jacobian, false, true)
-  STANLI_EIGEN_LOG_PROB(log_prob_propto, true, false)
-  STANLI_EIGEN_LOG_PROB(log_prob_propto_jacobian, true, true)
+  STANLI_EIGEN_LOG_PROB(log_prob)
+  STANLI_EIGEN_LOG_PROB(log_prob_jacobian)
+  STANLI_EIGEN_LOG_PROB(log_prob_propto)
+  STANLI_EIGEN_LOG_PROB(log_prob_propto_jacobian)
 
 #undef STANLI_EIGEN_LOG_PROB
 
-  template <bool propto, bool jacobian, typename T>
-  T vector_log_prob(std::vector<T>& q, std::vector<int>&, std::ostream* msgs) const {
-    Eigen::Matrix<T, -1, 1> mapped = Eigen::Map<Eigen::Matrix<T, -1, 1>>(
-        q.data(), static_cast<Eigen::Index>(q.size()));
-    return log_prob_impl<propto, jacobian>(mapped, msgs);
+#define STANLI_VECTOR_LOG_PROB(NAME, T) \
+  T NAME(std::vector<T>& q, std::vector<int>&, \
+         std::ostream* msgs) const override { \
+    Eigen::Matrix<T, -1, 1> mapped = Eigen::Map<Eigen::Matrix<T, -1, 1>>( \
+        q.data(), static_cast<Eigen::Index>(q.size())); \
+    return NAME(mapped, msgs); \
   }
 
-#define STANLI_VECTOR_LOG_PROB(NAME, PRO, JAC) \
-  double NAME(std::vector<double>& q, std::vector<int>& i, std::ostream* msgs) const override { \
-    return vector_log_prob<PRO, JAC>(q, i, msgs); \
-  } \
-  stan::math::var NAME(std::vector<stan::math::var>& q, std::vector<int>& i, std::ostream* msgs) const override { \
-    return vector_log_prob<PRO, JAC>(q, i, msgs); \
-  }
-
-  STANLI_VECTOR_LOG_PROB(log_prob, false, false)
-  STANLI_VECTOR_LOG_PROB(log_prob_jacobian, false, true)
-  STANLI_VECTOR_LOG_PROB(log_prob_propto, true, false)
-  STANLI_VECTOR_LOG_PROB(log_prob_propto_jacobian, true, true)
+  STANLI_VECTOR_LOG_PROB(log_prob, double)
+  STANLI_VECTOR_LOG_PROB(log_prob, stan::math::var)
+  STANLI_VECTOR_LOG_PROB(log_prob_jacobian, double)
+  STANLI_VECTOR_LOG_PROB(log_prob_jacobian, stan::math::var)
+  STANLI_VECTOR_LOG_PROB(log_prob_propto, double)
+  STANLI_VECTOR_LOG_PROB(log_prob_propto, stan::math::var)
+  STANLI_VECTOR_LOG_PROB(log_prob_propto_jacobian, double)
+  STANLI_VECTOR_LOG_PROB(log_prob_propto_jacobian, stan::math::var)
 
 #undef STANLI_VECTOR_LOG_PROB
 
@@ -329,16 +273,20 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     return {static_cast<size_t>(v.len)};
   }
 
-  size_t selected_column_end(bool include_tparams, bool include_gqs) const {
-    if (!has_write_array_) return cm_.views.size();
-    if (include_gqs) return wa_columns_.size();
-    if (include_tparams) return wa_n_gq_start_;
-    return wa_n_tp_start_;
+  bool has_write_array() const { return wa_interp_ || wa_pool_; }
+
+  std::vector<std::pair<size_t, size_t>> selected_ranges(
+      bool include_tparams, bool include_gqs) const {
+    std::vector<std::pair<size_t, size_t>> ranges;
+    ranges.emplace_back(0, include_tparams ? n_gq_start_ : n_tp_start_);
+    if (include_gqs) ranges.emplace_back(n_gq_start_, columns_.size());
+    return ranges;
   }
 
-  void append_columns(std::vector<std::string>& names, size_t first,
-                      size_t last) const {
-    for (size_t i = first; i < last; ++i) wa_columns_[i].append_names(names);
+  template <typename F>
+  void for_each_selected(bool include_tparams, bool include_gqs, F&& f) const {
+    for (const auto& range : selected_ranges(include_tparams, include_gqs))
+      for (size_t i = range.first; i < range.second; ++i) f(columns_[i]);
   }
 
   void check_size(Eigen::Index n) const {
@@ -350,7 +298,6 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     if (!cm_.write_array) return;
     auto& wa = *cm_.write_array;
     if (wa.interp) {
-      wa_interp_ = wa.interp;
       std::vector<double> q(static_cast<size_t>(proto_->n_params()));
       bool found = false;
       for (int variant = 0; variant < 3 && !found; ++variant) {
@@ -360,98 +307,80 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
           stanli::WaRng probe(1);
           std::copy(q.begin(), q.end(), proto_->params_data());
           proto_->run_forward_only();
-          (void)wa_interp_->eval(cm_.constrained_env(*proto_), probe);
+          (void)wa.interp->eval(cm_.constrained_env(*proto_), probe);
           found = true;
         } catch (const std::exception&) {
         }
       }
-      if (!found) throw std::runtime_error("stanli could not evaluate write_array during model construction");
-      wa_columns_ = wa_interp_->columns();
-      wa_n_tp_start_ = wa_interp_->n_tp_start();
-      wa_n_gq_start_ = wa_interp_->n_gq_start();
+      if (!found) return;
+      wa_interp_ = wa.interp;
+      columns_ = wa_interp_->columns();
+      n_tp_start_ = wa_interp_->n_tp_start();
+      n_gq_start_ = wa_interp_->n_gq_start();
     } else if (!wa.columns.empty()) {
       wa_proto_ = std::make_unique<stanli::Executor>(std::move(wa.graph));
       wa.bind(*wa_proto_);
-      wa_columns_ = wa.columns;
-      wa_n_tp_start_ = wa.n_tp_start;
-      wa_n_gq_start_ = wa.n_gq_start;
+      columns_ = wa.columns;
+      n_tp_start_ = wa.n_tp_start;
+      n_gq_start_ = wa.n_gq_start;
       wa_pool_ = std::make_unique<stanli::ExecutorPool>(*wa_proto_);
-    } else {
-      return;
     }
-    has_write_array_ = true;
   }
 
   void write_array_impl(stan::rng_t& rng, const std::vector<double>& q,
                         std::vector<double>& out, bool include_tparams,
                         bool include_gqs, std::ostream*) const {
-    if (q.size() != num_params_r__)
-      throw std::invalid_argument("stanli received the wrong number of unconstrained parameters");
-    const size_t first = 0;
-    const size_t last = selected_column_end(include_tparams, include_gqs);
-    out.assign(has_write_array_ ? scalar_count(wa_columns_, first, last)
-                  : scalar_count(cm_.views, first, last),
-           0.0);
-    if (!has_write_array_) {
-      auto lease = pool_->acquire();
-      std::copy(q.begin(), q.end(), lease->params_data());
-      lease->run_forward_only();
-      size_t offset = 0;
-      for (const auto& v : cm_.views) {
-        const double* p = lease->value_ptr(v.slot);
-        std::copy(p, p + v.len, out.begin() + offset);
-        offset += static_cast<size_t>(v.len);
-      }
-      return;
-    }
+    check_size(static_cast<Eigen::Index>(q.size()));
+    const auto ranges = selected_ranges(include_tparams, include_gqs);
+    size_t output_size = 0;
+    for (const auto& range : ranges)
+      output_size += scalar_count(columns_, range.first, range.second);
+    out.clear();
+    out.reserve(output_size);
+
     if (wa_interp_) {
-      // The interpreter owns a different RNG type. A fresh seed from the
-      // Stan RNG keeps this path thread-safe; graph write_array remains the
-      // exact fast path. RNG generated quantities are intentionally not
-      // advertised as bit-identical by this first backend.
-      stanli::WaRng wa_rng(static_cast<unsigned>(rng()));
+      stanli::WaRng wa_rng(include_gqs ? static_cast<unsigned>(rng()) : 1);
       auto lease = pool_->acquire();
       std::copy(q.begin(), q.end(), lease->params_data());
       lease->run_forward_only();
       const std::vector<double> row = wa_interp_->eval(
           cm_.constrained_env(*lease), wa_rng);
-      std::copy(row.begin(), row.begin() + static_cast<std::ptrdiff_t>(out.size()), out.begin());
+      for (const auto& range : ranges) {
+        const size_t first = scalar_count(columns_, 0, range.first);
+        const size_t last = scalar_count(columns_, 0, range.second);
+        out.insert(out.end(), row.begin() + static_cast<std::ptrdiff_t>(first),
+                   row.begin() + static_cast<std::ptrdiff_t>(last));
+      }
       return;
     }
-    auto lease = wa_pool_->acquire();
+
+    auto lease = (wa_pool_ ? *wa_pool_ : *pool_).acquire();
     std::copy(q.begin(), q.end(), lease->params_data());
     lease->run_forward_only();
-    size_t offset = 0;
-    for (size_t i = first; i < last; ++i) {
-      const auto& v = wa_columns_[i];
-      const double* p = lease->value_ptr(v.slot);
-      std::copy(p, p + v.len, out.begin() + offset);
-      offset += static_cast<size_t>(v.len);
+    for (const auto& range : ranges) {
+      for (size_t i = range.first; i < range.second; ++i) {
+        const auto& v = columns_[i];
+        const double* p = lease->value_ptr(v.slot);
+        for (int64_t j = 0; j < v.len; ++j)
+          out.push_back(p[v.storage_index(j)]);
+      }
     }
   }
 
   std::string name_;
-  // Recorded, not consumed: stanli's compiler rejects any `_rng` call in
-  // transformed data outright, so there is nothing to seed yet. Kept for
-  // parity with stanli's own bs_model_from_mir(), which does the same.
-  unsigned int seed_;
   stanli::CompiledModel cm_;
   std::unique_ptr<stanli::Executor> proto_;
   mutable std::unique_ptr<stanli::ExecutorPool> pool_;
   std::unique_ptr<stanli::Executor> wa_proto_;
   mutable std::unique_ptr<stanli::ExecutorPool> wa_pool_;
   std::shared_ptr<stanli::WaInterp> wa_interp_;
-  std::vector<stanli::CompiledModel::ParamView> wa_columns_;
-  size_t wa_n_tp_start_ = 0;
-  size_t wa_n_gq_start_ = 0;
-  bool has_write_array_ = false;
+  std::vector<stanli::CompiledModel::ParamView> columns_;
+  size_t n_tp_start_ = 0;
+  size_t n_gq_start_ = 0;
 };
 
-#undef STANLI_EIGEN_LOG_PROB
-#undef STANLI_VECTOR_LOG_PROB
-
 extern "C" SEXP stanr_stanli_new_model(SEXP mir, SEXP data, SEXP model_name,
-                                        SEXP seed) {
+                                        SEXP) {
   BEGIN_CPP11
   if (TYPEOF(mir) != STRSXP || XLENGTH(mir) != 1)
     cpp11::stop("stanli MIR must be a single string");
@@ -459,8 +388,7 @@ extern "C" SEXP stanr_stanli_new_model(SEXP mir, SEXP data, SEXP model_name,
     cpp11::stop("stanli model name must be a single string");
   stanli::DataMap data_map = sexp_to_data_map(data);
   auto* model = new stanli_model_base(
-      CHAR(STRING_ELT(mir, 0)), data_map, CHAR(STRING_ELT(model_name, 0)),
-      stanr::as_cpp<unsigned int>(seed));
+      CHAR(STRING_ELT(mir, 0)), data_map, CHAR(STRING_ELT(model_name, 0)));
   return cpp11::external_pointer<stan::model::model_base>(model);
   END_CPP11
 }
@@ -506,15 +434,15 @@ STANLI_MODEL_METHOD(model_unconstrained_names, (SEXP model),
 STANLI_MODEL_METHOD(model_log_prob,
                     (SEXP model, SEXP upars, SEXP jacobian),
                     return stanr::model_log_prob(
-                        *m, cpp11::doubles(upars), stanr::as_cpp<bool>(jacobian)))
+                        *m, cpp11::doubles(upars), require_jacobian(jacobian)))
 STANLI_MODEL_METHOD(model_grad_log_prob,
                     (SEXP model, SEXP upars, SEXP jacobian),
                     return stanr::model_grad_log_prob(
-                        *m, cpp11::doubles(upars), stanr::as_cpp<bool>(jacobian)))
+                        *m, cpp11::doubles(upars), require_jacobian(jacobian)))
 STANLI_MODEL_METHOD(model_hessian,
                     (SEXP model, SEXP upars, SEXP jacobian),
                     return stanr::model_hessian(
-                        *m, cpp11::doubles(upars), stanr::as_cpp<bool>(jacobian)))
+                        *m, cpp11::doubles(upars), require_jacobian(jacobian)))
 STANLI_MODEL_METHOD(model_unconstrain,
                     (SEXP model, SEXP variables, SEXP declarations),
                     return stanr::model_unconstrain(
