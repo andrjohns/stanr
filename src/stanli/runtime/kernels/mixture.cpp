@@ -13,6 +13,7 @@
 
 #include <stan/math.hpp>
 
+#include <cassert>
 #include <cmath>
 
 namespace stanli {
@@ -50,7 +51,9 @@ void lse_bwd(KernelCtx& ctx) {
 // deliberately a separate op: this kernel maps rows and does not choose how
 // the caller groups their target terms.
 void lse_rows_fwd(KernelCtx& ctx) {
+  assert(ctx.n_idata == 1);
   const int64_t K = ctx.idata[0];
+  assert(K > 0 && ctx.in[0].len == ctx.out.len * K);
   for (int64_t r = 0; r < ctx.out.len; ++r) {
     const int64_t off = r * K;
     ctx.out.data[r] =
@@ -60,7 +63,9 @@ void lse_rows_fwd(KernelCtx& ctx) {
 
 void lse_rows_bwd(KernelCtx& ctx) {
   if (!ctx.in_adj[0].data) return;
+  assert(ctx.n_idata == 1);
   const int64_t K = ctx.idata[0];
+  assert(K > 0 && ctx.in[0].len == ctx.out.len * K);
   for (int64_t r = 0; r < ctx.out.len; ++r) {
     const int64_t off = r * K;
     const double scale = ctx.out_adj_vec.data[r];
@@ -74,7 +79,9 @@ void lse_rows_bwd(KernelCtx& ctx) {
 // output per row. Each row accumulates ascending, so a row is bit-identical
 // to the OP_SUM_VEC a fused lane replaces.
 void sum_rows_fwd(KernelCtx& ctx) {
+  assert(ctx.n_idata == 1);
   const int64_t K = ctx.idata[0];
+  assert(K > 0 && ctx.in[0].len == ctx.out.len * K);
   for (int64_t r = 0; r < ctx.out.len; ++r) {
     const double* row = ctx.in[0].data + r * K;
     double acc = 0;
@@ -85,7 +92,9 @@ void sum_rows_fwd(KernelCtx& ctx) {
 
 void sum_rows_bwd(KernelCtx& ctx) {
   if (!ctx.in_adj[0].data) return;
+  assert(ctx.n_idata == 1);
   const int64_t K = ctx.idata[0];
+  assert(K > 0 && ctx.in[0].len == ctx.out.len * K);
   for (int64_t r = 0; r < ctx.out.len; ++r) {
     double* row = ctx.in_adj[0].data + r * K;
     const double scale = ctx.out_adj_vec.data[r];

@@ -379,6 +379,7 @@ struct Lowering {
         } else if (auto evaluated = owner->try_eval_pure(expr())) {
           owner->observe(v, std::move(*evaluated));
           const DataMap::Entry* en = owner->observation(v);
+          assert(en != nullptr);
           borrow_pure_value(*en);
         }
       }
@@ -4559,6 +4560,7 @@ struct Lowering {
       case BuiltinFamily::CategoricalRng:
         return lower_categorical_rng(e, actuals);
       case BuiltinFamily::ScalarRng:
+        assert(dispatch.scalar_rng.has_value());
         return lower_scalar_rng(e, actuals, *dispatch.scalar_rng);
       case BuiltinFamily::Density:
         if (auto v = lower_density_fn(e, actuals)) return *v;

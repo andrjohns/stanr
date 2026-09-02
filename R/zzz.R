@@ -53,7 +53,10 @@ private <- self <- NULL
     }
   }
 
-  dll <- dyn.load(.stanr_dll_path(libname, pkgname), local = FALSE, now = TRUE)
+  # Per-model libraries link their runner support directly. Only TBB must be
+  # global; keeping the package DLL local avoids interposing its Stan/stanli
+  # implementation symbols on other Stan packages in the same R process.
+  dll <- dyn.load(.stanr_dll_path(libname, pkgname), local = TRUE, now = TRUE)
   .stanr_dll <<- dll
 
   # No useDynLib -- bind routines by hand.

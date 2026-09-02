@@ -4,6 +4,7 @@
 #include <stanli/packet.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,7 @@ ForwardFn resolve_forward_fn(const Op& op);
 static Kernel g_table[OP_COUNT_];
 
 Kernel& kernel(uint16_t opcode) {
+  assert(opcode < OP_COUNT_);
   return g_table[opcode];
 }
 
@@ -56,6 +58,7 @@ const char* opcode_name(uint16_t opcode) {
 }
 
 void register_kernel(uint16_t opcode, Kernel k) {
+  assert(opcode < OP_COUNT_);
   g_table[opcode] = k;
 }
 
@@ -223,6 +226,7 @@ void Graph::compact_idata() {
   for (Op& op : ops) {
     if (op.idata == nullptr) continue;
     const auto entry = find(op.idata);
+    assert(entry != entries.end() && entry->offset != unused);
     op.idata = compact_idata_->data() + entry->offset;
   }
   // clear() would retain the outer vector's per-payload metadata capacity.
@@ -288,6 +292,7 @@ void Executor::bind_() {
       adj_off += s.len;
     }
   }
+  assert(adj_off == n_params_);
   for (size_t i = 0; i < graph_.slots.size(); ++i) {
     const Slot& s = graph_.slots[i];
     if (!s.is_param && (written[i] || (int)i == graph_.result_slot)) {
@@ -299,6 +304,7 @@ void Executor::bind_() {
   result_adjoint_offset_ = -1;
   if (graph_.result_slot >= 0) {
     result_adjoint_offset_ = adjoint_offsets[graph_.result_slot];
+    assert(result_adjoint_offset_ >= 0);
   }
 
   int64_t scratch = 0;
@@ -331,6 +337,7 @@ void Executor::bind_() {
         make_ctx_(graph_.ops[i], scratch_offsets[i], written, adjoint_offsets);
     const int o2 = graph_.ops[i].out2;
     if (o2 >= 0) {
+      assert(adjoint_offsets[o2] >= 0);
       out2_adj_ptr_[i] = adjoints_.data() + adjoint_offsets[o2];
     }
   }
@@ -372,13 +379,16 @@ KernelCtx Executor::make_ctx_(const Op& op, int64_t scratch_offset,
     const int si = op.in[i];
     const Slot& s = graph_.slots[si];
     const bool active = s.is_param || written[si];
+    assert(!active || adjoint_offsets[si] >= 0);
     ctx.in_adj[i] =
         Desc{active ? adjoints_.data() + adjoint_offsets[si] : nullptr, s.len};
   }
+  assert(adjoint_offsets[op.out] >= 0);
   const int64_t out_adj_off = adjoint_offsets[op.out];
   if (so.len == 1) ctx.out_adj = adjoints_[out_adj_off];
   ctx.out_adj_vec = Desc{adjoints_.data() + out_adj_off, so.len};
   if (op.out2 >= 0) {
+    assert(adjoint_offsets[op.out2] >= 0);
     ctx.out2_adj = adjoints_[adjoint_offsets[op.out2]];
   }
   return ctx;
@@ -479,6 +489,7 @@ double Executor::forward_value_only() {
 double Executor::forward() {
   run_forward_only();
   const Slot& r = graph_.slots[graph_.result_slot];
+  assert(r.len == 1);
   return values_[r.offset];
 }
 
@@ -486,6 +497,7 @@ double Executor::gradient(double* grad_out) {
   ++n_grad_evals_;
   const double v = forward();
   std::memset(adjoints_.data(), 0, sizeof(double) * adjoints_.size());
+  assert(result_adjoint_offset_ >= 0);
   adjoints_[result_adjoint_offset_] = 1.0;
   if (profile_) {
     for (size_t pi = graph_.ops.size(); pi-- > 0;) {

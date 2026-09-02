@@ -42,6 +42,43 @@ test_that("use_opencl = TRUE with backend = \"stanli\" errors, even without comp
   )
 })
 
+test_that("compiled-backend C++ inputs fail early for stanli", {
+  code <- "parameters { real x; }"
+  expect_error(
+    stan_model(
+      code = code,
+      backend = "stanli",
+      external_cpp = "unused.hpp",
+      compile = FALSE
+    ),
+    "external_cpp.*not supported"
+  )
+  expect_error(
+    stan_model(
+      code = code,
+      backend = "stanli",
+      cpp_options = list(CXXFLAGS = "-O3"),
+      compile = FALSE
+    ),
+    "cpp_options.*not supported"
+  )
+})
+
+test_that("stanli requests the optimized stock-stanc MIR fallback", {
+  flags <- NULL
+  testthat::local_mocked_bindings(
+    stanc_ctx = function() {
+      list(call = function(entrypoint, model_name, code, options) {
+        flags <<- as.character(options)
+        list(result = "mir", warnings = character())
+      })
+    },
+    .package = "stanr"
+  )
+  expect_identical(stanr:::.stanr_stanli_mir("parameters { real x; }"), "mir")
+  expect_identical(flags, c("O1", "debug-optimized-mir"))
+})
+
 # ---------------------------------------------------------------------------
 # Sampling parity with the compiled backend
 # ---------------------------------------------------------------------------
@@ -74,11 +111,8 @@ test_that("sampling a stanli-backend model produces a usable fit", {
 # ---------------------------------------------------------------------------
 # Data marshaling: every shape the stanli backend accepts.
 #
-# SEXP -> stanli::DataMap goes through an r_data_context (a stan::io::
-# var_context) and DataMap::from_var_context(), no JSON involved (see
-# sexp_to_data_map(), src/stanli_model.cpp) -- including multi-dimensional
-# integer arrays (im/iar3 below), whose dims come from r_data_context's own
-# dims_i().
+# SEXP -> stanli::DataMap is a direct, one-pass conversion with no JSON or
+# intermediate var_context (see sexp_to_data_map(), src/stanli_model.cpp).
 #
 # Values are read back through indexed transformed-data expressions rather
 # than by echoing whole arrays through generated quantities: stanli's own
@@ -184,7 +218,7 @@ test_that("a bare logical scalar round-trips through set_int()", {
   expect_equal(fit$summary()$mean[fit$summary()$variable == "flag_out"], 0)
 })
 
-test_that("a logical matrix round-trips through from_var_context() as 0/1", {
+test_that("a logical matrix round-trips through direct DataMap conversion", {
   code <- "
     data { array[2, 2] int lm; }
     transformed data { int chk = lm[2, 1]; }
@@ -381,11 +415,10 @@ test_that("four-dimensional real and integer arrays round-trip", {
 })
 
 # ---------------------------------------------------------------------------
-# Init: stanli has no inverse parameter transform, so only unconstrained
-# (i.e. no named values at all -- a plain radius) init is supported.
+# Constrained-scale initialization and inverse parameter transforms.
 # ---------------------------------------------------------------------------
 
-test_that("a constrained-scale (named) init fails clearly", {
+test_that("a constrained-scale (named) init samples and unconstrains", {
   mod <- stan_model(
     code = "parameters { real theta; } model { theta ~ normal(0, 1); }",
     backend = "stanli"
@@ -399,11 +432,8 @@ test_that("a constrained-scale (named) init fails clearly", {
     show_messages = FALSE,
     init = list(theta = 0.5)
   )
-  expect_true(all(fit$return_codes() != 0L))
-  expect_match(
-    paste(fit$output(), collapse = "\n"),
-    "stanli cannot take inits on the constrained scale"
-  )
+  expect_equal(fit$return_codes(), 0L)
+  expect_equal(fit$unconstrain_variables(list(theta = 0.5)), 0.5)
 })
 
 test_that("radius-only (unconstrained-compatible) init samples successfully", {
@@ -421,6 +451,115 @@ test_that("radius-only (unconstrained-compatible) init samples successfully", {
     init = 1
   )
   expect_equal(fit$return_codes(), 0L)
+})
+
+test_that("stanli inverse transforms handle constrained containers", {
+  mod <- stan_model(
+    code = "
+      parameters {
+        real<lower=0> sigma;
+        simplex[3] p;
+      }
+      model {
+        sigma ~ exponential(1);
+        p ~ dirichlet(rep_vector(1, 3));
+      }
+    ",
+    backend = "stanli"
+  )
+  fit <- mod$sample(
+    data = list(),
+    chains = 1,
+    iter_warmup = 5,
+    iter_sampling = 2,
+    seed = 2,
+    show_messages = FALSE,
+    init = list(sigma = 2, p = c(0.2, 0.3, 0.5))
+  )
+  expect_equal(fit$return_codes(), 0L)
+  constrained <- list(sigma = 2, p = c(0.2, 0.3, 0.5))
+  free <- fit$unconstrain_variables(constrained)
+  expect_length(free, 3L)
+  expect_equal(
+    fit$constrain_variables(
+      free,
+      transformed_parameters = FALSE,
+      generated_quantities = FALSE
+    ),
+    constrained,
+    tolerance = 1e-10
+  )
+})
+
+# ---------------------------------------------------------------------------
+# Pure value functions through stanli::Function.
+# ---------------------------------------------------------------------------
+
+test_that("compile_standalone exposes stanli scalar and container functions", {
+  mod <- stan_model(
+    code = "
+      functions {
+        real stanr_add_values(real a, real b) { return a + b; }
+        int stanr_increment(int x) { return x + 1; }
+        matrix stanr_scale_matrix(matrix x, real a) { return a * x; }
+      }
+      parameters { real theta; }
+      model { theta ~ normal(0, 1); }
+    ",
+    backend = "stanli",
+    compile_standalone = TRUE
+  )
+  expect_equal(names(formals(mod$functions$stanr_add_values)), c("a", "b"))
+  expect_equal(mod$functions$stanr_add_values(2, 3), 5)
+  expect_identical(mod$functions$stanr_increment(2L), 3L)
+  x <- matrix(1:4, 2, 2)
+  expect_equal(mod$functions$stanr_scale_matrix(x, 2), 2 * x)
+})
+
+test_that("stanli exposes functions without constructing the model graph", {
+  mod <- stan_model(
+    code = "
+      functions { real stanr_square_value(real x) { return x * x; } }
+      parameters { real theta; }
+      model { theta ~ normal(0, 1); }
+    ",
+    backend = "stanli",
+    compile = FALSE
+  )
+  mod$expose_stan_functions()
+  expect_false(mod$is_compiled())
+  expect_equal(mod$functions$stanr_square_value(4), 16)
+})
+
+test_that("stanli function exposure rejects unsupported value surfaces", {
+  mod <- stan_model(
+    code = "
+      functions { real draw_rng() { return normal_rng(0, 1); } }
+      parameters { real theta; }
+      model { theta ~ normal(0, 1); }
+    ",
+    backend = "stanli",
+    compile = FALSE
+  )
+  expect_error(mod$expose_stan_functions(), "cannot expose RNG")
+})
+
+test_that("fit-level OpenCL selection fails instead of being ignored", {
+  mod <- stan_model(
+    code = "parameters { real theta; } model { theta ~ normal(0, 1); }",
+    backend = "stanli"
+  )
+  expect_error(
+    mod$sample(
+      data = list(),
+      chains = 1,
+      iter_warmup = 1,
+      iter_sampling = 1,
+      opencl_ids = c(0, 0),
+      show_messages = FALSE
+    ),
+    "opencl_ids.*not supported"
+  )
 })
 
 # ---------------------------------------------------------------------------

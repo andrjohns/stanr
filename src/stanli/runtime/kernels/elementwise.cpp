@@ -8,6 +8,7 @@
 #include <stan/math/prim/fun/min.hpp>
 #include <stan/math/rev/core.hpp>
 
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -26,6 +27,7 @@ void exp_bwd(KernelCtx& ctx) {
 void add_n_fwd(KernelCtx& ctx) {
   double acc = 0;
   for (int i = 0; i < ctx.n_in; ++i) {
+    assert(ctx.in[i].len == 1);
     acc += ctx.in[i].data[0];
   }
   ctx.out.data[0] = acc;
@@ -163,7 +165,11 @@ void sum_vec_bwd(KernelCtx& ctx) {
 // first_default_aligned is consequently lane zero, matching the Eigen value
 // CmdStan passes to stan::math::prod without allocating a copy here.
 void prod_vec_fwd(KernelCtx& ctx) {
+  assert(ctx.in[0].len > 0);
+  assert(ctx.variant <= 7);
+  assert((ctx.variant & 6u) != 6u);
   if (ctx.variant & 4u) {
+    assert(ctx.idata != nullptr && ctx.n_idata == 1);
     ctx.out.data[0] = prod_phased(ctx.in[0].data, ctx.in[0].len, ctx.idata[0]);
   } else if (ctx.variant & 3u) {
     double product = ctx.in[0].data[0];
@@ -204,6 +210,8 @@ void prod_vec_bwd(KernelCtx& ctx) {
 // for CmdStan's aligned owning VectorXd.  A direct Map would instead make
 // signed-zero/NaN tie grouping depend on this slot's arena address.
 void extrema_vec_fwd(KernelCtx& ctx) {
+  assert(ctx.variant <= 7);
+  assert((ctx.variant & 6u) != 6u);
   const bool maximum = ctx.variant & 1u;
   if (ctx.in[0].len == 0) {
     ctx.out.data[0] = maximum ? -std::numeric_limits<double>::infinity()
@@ -211,6 +219,7 @@ void extrema_vec_fwd(KernelCtx& ctx) {
     return;
   }
   if (ctx.variant & 4u) {
+    assert(ctx.idata != nullptr && ctx.n_idata == 1);
     ctx.out.data[0] =
         extrema_phased(ctx.in[0].data, ctx.in[0].len, ctx.idata[0], maximum);
     return;

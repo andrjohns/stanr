@@ -8,6 +8,7 @@
 #include <stanli/island.hpp>
 #include <stanli/optable.hpp>
 
+#include <cassert>
 
 namespace stanli {
 
@@ -62,6 +63,8 @@ bool within_clone_budget(const Program& p, size_t softmax3_count) {
 }  // namespace
 
 void program_softmax3_fwd(KernelCtx& ctx) {
+  assert(ctx.variant == kProgramSoftmax3Variant && ctx.n_in == 1 &&
+         ctx.in[0].len == 3 && ctx.out.len == 3);
   softmax3_into(ctx.in[0].data, ctx.out.data);
 }
 
@@ -129,7 +132,9 @@ std::shared_ptr<const Program> specialize_softmax3(const IslandProg& p,
 void island_softmax3_fwd(KernelCtx& ctx) {
   const auto* base = static_cast<const IslandProg*>(ctx.udata);
   const auto& p = *static_cast<const Softmax3IslandProg*>(base);
+  assert(p.native_adj && p.optimized_double);
   const Program& optimized = *p.optimized_double;
+  assert(optimized.n_regs == p.n_regs);
   // Mirrors island_fwd's native-adjoint path; keep these seed and harvest
   // loops in lockstep with runtime/kernels/island.cpp.
   for (size_t k = 0; k < p.ins.size(); ++k) {

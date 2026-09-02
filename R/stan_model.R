@@ -268,7 +268,7 @@
     "stanc",
     "model",
     code,
-    as.array("debug-transformed-mir")
+    as.array(c("O1", "debug-optimized-mir"))
   )
   if (!is.null(res$errors)) {
     stop(paste(res$errors, collapse = "\n"), call. = FALSE)
@@ -289,6 +289,105 @@
   }
   address <- getNativeSymbolInfo(name, dll)$address
   function(...) do.call(".Call", c(list(address), list(...)))
+}
+
+.stanr_stanli_native_functions <- function() {
+  cached <- .stanr_memo$stanli_native_functions
+  if (!is.null(cached)) {
+    return(cached)
+  }
+  # OpenCL is a compiled-backend capability. Keeping it out of this table
+  # prevents stanli from satisfying that API with a misleading no-op.
+  names <- c(
+    setdiff(.stanr_model_support_exports, "select_opencl_device"),
+    "new_function",
+    "call_function"
+  )
+  cached <- stats::setNames(
+    lapply(
+      names,
+      function(name) {
+        .stanr_stanli_native_function(paste0("stanr_stanli_", name))
+      }
+    ),
+    names
+  )
+  .stanr_memo$stanli_native_functions <- cached
+  cached
+}
+
+.stanr_stanli_functions_environment <- function(mir, code, native) {
+  declarations <- .stanr_functions_to_cpp_wrappers(code)$functions
+  env <- new.env(parent = emptyenv())
+  if (is.null(declarations) || !nrow(declarations)) {
+    registry <- list(name = character(), is_rng = logical(), args = character())
+    env$stanr_exposed_functions <- function() registry
+    return(env)
+  }
+
+  unsupported <- declarations$is_rng |
+    grepl("_(rng|lp)$", declarations$name) |
+    declarations$returntype == "void" |
+    grepl("complex|tuple", declarations$returntype, ignore.case = TRUE) |
+    grepl("complex|tuple", declarations$arg_types, ignore.case = TRUE)
+  if (any(unsupported)) {
+    stop(
+      "The stanli Function API cannot expose RNG, _lp, void, complex, or tuple ",
+      "functions: ",
+      paste(unique(declarations$name[unsupported]), collapse = ", "),
+      ".",
+      call. = FALSE
+    )
+  }
+
+  duplicated_names <- duplicated(declarations$name)
+  if (any(duplicated_names)) {
+    warning(
+      "Overloaded Stan functions use the first declaration's R argument ",
+      "names; stanli selects the matching overload from their values: ",
+      paste(unique(declarations$name[duplicated_names]), collapse = ", "),
+      ".",
+      call. = FALSE
+    )
+    declarations <- declarations[!duplicated_names, , drop = FALSE]
+  }
+
+  for (i in seq_len(nrow(declarations))) {
+    name <- declarations$name[[i]]
+    args <- if (nzchar(declarations$args[[i]])) {
+      strsplit(declarations$args[[i]], ",", fixed = TRUE)[[1]]
+    } else {
+      character()
+    }
+    pointer <- native$new_function(mir, name)
+    wrapper_env <- list2env(
+      list(
+        .stanr_call = native$call_function,
+        .stanr_function = pointer
+      ),
+      parent = baseenv()
+    )
+    arguments <- stats::setNames(lapply(args, as.name), args)
+    argument_list <- as.call(c(list(quote(list)), arguments))
+    body <- as.call(list(
+      as.name(".stanr_call"),
+      as.name(".stanr_function"),
+      argument_list
+    ))
+    formals <- stats::setNames(rep(list(quote(expr = )), length(args)), args)
+    env[[name]] <- eval(
+      call("function", as.pairlist(formals), body),
+      envir = wrapper_env
+    )
+  }
+
+  registry <- list(
+    name = declarations$name,
+    is_rng = rep(FALSE, nrow(declarations)),
+    args = declarations$args
+  )
+  env$stanr_exposed_functions <- function() registry
+  env
 }
 
 .compile_stan_model_environment <- function(
@@ -464,42 +563,40 @@
 .compile_stanli_model_environment <- function(
   code,
   model_name,
-  include_paths = character(),
-  external_cpp = NULL,
-  cpp_options = list(),
   verbose = FALSE,
-  force_recompile = FALSE
+  force_recompile = FALSE,
+  compile_standalone = FALSE
 ) {
-  memo <- if (is.null(.stanr_memo$stanli_envs)) {
-    .stanr_memo$stanli_envs <- new.env(parent = emptyenv())
+  memo <- if (is.null(.stanr_memo$stanli_mirs)) {
+    .stanr_memo$stanli_mirs <- new.env(parent = emptyenv())
   } else {
-    .stanr_memo$stanli_envs
+    .stanr_memo$stanli_mirs
   }
-  key <- .stanr_hash(c(
-    "stanli",
-    code,
-    model_name,
-    include_paths,
-    .stanr_external_cpp_contents(external_cpp),
-    vapply(cpp_options, as.character, character(1))
-  ))
-  if (!force_recompile && !is.null(memo[[key]])) {
-    return(memo[[key]])
+  key <- .stanr_hash(c("stanli-o1-mir", code))
+  mir <- memo[[key]]
+  if (force_recompile || is.null(mir)) {
+    if (verbose) {
+      message("[stanr] Constructing '", model_name, "' with stanli...")
+    }
+    mir <- .stanr_stanli_mir(code)
+    memo[[key]] <- mir
   }
-  if (verbose) {
-    message("[stanr] Constructing '", model_name, "' with stanli...")
-  }
-  env <- new.env()
-  mir <- .stanr_stanli_mir(code)
-  new_model <- .stanr_stanli_native_function("stanr_stanli_new_model")
-  for (name in .stanr_model_support_exports) {
-    env[[name]] <- .stanr_stanli_native_function(
-      paste0("stanr_stanli_", name)
-    )
-  }
-  memo[[key]] <- env
+
+  native <- .stanr_stanli_native_functions()
+  model_native <- native[setdiff(
+    .stanr_model_support_exports,
+    "select_opencl_device"
+  )]
+  env <- list2env(model_native, parent = emptyenv())
+  new_model <- native$new_model
   env$new_model <- function(data, seed, declarations = NULL) {
-    new_model(mir, data, model_name, seed)
+    new_model(mir, data, model_name)
+  }
+  if (compile_standalone) {
+    functions <- .stanr_stanli_functions_environment(mir, code, native)
+    for (name in ls(functions, all.names = TRUE)) {
+      env[[name]] <- functions[[name]]
+    }
   }
   env
 }
@@ -577,8 +674,11 @@
 #'   on macOS and `"-lOpenCL"` elsewhere.
 #' @param backend (string) Either `"compiled"` (the default), which compiles
 #'   the model to a native shared library, or `"stanli"`, which interprets
-#'   the model instead of compiling it. The `"stanli"` backend does not
-#'   support `use_opencl` or constrained-scale `init` values.
+#'   the model instead of compiling it. The `"stanli"` backend supports
+#'   constrained-scale initialization, but not `use_opencl`, `external_cpp`,
+#'   or non-empty `cpp_options`. Its exposed-function backend supports
+#'   deterministic integer/real scalar and container functions, but not RNG,
+#'   `_lp`, void, complex, or tuple functions.
 #'
 #' @return A [`StanModel`] object.
 #'

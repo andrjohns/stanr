@@ -160,6 +160,20 @@ StanModel <- R6Class(
       if (!is.null(user_header)) {
         external_cpp <- c(external_cpp, user_header)
       }
+      if (backend == "stanli") {
+        if (length(external_cpp)) {
+          stop(
+            "`external_cpp` and `user_header` are not supported by the stanli backend.",
+            call. = FALSE
+          )
+        }
+        if (length(cpp_options)) {
+          stop(
+            "Non-empty `cpp_options` are not supported by the stanli backend.",
+            call. = FALSE
+          )
+        }
+      }
 
       private$stan_file_ <- stan_file
       private$code_ <- code
@@ -229,11 +243,9 @@ StanModel <- R6Class(
         .compile_stanli_model_environment(
           code = private$resolved_code(),
           model_name = private$model_name_,
-          include_paths = private$include_paths_,
-          external_cpp = private$external_cpp_,
-          cpp_options = private$cpp_options_,
           verbose = !quiet,
-          force_recompile = force_recompile
+          force_recompile = force_recompile,
+          compile_standalone = compile_standalone
         )
       } else .compile_stan_model_environment(
         code = private$resolved_code(),
@@ -349,14 +361,24 @@ StanModel <- R6Class(
 
       if (is.null(private$functions_compiled_env_)) {
         # Must work on a compile = FALSE model without compiling it.
-        private$functions_compiled_env_ <- .compile_standalone_functions_environment(
-          code = private$resolved_code(),
-          stan_file = private$stan_file_,
-          external_cpp = private$external_cpp_,
-          cpp_options = private$cpp_options_,
-          verbose = verbose,
-          precompiled_headers = private$precompiled_headers_
-        )
+        private$functions_compiled_env_ <- if (private$backend_ == "stanli") {
+          .compile_stanli_model_environment(
+            code = private$resolved_code(),
+            model_name = private$model_name_,
+            verbose = verbose,
+            force_recompile = FALSE,
+            compile_standalone = TRUE
+          )
+        } else {
+          .compile_standalone_functions_environment(
+            code = private$resolved_code(),
+            stan_file = private$stan_file_,
+            external_cpp = private$external_cpp_,
+            cpp_options = private$cpp_options_,
+            verbose = verbose,
+            precompiled_headers = private$precompiled_headers_
+          )
+        }
       }
 
       .stanr_build_functions_env(
@@ -450,6 +472,10 @@ StanModel <- R6Class(
       ids <- as.integer(opencl_ids)
       if (length(ids) != 2L || anyNA(ids) || any(ids < 0L)) {
         stop("`opencl_ids` must be c(platform_id, device_id).", call. = FALSE)
+      }
+      if (private$backend_ == "stanli") {
+        stop("`opencl_ids` are not supported by the stanli backend.",
+             call. = FALSE)
       }
       self$native_function("select_opencl_device")(ids[[1]], ids[[2]])
       invisible(NULL)

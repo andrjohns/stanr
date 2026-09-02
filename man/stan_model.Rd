@@ -102,8 +102,11 @@ what gets exposed and how.}
 
 \item{backend}{(string) Either \code{"compiled"} (the default), which compiles
 the model to a native shared library, or \code{"stanli"}, which interprets
-the model instead of compiling it. The \code{"stanli"} backend does not
-support \code{use_opencl} or constrained-scale \code{init} values.}
+the model instead of compiling it. The \code{"stanli"} backend supports
+constrained-scale initialization, but not \code{use_opencl}, \code{external_cpp},
+or non-empty \code{cpp_options}. Its exposed-function backend supports
+deterministic integer/real scalar and container functions, but not RNG,
+\verb{_lp}, void, complex, or tuple functions.}
 }
 \value{
 A \code{\link{StanModel}} object.

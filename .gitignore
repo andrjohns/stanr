@@ -4,6 +4,7 @@
 **.pch
 **.so
 **.dll
+src/stanli/libstanr_stanli.a
 inst/lib
 inst/doc
 .vscode

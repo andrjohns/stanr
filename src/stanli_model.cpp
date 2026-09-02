@@ -2,9 +2,9 @@
 #include <stan/math/rev/core.hpp>
 #include <stanr/cpp11_tuple_interop.hpp>
 #include <stanr/model_methods.hpp>
-#include <stanr/r_data_context.hpp>
 #include <stanli/compile.hpp>
 #include <stanli/executor_pool.hpp>
+#include <stanli/function.hpp>
 #include <stanli/wa_interp.hpp>
 
 #include <cpp11.hpp>
@@ -15,8 +15,12 @@
 
 #include <Eigen/Dense>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -26,93 +30,204 @@
 namespace stanr {
 namespace {
 
-// stanli restricts data to what DataMap::from_var_context() below can
-// actually represent: no tuples (the runtime still has no tuple lowering),
-// and no complex (from_var_context reads only vals_r()/vals_i(), so a
-// complex-only r_data_context entry would silently come through empty rather
-// than erroring). Numeric data.frames are normalized to matrices by
-// r_data_context and are supported here as long as all columns are real or
-// integer.
-void check_supported(const std::string& name, SEXP value) {
-  if (Rf_isNull(value))
-    throw std::runtime_error("stanli data value cannot be NULL: " + name);
-  if (Rf_inherits(value, "data.frame")) {
-    SEXP columns = value;
-    for (R_xlen_t i = 0; i < XLENGTH(columns); ++i) {
-      SEXP column = VECTOR_ELT(columns, i);
-      if (TYPEOF(column) == CPLXSXP)
-        throw std::runtime_error(
-            "stanli data does not support complex values yet: " + name);
-      if (TYPEOF(column) != INTSXP && TYPEOF(column) != REALSXP)
-        throw std::runtime_error(
-            "stanli data frames must contain only integer or numeric "
-            "columns: " +
-            name);
+std::vector<int64_t> sexp_dims(const std::string& name, SEXP value) {
+  SEXP dim = Rf_getAttrib(value, R_DimSymbol);
+  std::vector<int64_t> out;
+  if (Rf_xlength(dim) > 0) {
+    if (TYPEOF(dim) != INTSXP)
+      throw std::runtime_error("invalid dimensions for stanli data: " + name);
+    out.reserve(static_cast<size_t>(Rf_xlength(dim)));
+    for (R_xlen_t i = 0; i < Rf_xlength(dim); ++i) {
+      const int d = INTEGER_ELT(dim, i);
+      if (d == NA_INTEGER || d < 0)
+        throw std::runtime_error("invalid dimensions for stanli data: " + name);
+      out.push_back(d);
     }
+  } else if (Rf_xlength(value) != 1) {
+    out.push_back(static_cast<int64_t>(Rf_xlength(value)));
+  }
+  return out;
+}
+
+struct copied_reals {
+  std::vector<double> values;
+  std::vector<int> integer_values;
+  bool all_integer = true;
+};
+
+copied_reals copy_reals(const std::string& name, SEXP value) {
+  const R_xlen_t n = Rf_xlength(value);
+  const double* source = REAL(value);
+  copied_reals out;
+  out.values.resize(static_cast<size_t>(n));
+  out.integer_values.reserve(static_cast<size_t>(n));
+  for (R_xlen_t i = 0; i < n; ++i) {
+    if (!std::isfinite(source[i]))
+      throw std::runtime_error(
+          "stanli data cannot contain NA, NaN, or Inf: " + name);
+    out.values[static_cast<size_t>(i)] = source[i];
+    if (out.all_integer && std::trunc(source[i]) == source[i] &&
+        source[i] >= static_cast<double>(std::numeric_limits<int>::min()) &&
+        source[i] <= static_cast<double>(std::numeric_limits<int>::max())) {
+      out.integer_values.push_back(static_cast<int>(source[i]));
+    } else {
+      out.all_integer = false;
+      out.integer_values.clear();
+    }
+  }
+  return out;
+}
+
+std::vector<int> copy_integers(const std::string& name, SEXP value) {
+  const bool logical = TYPEOF(value) == LGLSXP;
+  const R_xlen_t n = Rf_xlength(value);
+  const int* source = logical ? LOGICAL(value) : INTEGER(value);
+  std::vector<int> out(static_cast<size_t>(n));
+  for (R_xlen_t i = 0; i < n; ++i) {
+    if (source[i] == NA_INTEGER)
+      throw std::runtime_error("stanli data cannot contain NA: " + name);
+    out[static_cast<size_t>(i)] = source[i];
+  }
+  return out;
+}
+
+void add_data_frame(stanli::DataMap& out, const std::string& name,
+                    SEXP value) {
+  const R_xlen_t n_columns = Rf_xlength(value);
+  const R_xlen_t n_rows = n_columns == 0 ? 0 : Rf_xlength(VECTOR_ELT(value, 0));
+  for (R_xlen_t column = 0; column < n_columns; ++column) {
+    SEXP x = VECTOR_ELT(value, column);
+    if (Rf_xlength(x) != n_rows)
+      throw std::runtime_error("stanli data frame columns have unequal lengths: " +
+                               name);
+    if (TYPEOF(x) == CPLXSXP) {
+      throw std::runtime_error(
+          "stanli data does not support complex values yet: " + name);
+    } else if (TYPEOF(x) != INTSXP && TYPEOF(x) != REALSXP) {
+      throw std::runtime_error(
+          "stanli data frames must contain only integer or numeric columns: " +
+          name);
+    }
+  }
+
+  const std::vector<int64_t> dims = {static_cast<int64_t>(n_rows),
+                                     static_cast<int64_t>(n_columns)};
+  const size_t size = static_cast<size_t>(n_rows * n_columns);
+  std::vector<double> values;
+  std::vector<int> integer_values;
+  values.reserve(size);
+  integer_values.reserve(size);
+  bool all_integer = true;
+  for (R_xlen_t column = 0; column < n_columns; ++column) {
+    SEXP x = VECTOR_ELT(value, column);
+    if (TYPEOF(x) == REALSXP) {
+      copied_reals one = copy_reals(
+          name + "[[" + std::to_string(column + 1) + "]]", x);
+      values.insert(values.end(), one.values.begin(), one.values.end());
+      if (all_integer && one.all_integer) {
+        integer_values.insert(integer_values.end(), one.integer_values.begin(),
+                              one.integer_values.end());
+      } else {
+        all_integer = false;
+        integer_values.clear();
+      }
+    } else {
+      std::vector<int> one = copy_integers(
+          name + "[[" + std::to_string(column + 1) + "]]", x);
+      values.insert(values.end(), one.begin(), one.end());
+      if (all_integer)
+        integer_values.insert(integer_values.end(), one.begin(), one.end());
+    }
+  }
+  if (all_integer) {
+    out.set_int_array(name, std::move(integer_values), dims);
     return;
   }
-  if (TYPEOF(value) == CPLXSXP)
-    throw std::runtime_error("stanli data does not support complex values yet");
-  if (TYPEOF(value) != INTSXP && TYPEOF(value) != LGLSXP &&
-      TYPEOF(value) != REALSXP) {
+  out.set_real_array(name, std::move(values), dims);
+}
+
+// Build DataMap directly so each R value is validated and copied once. The
+// compiled backend still uses r_data_context for tuple/complex support; those
+// types are deliberately rejected here because stanli cannot lower them.
+stanli::DataMap sexp_to_data_map(SEXP data) {
+  if (Rf_isNull(data) || XLENGTH(data) == 0) return stanli::DataMap();
+  SEXP names = Rf_getAttrib(data, R_NamesSymbol);
+  if (TYPEOF(data) != VECSXP || Rf_isNull(names) ||
+      XLENGTH(names) != XLENGTH(data))
+    throw std::runtime_error("stanli data must be a named list");
+  stanli::DataMap out;
+  for (R_xlen_t i = 0; i < XLENGTH(data); ++i) {
+    SEXP name_sexp = STRING_ELT(names, i);
+    if (name_sexp == NA_STRING || CHAR(name_sexp)[0] == '\0')
+      throw std::runtime_error("stanli data list names must be non-empty");
+    const std::string name = CHAR(name_sexp);
+    if (out.has(name))
+      throw std::runtime_error("stanli data list names must be unique: " + name);
+    SEXP value = VECTOR_ELT(data, i);
+    if (Rf_isNull(value))
+      throw std::runtime_error("stanli data value cannot be NULL: " + name);
+    if (Rf_inherits(value, "data.frame")) {
+      add_data_frame(out, name, value);
+      continue;
+    }
+    if (TYPEOF(value) == CPLXSXP)
+      throw std::runtime_error(
+          "stanli data does not support complex values yet: " + name);
+    if (TYPEOF(value) == REALSXP) {
+      copied_reals values = copy_reals(name, value);
+      std::vector<int64_t> dims = sexp_dims(name, value);
+      if (values.all_integer) {
+        if (dims.empty())
+          out.set_int(name, values.integer_values.front());
+        else
+          out.set_int_array(name, std::move(values.integer_values),
+                            std::move(dims));
+      } else if (dims.empty()) {
+        out.set_real(name, values.values.front());
+      } else {
+        out.set_real_array(name, std::move(values.values), std::move(dims));
+      }
+      continue;
+    }
+    if (TYPEOF(value) == INTSXP || TYPEOF(value) == LGLSXP) {
+      std::vector<int> values = copy_integers(name, value);
+      std::vector<int64_t> dims = sexp_dims(name, value);
+      if (dims.empty())
+        out.set_int(name, values.front());
+      else
+        out.set_int_array(name, std::move(values), std::move(dims));
+      continue;
+    }
     throw std::runtime_error(
         "stanli data must be numeric, logical, or an array (tuple-typed "
         "data is not yet supported): " + name);
   }
+  return out;
 }
 
-// stanli has no sink for r_data_context's NaN-only check (it silently treats
-// Inf as a valid real), so NA/NaN/Inf get their own stricter, stanli-flavored
-// pass here before that context ever sees the value. Data frames need to be
-// checked column by column because their outer SEXP is a VECSXP.
-void check_finite(const std::string& name, SEXP value) {
-  if (Rf_inherits(value, "data.frame")) {
-    for (R_xlen_t i = 0; i < XLENGTH(value); ++i) {
-      check_finite(name + "[[" + std::to_string(i + 1) + "]]",
-                   VECTOR_ELT(value, i));
+SEXP data_entry_to_sexp(const stanli::DataMap::Entry& entry) {
+  const R_xlen_t size = static_cast<R_xlen_t>(
+      entry.is_int ? entry.i.size() : entry.r.size());
+  SEXP out = PROTECT(Rf_allocVector(entry.is_int ? INTSXP : REALSXP, size));
+  if (entry.is_int) {
+    std::copy(entry.i.begin(), entry.i.end(), INTEGER(out));
+  } else {
+    std::copy(entry.r.begin(), entry.r.end(), REAL(out));
+  }
+  if (!entry.dims.empty()) {
+    SEXP dims = PROTECT(Rf_allocVector(INTSXP, entry.dims.size()));
+    for (size_t i = 0; i < entry.dims.size(); ++i) {
+      if (entry.dims[i] < 0 || entry.dims[i] > std::numeric_limits<int>::max()) {
+        UNPROTECT(2);
+        throw std::runtime_error("stanli function result has invalid dimensions");
+      }
+      INTEGER(dims)[i] = static_cast<int>(entry.dims[i]);
     }
-    return;
+    Rf_setAttrib(out, R_DimSymbol, dims);
+    UNPROTECT(1);
   }
-  const R_xlen_t n = XLENGTH(value);
-  if (TYPEOF(value) == REALSXP) {
-    for (R_xlen_t i = 0; i < n; ++i) {
-      if (!std::isfinite(REAL_ELT(value, i)))
-        throw std::runtime_error(
-            "stanli data cannot contain NA, NaN, or Inf: " + name);
-    }
-    return;
-  }
-  for (R_xlen_t i = 0; i < n; ++i) {
-    const int x =
-        TYPEOF(value) == LGLSXP ? LOGICAL_ELT(value, i) : INTEGER_ELT(value, i);
-    if (x == NA_INTEGER)
-      throw std::runtime_error("stanli data cannot contain NA: " + name);
-  }
-}
-
-// SEXP -> stanli::DataMap. stanli-specific restrictions (no tuples, no
-// complex, no NA/NaN/Inf) are checked up front with stanli's own error
-// messages; once a list clears that, it is exactly what stanr::r_data_context
-// (the same var_context the compiled backend builds from R data) already
-// knows how to read, so DataMap::from_var_context() -- stanli's adapter for a
-// caller that already has a var_context, rather than JSON text -- does the
-// actual conversion.
-stanli::DataMap sexp_to_data_map(SEXP data) {
-  if (Rf_isNull(data) || XLENGTH(data) == 0) return stanli::DataMap();
-  SEXP names = Rf_getAttrib(data, R_NamesSymbol);
-  if (TYPEOF(data) != VECSXP || Rf_isNull(names))
-    throw std::runtime_error("stanli data must be a named list");
-  for (R_xlen_t i = 0; i < XLENGTH(data); ++i) {
-    const char* name = CHAR(STRING_ELT(names, i));
-    if (name[0] == '\0')
-      throw std::runtime_error("stanli data list names must be non-empty");
-    SEXP value = VECTOR_ELT(data, i);
-    check_supported(name, value);
-    check_finite(name, value);
-  }
-  cpp11::list data_list(data);
-  stanr::r_data_context context(data_list);
-  return stanli::DataMap::from_var_context(context);
+  UNPROTECT(1);
+  return out;
 }
 
 void append_unc_names(const stanli::CompiledModel::UncParam& p,
@@ -144,13 +259,6 @@ void append_unc_names(const stanli::CompiledModel::UncParam& p,
     out.push_back(p.name + "." + std::to_string(i + 1));
 }
 
-size_t scalar_count(const std::vector<stanli::CompiledModel::ParamView>& views,
-                    size_t first, size_t last) {
-  size_t n = 0;
-  for (size_t i = first; i < last; ++i) n += static_cast<size_t>(views[i].len);
-  return n;
-}
-
 bool require_jacobian(SEXP value) {
   if (!stanr::as_cpp<bool>(value))
     throw std::runtime_error(
@@ -161,9 +269,8 @@ bool require_jacobian(SEXP value) {
 
 }  // namespace
 
-// Hidden visibility: compiled into libstanr_runner.a, statically linked into
-// both the package .so and (transitively, via the archive) every per-model
-// .so built at runtime -- see stanr/r_data_context.hpp.
+// Package-only adapter. Runtime-compiled model libraries link the generic
+// runner archive but never this class or the stanli runtime.
 class __attribute__((visibility("hidden"))) stanli_model_base final
     : public stan::model::model_base {
  public:
@@ -179,6 +286,7 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     n_tp_start_ = columns_.size();
     n_gq_start_ = columns_.size();
     prepare_write_array();
+    prepare_column_offsets();
   }
 
   std::string model_name() const override { return name_; }
@@ -222,7 +330,7 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     for (Eigen::Index i = 0; i < q.size(); ++i) lease->params_data()[i] = q(i);
     try {
       return lease->forward();
-    } catch (const std::domain_error&) {
+    } catch (const std::exception&) {
       return -std::numeric_limits<double>::infinity();
     }
   }
@@ -231,16 +339,20 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
       Eigen::Matrix<stan::math::var, -1, 1>& q) const {
     auto lease = pool_->acquire();
     check_size(q.size());
-    std::vector<double> gradient(static_cast<size_t>(q.size()));
+    // The workspace is independent of a model/executor and is safe to reuse
+    // after precomputed_gradients() has copied it onto the autodiff arena.
+    static thread_local std::vector<double> gradient;
+    gradient.resize(static_cast<size_t>(q.size()));
     for (Eigen::Index i = 0; i < q.size(); ++i)
       lease->params_data()[i] = q(i).val();
     double value;
     try {
       value = lease->gradient(gradient.data());
-    } catch (const std::domain_error&) {
+    } catch (const std::exception&) {
       return stan::math::var(-std::numeric_limits<double>::infinity());
     }
-    std::vector<stan::math::var> operands(q.data(), q.data() + q.size());
+    std::vector<stan::math::var> operands;
+    if (q.size() != 0) operands.assign(q.data(), q.data() + q.size());
     return stan::math::precomputed_gradients(value, operands, gradient);
   }
 
@@ -279,47 +391,112 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
 
 #undef STANLI_VECTOR_LOG_PROB
 
-  void transform_inits(const stan::io::var_context&, Eigen::VectorXd&,
+  void transform_inits(const stan::io::var_context& context,
+                       Eigen::VectorXd& params_r,
                        std::ostream*) const override {
-    throw std::runtime_error(
-        "stanli cannot take inits on the constrained scale: pass an unconstrained init instead");
+    const std::vector<double> values = unconstrain_context(context);
+    params_r.resize(static_cast<Eigen::Index>(values.size()));
+    std::copy(values.begin(), values.end(), params_r.data());
   }
 
-  void transform_inits(const stan::io::var_context&, std::vector<int>&,
-                       std::vector<double>&, std::ostream*) const override {
-    throw std::runtime_error(
-        "stanli cannot take inits on the constrained scale: pass an unconstrained init instead");
+  void transform_inits(const stan::io::var_context& context,
+                       std::vector<int>& params_i,
+                       std::vector<double>& params_r,
+                       std::ostream*) const override {
+    params_i.clear();
+    params_r = unconstrain_context(context);
   }
 
-  void unconstrain_array(const Eigen::VectorXd&, Eigen::VectorXd&,
+  void unconstrain_array(const Eigen::VectorXd& constrained,
+                         Eigen::VectorXd& unconstrained,
                          std::ostream*) const override {
-    throw std::runtime_error(
-        "stanli does not yet implement inverse parameter transforms");
+    const std::vector<double> values = unconstrain_flat(
+        constrained.data(), static_cast<size_t>(constrained.size()));
+    unconstrained.resize(static_cast<Eigen::Index>(values.size()));
+    std::copy(values.begin(), values.end(), unconstrained.data());
   }
 
-  void unconstrain_array(const std::vector<double>&, std::vector<double>&,
+  void unconstrain_array(const std::vector<double>& constrained,
+                         std::vector<double>& unconstrained,
                          std::ostream*) const override {
-    throw std::runtime_error(
-        "stanli does not yet implement inverse parameter transforms");
+    unconstrained = unconstrain_flat(constrained.data(), constrained.size());
   }
 
   void write_array(stan::rng_t& rng, Eigen::VectorXd& q, Eigen::VectorXd& out,
                    bool include_tparams = true, bool include_gqs = true,
                    std::ostream* msgs = nullptr) const override {
-    std::vector<double> input(q.data(), q.data() + q.size());
-    std::vector<double> values;
-    write_array_impl(rng, input, values, include_tparams, include_gqs, msgs);
-    out = Eigen::Map<Eigen::VectorXd>(values.data(), static_cast<Eigen::Index>(values.size()));
+    out.resize(static_cast<Eigen::Index>(
+        selected_output_size(include_tparams, include_gqs)));
+    write_array_impl(rng, q.data(), static_cast<size_t>(q.size()), out.data(),
+                     include_tparams, include_gqs, msgs);
   }
 
   void write_array(stan::rng_t& rng, std::vector<double>& q,
                    std::vector<int>&, std::vector<double>& out,
                    bool include_tparams = true, bool include_gqs = true,
                    std::ostream* msgs = nullptr) const override {
-    write_array_impl(rng, q, out, include_tparams, include_gqs, msgs);
+    out.resize(selected_output_size(include_tparams, include_gqs));
+    write_array_impl(rng, q.data(), q.size(), out.data(), include_tparams,
+                     include_gqs, msgs);
   }
 
  private:
+  const stanli::InitInterp& init_interpreter() const {
+    if (!cm_.transform_inits) {
+      throw std::runtime_error(
+          "this model has no inverse parameter transforms: its MIR carries "
+          "no transform_inits section");
+    }
+    if (!cm_.transform_inits->interp) {
+      throw std::runtime_error(
+          "this model's inverse parameter transforms are unavailable: " +
+          cm_.transform_inits->truncated);
+    }
+    return *cm_.transform_inits->interp;
+  }
+
+  std::vector<double> check_unconstrained_size(
+      std::vector<double> values) const {
+    if (values.size() != num_params_r__)
+      throw std::runtime_error(
+          "the inverse transforms produced the wrong number of unconstrained "
+          "values");
+    return values;
+  }
+
+  std::vector<double> unconstrain_context(
+      const stan::io::var_context& context) const {
+    const stanli::DataMap supplied =
+        stanli::DataMap::from_var_context(context);
+    const std::map<std::string, stanli::DataMap::Entry> inits(
+        supplied.entries().begin(), supplied.entries().end());
+    return check_unconstrained_size(init_interpreter().eval(inits));
+  }
+
+  std::vector<double> unconstrain_flat(const double* values, size_t size) const {
+    const stanli::InitInterp& interp = init_interpreter();
+    std::map<std::string, stanli::DataMap::Entry> inits;
+    size_t offset = 0;
+    for (const stanli::InitParam& param : interp.params()) {
+      if (param.constrained_len < 0 ||
+          static_cast<uint64_t>(param.constrained_len) > size - offset) {
+        throw std::runtime_error(
+            "the constrained parameter vector has the wrong number of values");
+      }
+      stanli::DataMap::Entry entry;
+      entry.dims = param.dims;
+      const size_t length = static_cast<size_t>(param.constrained_len);
+      if (length != 0)
+        entry.r.assign(values + offset, values + offset + length);
+      inits.emplace(param.name, std::move(entry));
+      offset += length;
+    }
+    if (offset != size)
+      throw std::runtime_error(
+          "the constrained parameter vector has the wrong number of values");
+    return check_unconstrained_size(interp.eval(inits));
+  }
+
   static std::vector<size_t> view_dims(const stanli::CompiledModel::ParamView& v) {
     return std::vector<size_t>(v.dims.begin(), v.dims.end());
   }
@@ -334,18 +511,44 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
 
   bool has_write_array() const { return wa_interp_ || wa_pool_; }
 
-  std::vector<std::pair<size_t, size_t>> selected_ranges(
-      bool include_tparams, bool include_gqs) const {
-    std::vector<std::pair<size_t, size_t>> ranges;
-    ranges.emplace_back(0, include_tparams ? n_gq_start_ : n_tp_start_);
-    if (include_gqs) ranges.emplace_back(n_gq_start_, columns_.size());
-    return ranges;
+  using Range = std::pair<size_t, size_t>;
+
+  size_t selected_ranges(bool include_tparams, bool include_gqs,
+                         std::array<Range, 2>& ranges) const {
+    ranges[0] = {0, include_tparams ? n_gq_start_ : n_tp_start_};
+    if (!include_gqs) return 1;
+    ranges[1] = {n_gq_start_, columns_.size()};
+    return 2;
   }
 
   template <typename F>
   void for_each_selected(bool include_tparams, bool include_gqs, F&& f) const {
-    for (const auto& range : selected_ranges(include_tparams, include_gqs))
-      for (size_t i = range.first; i < range.second; ++i) f(columns_[i]);
+    std::array<Range, 2> ranges;
+    const size_t n_ranges =
+        selected_ranges(include_tparams, include_gqs, ranges);
+    for (size_t r = 0; r < n_ranges; ++r)
+      for (size_t i = ranges[r].first; i < ranges[r].second; ++i)
+        f(columns_[i]);
+  }
+
+  void prepare_column_offsets() {
+    column_offsets_.resize(columns_.size() + 1);
+    column_offsets_[0] = 0;
+    for (size_t i = 0; i < columns_.size(); ++i) {
+      column_offsets_[i + 1] =
+          column_offsets_[i] + static_cast<size_t>(columns_[i].len);
+    }
+  }
+
+  size_t selected_output_size(bool include_tparams, bool include_gqs) const {
+    std::array<Range, 2> ranges;
+    const size_t n_ranges =
+        selected_ranges(include_tparams, include_gqs, ranges);
+    size_t size = 0;
+    for (size_t r = 0; r < n_ranges; ++r)
+      size += column_offsets_[ranges[r].second] -
+              column_offsets_[ranges[r].first];
+    return size;
   }
 
   void check_size(Eigen::Index n) const {
@@ -386,42 +589,39 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     }
   }
 
-  void write_array_impl(stan::rng_t& rng, const std::vector<double>& q,
-                        std::vector<double>& out, bool include_tparams,
-                        bool include_gqs, std::ostream*) const {
-    check_size(static_cast<Eigen::Index>(q.size()));
-    const auto ranges = selected_ranges(include_tparams, include_gqs);
-    size_t output_size = 0;
-    for (const auto& range : ranges)
-      output_size += scalar_count(columns_, range.first, range.second);
-    out.clear();
-    out.reserve(output_size);
+  void write_array_impl(stan::rng_t& rng, const double* q, size_t q_size,
+                        double* out, bool include_tparams, bool include_gqs,
+                        std::ostream*) const {
+    check_size(static_cast<Eigen::Index>(q_size));
+    std::array<Range, 2> ranges;
+    const size_t n_ranges =
+        selected_ranges(include_tparams, include_gqs, ranges);
 
     if (wa_interp_) {
       stanli::WaRng wa_rng(include_gqs ? static_cast<unsigned>(rng()) : 1);
       auto lease = pool_->acquire();
-      std::copy(q.begin(), q.end(), lease->params_data());
+      if (q_size != 0) std::copy(q, q + q_size, lease->params_data());
       lease->run_forward_only();
       const std::vector<double> row = wa_interp_->eval(
           cm_.constrained_env(*lease), wa_rng);
-      for (const auto& range : ranges) {
-        const size_t first = scalar_count(columns_, 0, range.first);
-        const size_t last = scalar_count(columns_, 0, range.second);
-        out.insert(out.end(), row.begin() + static_cast<std::ptrdiff_t>(first),
-                   row.begin() + static_cast<std::ptrdiff_t>(last));
+      for (size_t r = 0; r < n_ranges; ++r) {
+        const size_t first = column_offsets_[ranges[r].first];
+        const size_t last = column_offsets_[ranges[r].second];
+        out = std::copy(row.begin() + static_cast<std::ptrdiff_t>(first),
+                        row.begin() + static_cast<std::ptrdiff_t>(last), out);
       }
       return;
     }
 
     auto lease = (wa_pool_ ? *wa_pool_ : *pool_).acquire();
-    std::copy(q.begin(), q.end(), lease->params_data());
+    if (q_size != 0) std::copy(q, q + q_size, lease->params_data());
     lease->run_forward_only();
-    for (const auto& range : ranges) {
-      for (size_t i = range.first; i < range.second; ++i) {
+    for (size_t r = 0; r < n_ranges; ++r) {
+      for (size_t i = ranges[r].first; i < ranges[r].second; ++i) {
         const auto& v = columns_[i];
         const double* p = lease->value_ptr(v.slot);
         for (int64_t j = 0; j < v.len; ++j)
-          out.push_back(p[v.storage_index(j)]);
+          *out++ = p[v.storage_index(j)];
       }
     }
   }
@@ -434,12 +634,12 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
   mutable std::unique_ptr<stanli::ExecutorPool> wa_pool_;
   std::shared_ptr<stanli::WaInterp> wa_interp_;
   std::vector<stanli::CompiledModel::ParamView> columns_;
+  std::vector<size_t> column_offsets_;
   size_t n_tp_start_ = 0;
   size_t n_gq_start_ = 0;
 };
 
-extern "C" SEXP stanr_stanli_new_model(SEXP mir, SEXP data, SEXP model_name,
-                                        SEXP) {
+extern "C" SEXP stanr_stanli_new_model(SEXP mir, SEXP data, SEXP model_name) {
   BEGIN_CPP11
   if (TYPEOF(mir) != STRSXP || XLENGTH(mir) != 1)
     cpp11::stop("stanli MIR must be a single string");
@@ -456,6 +656,25 @@ extern "C" SEXP stanr_stanli_run_model(SEXP model, SEXP args) {
   BEGIN_CPP11
   cpp11::external_pointer<stan::model::model_base> m(model);
   return stanr::run_model(*m, cpp11::list(args));
+  END_CPP11
+}
+
+extern "C" SEXP stanr_stanli_new_function(SEXP mir, SEXP function_name) {
+  BEGIN_CPP11
+  if (TYPEOF(mir) != STRSXP || XLENGTH(mir) != 1)
+    cpp11::stop("stanli function MIR must be a single string");
+  if (TYPEOF(function_name) != STRSXP || XLENGTH(function_name) != 1)
+    cpp11::stop("stanli function name must be a single string");
+  auto* function = new stanli::Function(stanli::Function::from_mir(
+      CHAR(STRING_ELT(mir, 0)), CHAR(STRING_ELT(function_name, 0))));
+  return cpp11::external_pointer<stanli::Function>(function);
+  END_CPP11
+}
+
+extern "C" SEXP stanr_stanli_call_function(SEXP function, SEXP arguments) {
+  BEGIN_CPP11
+  cpp11::external_pointer<stanli::Function> fn(function);
+  return data_entry_to_sexp((*fn)(sexp_to_data_map(arguments)));
   END_CPP11
 }
 
@@ -534,10 +753,4 @@ STANLI_MODEL_METHOD(model_variable_skeleton,
                     return stanr::model_variable_skeleton(
                         *m, stanr::as_cpp<bool>(tp), stanr::as_cpp<bool>(gq),
                         cpp11::list(declarations)))
-extern "C" SEXP stanr_stanli_select_opencl_device(SEXP, SEXP) {
-  BEGIN_CPP11
-  return R_NilValue;
-  END_CPP11
-}
-
 }  // namespace stanr

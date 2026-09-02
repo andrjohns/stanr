@@ -7,11 +7,13 @@ all: $(SHLIB)
 PKG_CPPFLAGS_BASE = -I"../inst/include" \
   -I"sundials" \
   -I"stanli/runtime/include" \
-  -D_REENTRANT -DSTAN_THREADS \
+  -D_REENTRANT -DSTAN_THREADS -DNDEBUG \
   -D_HAS_AUTO_PTR_ETC=0 -DEIGEN_PERMANENTLY_DISABLE_STUPID_WARNINGS \
   -DTBB_INTERFACE_NEW -DEIGEN_NO_DEBUG -DBOOST_DISABLE_ASSERTS
 
 PKG_CPPFLAGS = $(PKG_CPPFLAGS_BASE) -include stan_sundials_printf_override.hpp
+PKG_CXXFLAGS += -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden
+PKG_CFLAGS += -fvisibility=hidden
 
 R_CC := $(shell $(R_HOME)/bin$(R_ARCH_BIN)/R CMD config CC)
 
@@ -37,20 +39,21 @@ SUNDIALS_SOURCES = $(wildcard sundials/*.c) \
   nvector/serial/nvector_serial.c
 SUNDIALS_OBJECTS = $(SUNDIALS_SOURCES:.c=.o)
 
-STANLI_SOURCES = $(wildcard stanli/runtime/src/*.cpp) \
+STANLI_SOURCES = $(filter-out stanli/runtime/src/build_id.cpp, \
+  $(wildcard stanli/runtime/src/*.cpp)) \
   $(wildcard stanli/runtime/kernels/*.cpp)
 STANLI_OBJECTS = $(STANLI_SOURCES:.cpp=.o)
 
 ifneq ($(findstring clang,$(R_CC))$(findstring emcc,$(R_CC)),)
 STANLI_PCH = include/stanli_pch.hpp.pch
-STANLI_CXXFLAGS = $(PKG_CPPFLAGS_BASE) -include-pch include/stanli_pch.hpp.pch
+STANLI_CXXFLAGS = $(PKG_CPPFLAGS_BASE) -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden -include-pch include/stanli_pch.hpp.pch
 $(STANLI_PCH): include/stanli_pch.hpp
-	env $(CXX) $(CXX20FLAGS) $(PKG_CPPFLAGS_BASE) -fPIC -fpch-instantiate-templates -x c++-header $< -o $@
+	env $(CXX) $(CXX20FLAGS) $(PKG_CPPFLAGS_BASE) -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden -fPIC -fpch-instantiate-templates -x c++-header $< -o $@
 else
 STANLI_PCH = include/stanli_pch.hpp.gch
-STANLI_CXXFLAGS = $(PKG_CPPFLAGS_BASE) -include include/stanli_pch.hpp
+STANLI_CXXFLAGS = $(PKG_CPPFLAGS_BASE) -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden -include include/stanli_pch.hpp
 $(STANLI_PCH): include/stanli_pch.hpp
-	env $(CXX) $(CXX20FLAGS) $(PKG_CPPFLAGS_BASE) -fPIC -x c++-header $< -o $@
+	env $(CXX) $(CXX20FLAGS) $(PKG_CPPFLAGS_BASE) -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden -fPIC -x c++-header $< -o $@
 endif
 
 stanli/runtime/src/%.o: stanli/runtime/src/%.cpp $(STANLI_PCH)
@@ -60,17 +63,28 @@ stanli/runtime/kernels/%.o: stanli/runtime/kernels/%.cpp $(STANLI_PCH)
 	$(CXX) $(CXX20FLAGS) $(STANLI_CXXFLAGS) -fPIC -c $< -o $@
 
 STANLI_RUNNER_ARCHIVE = ../inst/lib/$(R_ARCH)/libstanr_runner.a
-PKG_LIBS += $(STANLI_RUNNER_ARCHIVE)
-RUNNER_OBJECTS = runner.o model_methods.o r_data_context.o stanli_model.o $(STANLI_OBJECTS)
+STANLI_PACKAGE_ARCHIVE = stanli/libstanr_stanli.a
+PKG_LIBS += $(STANLI_PACKAGE_ARCHIVE) $(STANLI_RUNNER_ARCHIVE)
+ifeq ($(shell uname -s),Linux)
+PKG_LIBS += -Wl,--exclude-libs,ALL
+endif
+RUNNER_OBJECTS = runner.o model_methods.o r_data_context.o
+STANLI_PACKAGE_OBJECTS = stanli_model.o $(STANLI_OBJECTS)
 OBJECTS = init.o xptr.o hash.o concurrency.o
 
-$(SHLIB): $(TBB_LIB_DIR)/$(firstword $(TBB_LIB_NAMES)) $(STANLI_RUNNER_ARCHIVE)
+$(SHLIB): $(TBB_LIB_DIR)/$(firstword $(TBB_LIB_NAMES)) $(STANLI_PACKAGE_ARCHIVE) $(STANLI_RUNNER_ARCHIVE)
+
+$(STANLI_PACKAGE_ARCHIVE): $(STANLI_PACKAGE_OBJECTS)
+	$(RM) $@
+	$(AR) -rs $@ $(STANLI_PACKAGE_OBJECTS)
+	@strip -S $@ || true
 
 $(STANLI_RUNNER_ARCHIVE): $(RUNNER_OBJECTS) $(SUNDIALS_OBJECTS)
 	@mkdir -p ../inst/lib/$(R_ARCH)
-	$(AR) -rs ../inst/lib/$(R_ARCH)/libstanr_runner.a $(SUNDIALS_OBJECTS) $(RUNNER_OBJECTS)
-	@strip -S ../inst/lib/$(R_ARCH)/libstanr_runner.a || true
+	$(RM) $@
+	$(AR) -rs $@ $(SUNDIALS_OBJECTS) $(RUNNER_OBJECTS)
+	@strip -S $@ || true
 
 clean:
 	rm -rf ../inst/lib ../inst/tbb-build;
-	rm -f stanr.so $(OBJECTS) $(RUNNER_OBJECTS) $(STANLI_OBJECTS) $(SUNDIALS_OBJECTS) include/stanli_pch.hpp.gch include/stanli_pch.hpp.pch
+	rm -f stanr.so $(OBJECTS) $(RUNNER_OBJECTS) $(STANLI_PACKAGE_OBJECTS) $(STANLI_PACKAGE_ARCHIVE) stanli/runtime/src/build_id.o $(SUNDIALS_OBJECTS) include/stanli_pch.hpp.gch include/stanli_pch.hpp.pch
