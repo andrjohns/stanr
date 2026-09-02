@@ -248,7 +248,7 @@ test_that("NA integer data errors for a multi-dim int array", {
       seed = 1,
       show_messages = FALSE
     ),
-    "Integer variable 'im' contains NA"
+    "stanli data cannot contain NA"
   )
 })
 
@@ -273,15 +273,23 @@ test_that("complex data is rejected", {
 test_that("numeric data.frame data is accepted as a matrix", {
   mod <- stan_model(
     code = "
-      data { matrix[2, 2] x; }
+      data { matrix[2, 2] m; }
+      transformed data { real check = m[2, 1]; }
       parameters { real theta; }
       model { theta ~ normal(0, 1); }
-      generated quantities { real total = sum(x); }
+      generated quantities {
+        real out = check;
+        real total = sum(m);
+      }
     ",
     backend = "stanli"
   )
+  frame <- data.frame(
+    first = c(1.5, 2.5),
+    second = c(3.5, 4.5)
+  )
   fit <- mod$sample(
-    data = list(x = data.frame(a = c(1, 2), b = c(3, 4))),
+    data = list(m = frame),
     chains = 1,
     iter_warmup = 5,
     iter_sampling = 1,
@@ -289,7 +297,27 @@ test_that("numeric data.frame data is accepted as a matrix", {
     show_messages = FALSE,
     fixed_param = TRUE
   )
-  expect_equal(fit$summary()$mean[fit$summary()$variable == "total"], 10)
+  s <- fit$summary()
+  expect_equal(s$mean[s$variable == "out"], frame[2, 1])
+  expect_equal(s$mean[s$variable == "total"], 10)
+})
+
+test_that("non-numeric data.frame columns are rejected", {
+  mod <- stan_model(
+    code = "data { real x; } parameters { real theta; } model { theta ~ normal(0, 1); }",
+    backend = "stanli"
+  )
+  expect_error(
+    mod$sample(
+      data = list(x = data.frame(value = c(1, 2), label = c("a", "b"))),
+      chains = 1,
+      iter_warmup = 5,
+      iter_sampling = 5,
+      seed = 1,
+      show_messages = FALSE
+    ),
+    "stanli data frames must contain only integer or numeric columns"
+  )
 })
 
 test_that("tuple-typed (list) data is rejected", {
@@ -306,11 +334,11 @@ test_that("tuple-typed (list) data is rejected", {
       seed = 1,
       show_messages = FALSE
     ),
-    "is not declared as a tuple"
+    "tuple-typed"
   )
 })
 
-test_that("higher-rank real and integer arrays are accepted", {
+test_that("four-dimensional real and integer arrays round-trip", {
   mod <- stan_model(
     code = "
       data {
@@ -330,7 +358,7 @@ test_that("higher-rank real and integer arrays are accepted", {
     ",
     backend = "stanli"
   )
-  a <- array(seq_len(16) + 0.5, dim = c(2, 2, 2, 2))
+  a <- array(seq(100, by = 1, length.out = 16), dim = c(2, 2, 2, 2))
   b <- array(seq_len(16), dim = c(2, 2, 2, 2))
   fit <- mod$sample(
     data = list(a = a, b = b),

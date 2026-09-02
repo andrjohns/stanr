@@ -26,33 +26,92 @@
 namespace stanr {
 namespace {
 
-// r_data_context handles list, type, dimension, and missing-value validation.
-// These are the two cases its var_context representation cannot reject for us.
-void check_stanli_value(const std::string& name, SEXP value) {
-  if (TYPEOF(value) == CPLXSXP)
-    throw std::runtime_error("stanli data does not support complex values yet");
-  if (TYPEOF(value) == VECSXP) {
-    for (R_xlen_t i = 0; i < XLENGTH(value); ++i)
-      check_stanli_value(name, VECTOR_ELT(value, i));
+// stanli restricts data to what DataMap::from_var_context() below can
+// actually represent: no tuples (the runtime still has no tuple lowering),
+// and no complex (from_var_context reads only vals_r()/vals_i(), so a
+// complex-only r_data_context entry would silently come through empty rather
+// than erroring). Numeric data.frames are normalized to matrices by
+// r_data_context and are supported here as long as all columns are real or
+// integer.
+void check_supported(const std::string& name, SEXP value) {
+  if (Rf_isNull(value))
+    throw std::runtime_error("stanli data value cannot be NULL: " + name);
+  if (Rf_inherits(value, "data.frame")) {
+    SEXP columns = value;
+    for (R_xlen_t i = 0; i < XLENGTH(columns); ++i) {
+      SEXP column = VECTOR_ELT(columns, i);
+      if (TYPEOF(column) == CPLXSXP)
+        throw std::runtime_error(
+            "stanli data does not support complex values yet: " + name);
+      if (TYPEOF(column) != INTSXP && TYPEOF(column) != REALSXP)
+        throw std::runtime_error(
+            "stanli data frames must contain only integer or numeric "
+            "columns: " +
+            name);
+    }
     return;
   }
-  if (TYPEOF(value) != REALSXP) return;
-  const R_xlen_t n = XLENGTH(value);
-  for (R_xlen_t i = 0; i < n; ++i) {
-    if (!std::isfinite(REAL_ELT(value, i)))
-      throw std::runtime_error(
-          "stanli data cannot contain NA, NaN, or Inf: " + name);
+  if (TYPEOF(value) == CPLXSXP)
+    throw std::runtime_error("stanli data does not support complex values yet");
+  if (TYPEOF(value) != INTSXP && TYPEOF(value) != LGLSXP &&
+      TYPEOF(value) != REALSXP) {
+    throw std::runtime_error(
+        "stanli data must be numeric, logical, or an array (tuple-typed "
+        "data is not yet supported): " + name);
   }
 }
 
+// stanli has no sink for r_data_context's NaN-only check (it silently treats
+// Inf as a valid real), so NA/NaN/Inf get their own stricter, stanli-flavored
+// pass here before that context ever sees the value. Data frames need to be
+// checked column by column because their outer SEXP is a VECSXP.
+void check_finite(const std::string& name, SEXP value) {
+  if (Rf_inherits(value, "data.frame")) {
+    for (R_xlen_t i = 0; i < XLENGTH(value); ++i) {
+      check_finite(name + "[[" + std::to_string(i + 1) + "]]",
+                   VECTOR_ELT(value, i));
+    }
+    return;
+  }
+  const R_xlen_t n = XLENGTH(value);
+  if (TYPEOF(value) == REALSXP) {
+    for (R_xlen_t i = 0; i < n; ++i) {
+      if (!std::isfinite(REAL_ELT(value, i)))
+        throw std::runtime_error(
+            "stanli data cannot contain NA, NaN, or Inf: " + name);
+    }
+    return;
+  }
+  for (R_xlen_t i = 0; i < n; ++i) {
+    const int x =
+        TYPEOF(value) == LGLSXP ? LOGICAL_ELT(value, i) : INTEGER_ELT(value, i);
+    if (x == NA_INTEGER)
+      throw std::runtime_error("stanli data cannot contain NA: " + name);
+  }
+}
+
+// SEXP -> stanli::DataMap. stanli-specific restrictions (no tuples, no
+// complex, no NA/NaN/Inf) are checked up front with stanli's own error
+// messages; once a list clears that, it is exactly what stanr::r_data_context
+// (the same var_context the compiled backend builds from R data) already
+// knows how to read, so DataMap::from_var_context() -- stanli's adapter for a
+// caller that already has a var_context, rather than JSON text -- does the
+// actual conversion.
 stanli::DataMap sexp_to_data_map(SEXP data) {
   if (Rf_isNull(data) || XLENGTH(data) == 0) return stanli::DataMap();
+  SEXP names = Rf_getAttrib(data, R_NamesSymbol);
+  if (TYPEOF(data) != VECSXP || Rf_isNull(names))
+    throw std::runtime_error("stanli data must be a named list");
+  for (R_xlen_t i = 0; i < XLENGTH(data); ++i) {
+    const char* name = CHAR(STRING_ELT(names, i));
+    if (name[0] == '\0')
+      throw std::runtime_error("stanli data list names must be non-empty");
+    SEXP value = VECTOR_ELT(data, i);
+    check_supported(name, value);
+    check_finite(name, value);
+  }
   cpp11::list data_list(data);
   stanr::r_data_context context(data_list);
-  const auto names = cpp11::as_cpp<std::vector<std::string>>(data_list.names());
-  for (R_xlen_t i = 0; i < XLENGTH(data); ++i) {
-    check_stanli_value(names[i], data_list[i]);
-  }
   return stanli::DataMap::from_var_context(context);
 }
 
