@@ -339,10 +339,7 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
       Eigen::Matrix<stan::math::var, -1, 1>& q) const {
     auto lease = pool_->acquire();
     check_size(q.size());
-    // The workspace is independent of a model/executor and is safe to reuse
-    // after precomputed_gradients() has copied it onto the autodiff arena.
-    static thread_local std::vector<double> gradient;
-    gradient.resize(static_cast<size_t>(q.size()));
+    std::vector<double> gradient(static_cast<size_t>(q.size()));
     for (Eigen::Index i = 0; i < q.size(); ++i)
       lease->params_data()[i] = q(i).val();
     double value;
