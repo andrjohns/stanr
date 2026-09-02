@@ -71,6 +71,7 @@ class DataMap {
       throw std::runtime_error("data: variable not provided: " + name);
     return it->second;
   }
+  const std::map<std::string, Entry>& entries() const { return m_; }
 
   // Each factory lives in its own translation unit -- data.cpp for the JSON
   // pair, data_var_context.cpp for this one -- so a build can drop either.

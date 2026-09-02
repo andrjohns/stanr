@@ -21,7 +21,9 @@
 #define STANLI_MIR_INTERP_HPP
 
 #include <stanli/compile.hpp>
+#include <stanli/container_shape.hpp>
 #include <stanli/data.hpp>
+#include <stanli/extrema_grouping.hpp>
 #include <stanli/message_sink.hpp>
 #include <stanli/mir.hpp>
 #include <stanli/optable.hpp>  // STANLI_SCALAR_UNARY_LIST
@@ -150,6 +152,29 @@ class MirInterp {
       for (const auto& s : f.body) sub.exec(s);
     } catch (ReturnV& r) {
       return std::move(r.v.r);
+    }
+    fail("function returned no value: " + f.name);
+  }
+
+  // Bind already-typed values positionally and preserve the complete return
+  // value, including integer identity and logical dimensions.  Function's
+  // public C++ entry point uses this path: DataMap::Entry is Value itself for
+  // the double instantiation, so no host/container conversion is needed.
+  Value call(const mir::FunDef& f, const std::vector<Value>& args) {
+    if (udf_depth_ > 64) fail("UDF recursion too deep");
+    if (f.arg_names.size() != args.size())
+      fail("function argument count mismatch: " + f.name);
+    MirInterp sub(funs_, where_, hooks_);
+    sub.udf_depth_ = udf_depth_ + 1;
+    sub.propto_ctx_ = propto_ctx_;
+    for (size_t k = 0; k < args.size(); ++k) {
+      sub.env_[f.arg_names[k]] = args[k];
+      sub.set_declared_dims(f.arg_names[k], args[k].dims);
+    }
+    try {
+      for (const auto& s : f.body) sub.exec(s);
+    } catch (ReturnV& r) {
+      return std::move(r.v);
     }
     fail("function returned no value: " + f.name);
   }
@@ -297,7 +322,21 @@ class MirInterp {
           return;
         }
         if (st.lhs_idx.empty()) {
-          env_[st.lhs] = eval(st.rhs);
+          Value v = eval(st.rhs);
+          // A plain `int` name stays int for its whole lifetime; the RHS's
+          // own arithmetic (e.g. `sumnt2 += nts[i] * nts[i]`) does not, since
+          // MirInterp's binary ops answer in real registers. Re-declaring an
+          // int with an int-valued init already coerces (above); a later
+          // whole-variable reassignment needs the same coercion, or the next
+          // eval_int on this name (a parameter or array size, say) sees a
+          // real entry and fails as unknown.
+          const Value* existing = find(st.lhs);
+          if (existing && existing->is_int && !v.is_int) {
+            v.is_int = true;
+            v.i.clear();
+            for (const T& x : v.r) v.i.push_back((int)val(x));
+          }
+          env_[st.lhs] = std::move(v);
           return;
         }
         Value* en = find(st.lhs);
@@ -332,16 +371,23 @@ class MirInterp {
         }
         // Fix one or more leading dimensions of an N-D array and replace
         // the complete remaining container. For array[3] matrix[2,4] x,
-        // x[i,j] is a row_vector[4]. First-index-fast storage makes those
-        // trailing values a strided sequence at offset + prefix_stride*k.
-        if (en->dims.size() > 2 && !st.lhs_idx.empty() &&
-            st.lhs_idx.size() < en->dims.size()) {
-          bool all_single = true;
-          for (const auto& index : st.lhs_idx)
-            if (index.name != "IndexSingle") all_single = false;
-          if (all_single) {
+        // x[i,j] is a row_vector[4] (implicit rest); x[i, :, :] spells the
+        // same write with an explicit `:` for every remaining dimension.
+        // First-index-fast storage makes those trailing values a strided
+        // sequence at offset + prefix_stride*k.
+        if (en->dims.size() > 2 && !st.lhs_idx.empty()) {
+          size_t prefix_len = 0;
+          while (prefix_len < st.lhs_idx.size() &&
+                 st.lhs_idx[prefix_len].name == "IndexSingle")
+            ++prefix_len;
+          bool trailing_all = true;
+          for (size_t d = prefix_len; d < st.lhs_idx.size(); ++d)
+            if (st.lhs_idx[d].name != "IndexAll") trailing_all = false;
+          if (prefix_len > 0 && trailing_all && prefix_len < en->dims.size() &&
+              (st.lhs_idx.size() == prefix_len ||
+               st.lhs_idx.size() == en->dims.size())) {
             int64_t offset = 0, prefix_stride = 1;
-            for (size_t d = 0; d < st.lhs_idx.size(); ++d) {
+            for (size_t d = 0; d < prefix_len; ++d) {
               const long i = as_int(st.lhs_idx[d].args[0]);
               if (i < 1 || i > en->dims[d])
                 fail("indexed assignment index out of bounds", st.raw);
@@ -349,7 +395,7 @@ class MirInterp {
               prefix_stride *= en->dims[d];
             }
             int64_t rest = 1;
-            for (size_t d = st.lhs_idx.size(); d < en->dims.size(); ++d)
+            for (size_t d = prefix_len; d < en->dims.size(); ++d)
               rest *= en->dims[d];
             if (static_cast<int64_t>(v.r.size()) != rest)
               fail("indexed assignment size mismatch", st.raw);
@@ -950,6 +996,78 @@ class MirInterp {
     return from_entry(*dp);
   }
 
+  // reduce_sum(f, sliced, grainsize, shared...) sums f over the terms of a
+  // partition of `sliced`, and its contract is that the partition is
+  // unobservable. Stan Math without STAN_THREADS takes that freedom to its
+  // limit and makes exactly one call over the whole slice, returning zero
+  // for an empty one (prim/functor/reduce_sum.hpp); stanli has no threading,
+  // so both engines make that same single call. lower.cpp's
+  // lower_reduce_sum is the graph-side half of this and carries the full
+  // account.
+  Value call_reduce_sum(const mir::Expr& e) {
+    if (e.args.size() < 3)
+      fail(
+          "reduce_sum: expected a partial-sum function, a sliced argument, "
+          "and a grainsize",
+          e.raw);
+    if (e.args[0].kind != mir::Expr::Var)
+      fail("reduce_sum: the partial-sum argument is not a function name",
+           e.raw);
+    Value slice = eval(e.args[1]);
+    const long grainsize = as_int(e.args[2]);
+    std::vector<Value> shared;
+    shared.reserve(e.args.size() - 3);
+    for (size_t i = 3; i < e.args.size(); ++i)
+      shared.push_back(eval(e.args[i]));
+    // Even an empty slice evaluates every actual argument. Validation is
+    // inside the Stan Math call, after those evaluations and their effects.
+    stan::math::check_positive("reduce_sum", "grainsize", grainsize);
+    const int64_t n =
+        slice.dims.empty() ? (int64_t)slice.r.size() : slice.dims.front();
+    Value sum;
+    sum.r = {0.0};
+    if (n == 0) return sum;
+
+    bool propto = false;
+    const std::string base =
+        mir::reduce_sum_partial_name(e.args[0].name, &propto);
+    const std::vector<mir::UnsizedView> views =
+        mir::reduce_sum_partial_views(e);
+    const mir::FunDef* f = mir::resolve_reduce_sum_partial(funs_, base, views);
+    if (f == nullptr)
+      fail("reduce_sum: unknown partial-sum function " + base, e.raw);
+    if (f->arg_names.size() != views.size())
+      fail("reduce_sum: " + base + " arity does not match the call", e.raw);
+    if (udf_depth_ > 64) fail("UDF recursion too deep");
+
+    MirInterp sub(funs_, where_, hooks_);
+    sub.udf_depth_ = udf_depth_ + 1;
+    // As in CmdStan, an `_lupdf` functor inherits the caller's normalization
+    // and an `_lpdf` one forces the normalized density.
+    sub.propto_ctx_ = propto_ctx_ && propto;
+    sub.env_[f->arg_names[0]] = std::move(slice);
+    Value start;
+    start.is_int = true;
+    start.i = {1};
+    start.r = {1.0};
+    if (n > std::numeric_limits<int32_t>::max())
+      fail("reduce_sum: slice bound exceeds the Stan integer range", e.raw);
+    Value end;
+    end.is_int = true;
+    end.i = {static_cast<int>(n)};
+    end.r = {(double)n};
+    sub.env_[f->arg_names[1]] = std::move(start);
+    sub.env_[f->arg_names[2]] = std::move(end);
+    for (size_t i = 3; i < e.args.size(); ++i)
+      sub.env_[f->arg_names[i]] = std::move(shared[i - 3]);
+    try {
+      for (const auto& st : f->body) sub.exec(st);
+    } catch (ReturnV& r) {
+      return std::move(r.v);
+    }
+    fail("reduce_sum: " + base + " returned no value", e.raw);
+  }
+
   Value call_udf(const mir::Expr& e) {
     auto it = funs_.find(e.name);
     if (it == funs_.end()) fail("unknown function " + e.name, e.raw);
@@ -1240,6 +1358,7 @@ class MirInterp {
   Value eval_fun(const mir::Expr& e) {
     Value r;
     if (e.fn_lib == mir::Expr::Lib::UserDefined) return call_udf(e);
+    if (mir::is_reduce_sum(e)) return call_reduce_sum(e);
     const auto is_scalar = [](const Value& v) {
       return v.dims.empty() && v.r.size() == 1;
     };
@@ -1981,6 +2100,22 @@ class MirInterp {
         r.r.push_back(m.r.at((size_t)((j - 1) * R + (i - 1) + k)));
       return r;
     }
+    if (e.name == "block" && e.args.size() == 5) {
+      Value m = eval(e.args[0]);
+      if (m.dims.size() != 2) fail("block: needs a matrix", e.raw);
+      const long i = as_int(e.args[1]), j = as_int(e.args[2]),
+                 nr = as_int(e.args[3]), nc = as_int(e.args[4]);
+      const int64_t R = m.dims[0];
+      check_block_shape(R, m.dims[1], i, j, nr, nc);
+      r.dims = {nr, nc};
+      r.r.reserve((size_t)(nr * nc));
+      // Source and result are both column-major, so filling the result in
+      // storage order walks one source column at a time, R apart.
+      for (long c = 0; c < nc; ++c)
+        for (long k = 0; k < nr; ++k)
+          r.r.push_back(m.r.at((size_t)((j - 1 + c) * R + (i - 1 + k))));
+      return r;
+    }
     if (e.name == "col" && e.args.size() == 2) {
       Value m = eval(e.args[0]);
       if (m.dims.size() != 2) fail("col: needs a matrix", e.raw);
@@ -2021,6 +2156,33 @@ class MirInterp {
         r.r.push_back(a.r.at((size_t)(off + k)));
         if (a.is_int) r.i.push_back(a.i.at((size_t)(off + k)));
       }
+      return r;
+    }
+    if (e.name == "reverse" && e.args.size() == 1) {
+      Value a = eval(e.args[0]);
+      r = a;
+      const auto reverse_outer = [&](auto* values) {
+        // Vectors and row-vectors have one logical axis and one flat buffer.
+        // Arrays use DataMap's first-index-fast storage, so reversing an
+        // array means reversing dimension zero once for every suffix lane,
+        // not reversing the complete buffer (which would also reverse each
+        // container-valued element).
+        if (e.args[0].unsized.depth == 0) {
+          std::reverse(values->begin(), values->end());
+          return;
+        }
+        if (a.dims.empty()) fail("reverse: array has no dimensions", e.raw);
+        const int64_t outer = a.dims.front();
+        if (outer < 0 || (outer != 0 && values->size() % (size_t)outer != 0))
+          fail("reverse: array shape does not match storage", e.raw);
+        if (outer == 0) return;
+        for (size_t offset = 0; offset < values->size();
+             offset += (size_t)outer)
+          std::reverse(values->begin() + offset,
+                       values->begin() + offset + outer);
+      };
+      reverse_outer(&r.r);
+      if (r.is_int) reverse_outer(&r.i);
       return r;
     }
     // squared_distance is dot_self of the difference, which is how the
@@ -2064,25 +2226,33 @@ class MirInterp {
         }
       return r;
     }
-    if (e.name == "crossprod" && e.args.size() == 1) {
+    if ((e.name == "crossprod" ||
+         e.name == "multiply_lower_tri_self_transpose") &&
+        e.args.size() == 1) {
       using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
       Value a = eval(e.args[0]);
-      if (a.dims.size() != 2) fail("crossprod: needs a matrix", e.raw);
+      if (a.dims.size() != 2) fail(e.name + ": needs a matrix", e.raw);
       const int64_t rows = a.dims[0], cols = a.dims[1];
       if (rows < 0 || cols < 0 ||
           (rows != 0 && cols > std::numeric_limits<int64_t>::max() / rows) ||
           rows * cols != static_cast<int64_t>(a.r.size()))
-        fail("crossprod: matrix shape does not match storage", e.raw);
+        fail(e.name + ": matrix shape does not match storage", e.raw);
       Mat matrix(rows, cols);
       for (int64_t j = 0; j < cols; ++j)
         for (int64_t i = 0; i < rows; ++i)
           matrix(i, j) = a.r[(size_t)(j * rows + i)];
-      const Mat product = stan::math::crossprod(matrix);
-      r.dims = {cols, cols};
-      r.r.resize((size_t)(cols * cols));
-      for (int64_t j = 0; j < cols; ++j)
-        for (int64_t i = 0; i < cols; ++i)
-          r.r[(size_t)(j * cols + i)] = product(i, j);
+      // crossprod is A' A (cols x cols); multiply_lower_tri_self_transpose
+      // takes the lower triangle of A and forms L L' (rows x rows).
+      const Mat product =
+          e.name == "crossprod"
+              ? Mat(stan::math::crossprod(matrix))
+              : Mat(stan::math::multiply_lower_tri_self_transpose(matrix));
+      const int64_t out = e.name == "crossprod" ? cols : rows;
+      r.dims = {out, out};
+      r.r.resize((size_t)(out * out));
+      for (int64_t j = 0; j < out; ++j)
+        for (int64_t i = 0; i < out; ++i)
+          r.r[(size_t)(j * out + i)] = product(i, j);
       return r;
     }
     if (e.name == "diag_matrix" && e.args.size() == 1) {
@@ -2146,18 +2316,30 @@ class MirInterp {
           e.args[0].unsized.depth == 0 &&
           (e.args[0].unsized.leaf == mir::UnsizedLeaf::Vector ||
            e.args[0].unsized.leaf == mir::UnsizedLeaf::RowVector);
-      const mir::ProdGrouping grouping = udf_depth_ == 0
-                                             ? mir::prod_grouping(e.args[0])
-                                             : mir::ProdGrouping::Legacy;
-      if (!eigen_container || grouping == mir::ProdGrouping::Legacy) {
+      const ExpressionLayout layout =
+          udf_depth_ == 0 ? mir::source_expression_layout(e.args[0])
+                          : ExpressionLayout::unknown();
+      if (!eigen_container || !layout.known()) {
         T product = T(1.0);
         for (const T& value : a.r) product *= value;
         r.r = {product};
         return r;
       }
-      if (grouping == mir::ProdGrouping::Scalar) {
+      if (layout.kind == ExpressionLayout::Kind::Scalar) {
         T product = a.r[0];
         for (size_t i = 1; i < a.r.size(); ++i) product *= a.r[i];
+        r.r = {product};
+        return r;
+      }
+      if (layout.kind == ExpressionLayout::Kind::Direct &&
+          layout.element_offset != 0) {
+        if constexpr (std::is_same_v<T, double>) {
+          r.r = {prod_phased(a.r.data(), static_cast<int64_t>(a.r.size()),
+                             layout.element_offset)};
+          return r;
+        }
+        T product = T(1.0);
+        for (const T& value : a.r) product *= value;
         r.r = {product};
         return r;
       }
@@ -2256,6 +2438,69 @@ class MirInterp {
       r.dims = {n};
       return r;
     }
+    // The zeros_*/ones_* constructors are rep_vector with a fixed fill.
+    // Only zeros_int_array carries integer provenance; ones_array is real.
+    if ((e.name == "zeros_vector" || e.name == "zeros_row_vector" ||
+         e.name == "ones_vector" || e.name == "ones_row_vector" ||
+         e.name == "zeros_int_array" || e.name == "ones_array") &&
+        e.args.size() == 1) {
+      const long n = as_int(e.args[0]);
+      const bool is_ones = e.name.rfind("ones", 0) == 0;
+      (void)checked_container_size({n}, e.name);
+      r.r.assign(n, T(is_ones ? 1.0 : 0.0));
+      r.dims = {n};
+      if (e.name == "zeros_int_array") {
+        r.is_int = true;
+        r.i.assign(n, is_ones ? 1 : 0);
+      }
+      return r;
+    }
+    if (e.name == "identity_matrix" && e.args.size() == 1) {
+      const long n = as_int(e.args[0]);
+      r.r.assign((size_t)checked_container_size({n, n}, e.name), T(0.0));
+      for (long k = 0; k < n; ++k) r.r[(size_t)(k * n + k)] = T(1.0);
+      r.dims = {n, n};
+      return r;
+    }
+    // The linspaced_* family is data-only -- stanc's signatures reject
+    // AutoDiffable bounds -- so every use is a constant the interpreter can
+    // fold, and no graph opcode is needed. Delegate to stan-math instead of
+    // open-coding the spacing: the integer overload inherits Eigen's rule
+    // that `high` is lowered until the range divides evenly, which is easy
+    // to reproduce subtly wrong, and each overload names itself in the
+    // domain errors CmdStan reports for a negative size or high < low.
+    if (e.name == "linspaced_int_array" && e.args.size() == 3) {
+      const std::vector<int> values = stan::math::linspaced_int_array(
+          (int)as_int(e.args[0]), (int)as_int(e.args[1]),
+          (int)as_int(e.args[2]));
+      r.is_int = true;
+      r.dims = {(int64_t)values.size()};
+      r.i.assign(values.begin(), values.end());
+      r.r.reserve(values.size());
+      for (const int x : values) r.r.push_back(T((double)x));
+      return r;
+    }
+    if ((e.name == "linspaced_array" || e.name == "linspaced_vector" ||
+         e.name == "linspaced_row_vector") &&
+        e.args.size() == 3) {
+      const int n = (int)as_int(e.args[0]);
+      const double lo = val(eval(e.args[1]).r.at(0));
+      const double hi = val(eval(e.args[2]).r.at(0));
+      const auto emit = [&](const auto& values) {
+        const int64_t len = (int64_t)values.size();
+        r.dims = {len};
+        r.r.reserve((size_t)len);
+        for (int64_t k = 0; k < len; ++k) r.r.push_back(T(values[k]));
+      };
+      if (e.name == "linspaced_array") {
+        emit(stan::math::linspaced_array(n, lo, hi));
+      } else if (e.name == "linspaced_vector") {
+        emit(Eigen::VectorXd(stan::math::linspaced_vector(n, lo, hi)));
+      } else {
+        emit(Eigen::RowVectorXd(stan::math::linspaced_row_vector(n, lo, hi)));
+      }
+      return r;
+    }
     if (e.name == "Equals__")
       return cmp([](double x, double y) { return x == y; });
     if (e.name == "NEquals__")
@@ -2268,29 +2513,98 @@ class MirInterp {
       return cmp([](double x, double y) { return x < y; });
     if (e.name == "Leq__")
       return cmp([](double x, double y) { return x <= y; });
-    if (e.name == "PNot__")
+    if (e.name == "PNot__" || e.name == "logical_negation")
       return un([](const T& x) { return T(val(x) == 0.0 ? 1.0 : 0.0); });
-    if (e.name == "is_nan") {
+    if (e.name == "is_nan" || e.name == "is_inf") {
       Value a = eval(e.args[0]);
-      if (a.r.size() != 1) fail("is_nan: needs a scalar", e.raw);
-      const int answer = std::isnan(val(a.r[0])) ? 1 : 0;
+      if (a.r.size() != 1) fail(e.name + ": needs a scalar", e.raw);
+      const double value = val(a.r[0]);
+      const int answer =
+          e.name == "is_nan" ? std::isnan(value) : std::isinf(value);
       r.is_int = true;
       r.i = {answer};
       r.r = {T((double)answer)};
       return r;
     }
     if (e.name == "max" || e.name == "min") {
-      const bool owning_vector_context =
+      const bool owning_container_context =
           where_ == "write_array" || where_ == "prepare_data";
-      const mir::ExtremaKind native_kind =
-          owning_vector_context && udf_depth_ == 0 ? mir::extrema_kind(e)
-                                                   : mir::ExtremaKind::Legacy;
-      if (native_kind != mir::ExtremaKind::Legacy) {
+      const mir::ExtremaCall native =
+          owning_container_context && udf_depth_ == 0 ? mir::extrema_call(e)
+                                                      : mir::ExtremaCall{};
+      const bool real_container =
+          native.surface == mir::ExtremaSurface::RealVector ||
+          native.surface == mir::ExtremaSurface::RealMatrix ||
+          native.surface == mir::ExtremaSurface::RealArray;
+      if (native.kind != mir::ExtremaKind::Legacy && real_container) {
+        // A bare matrix transpose is deliberately refused by graph lowering:
+        // Eigen's transpose evaluator has a packet order that cannot be
+        // reconstructed from a materialized col-major transpose. Preserve
+        // that evaluator here as the fallback contract, including its
+        // platform-dependent NaN and signed-zero selection.
+        const mir::Expr& operand = e.args[0];
+        const bool bare_matrix_transpose =
+            (operand.name == "Transpose__" || operand.name == "transpose") &&
+            operand.args.size() == 1 &&
+            operand.args[0].kind == mir::Expr::Var &&
+            operand.args[0].unsized.depth == 0 &&
+            operand.args[0].unsized.leaf == mir::UnsizedLeaf::Matrix;
+        if (bare_matrix_transpose) {
+          Value source = eval(operand.args[0]);
+          if (source.dims.size() != 2 || source.dims[0] < 0 ||
+              source.dims[1] < 0 ||
+              (source.dims[0] != 0 &&
+               source.dims[1] >
+                   std::numeric_limits<int64_t>::max() / source.dims[0]) ||
+              source.dims[0] * source.dims[1] !=
+                  static_cast<int64_t>(source.r.size()))
+            fail("min/max matrix transpose has invalid dimensions", e.raw);
+          if (source.r.empty()) {
+            r.r = {native.kind == mir::ExtremaKind::Min
+                       ? T(std::numeric_limits<double>::infinity())
+                       : T(-std::numeric_limits<double>::infinity())};
+            return r;
+          }
+          using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+          const Eigen::Map<const Mat> matrix(source.r.data(), source.dims[0],
+                                             source.dims[1]);
+          r.r = {native.kind == mir::ExtremaKind::Min
+                     ? stan::math::min(matrix.transpose())
+                     : stan::math::max(matrix.transpose())};
+          return r;
+        }
         Value a = eval(e.args[0]);
         if (a.r.empty()) {
-          r.r = {native_kind == mir::ExtremaKind::Min
+          r.r = {native.kind == mir::ExtremaKind::Min
                      ? T(std::numeric_limits<double>::infinity())
                      : T(-std::numeric_limits<double>::infinity())};
+          return r;
+        }
+        const ExpressionLayout layout =
+            mir::source_expression_layout(e.args[0]);
+        if (layout.kind == ExpressionLayout::Kind::Direct &&
+            layout.element_offset != 0) {
+          if constexpr (std::is_same_v<T, double>) {
+            r.r = {T(extrema_phased(
+                a.r.data(), static_cast<int64_t>(a.r.size()),
+                layout.element_offset, native.kind == mir::ExtremaKind::Max))};
+            return r;
+          }
+        }
+        if (!layout.packet_access()) {
+          // Indexed views have no packet traversal.  Keep the same strict
+          // comparison and ascending coefficient order as Eigen's default
+          // redux path; this also covers matrix rows and gathers.
+          const auto vmax = [](const T& x, const T& y) {
+            return val(x) < val(y) ? y : x;
+          };
+          const auto vmin = [](const T& x, const T& y) {
+            return val(y) < val(x) ? y : x;
+          };
+          T m = a.r.at(0);
+          for (const T& x : a.r)
+            m = native.kind == mir::ExtremaKind::Max ? vmax(m, x) : vmin(m, x);
+          r.r = {m};
           return r;
         }
         // The std::vector backing an interpreted value has no aligned-owning
@@ -2301,7 +2615,7 @@ class MirInterp {
         const Eigen::Map<const Vec> input(a.r.data(), a.r.size());
         const auto owning_grouping =
             input.unaryExpr(Eigen::internal::core_cast_op<T, T>());
-        r.r = {native_kind == mir::ExtremaKind::Min
+        r.r = {native.kind == mir::ExtremaKind::Min
                    ? stan::math::min(owning_grouping)
                    : stan::math::max(owning_grouping)};
         return r;
@@ -2412,7 +2726,7 @@ class MirInterp {
       }
       return o;
     }
-    if (e.name == "Transpose__") {
+    if (e.name == "Transpose__" || e.name == "transpose") {
       Value a = eval(e.args[0]);
       if (a.dims.size() < 2) return a;  // vector transpose: same storage
       Value o;
@@ -2428,6 +2742,35 @@ class MirInterp {
       Value a = eval(e.args[0]);
       a.dims = {(int64_t)a.r.size()};
       a.is_int = false;
+      return a;
+    }
+    if (e.name == "to_matrix" && (e.args.size() == 1 || e.args.size() == 3)) {
+      Value a = eval(e.args[0]);
+      a.is_int = false;
+      a.i.clear();
+      // First-index-fast array storage is already column-major over the
+      // resulting matrix axes. Unlike the graph's outer-major arrays, this
+      // interpreter must not transpose it. Stan Math infers zero columns
+      // when the outer array is empty, regardless of its declared suffix.
+      const bool from_2d_array =
+          e.args.size() == 1 && a.dims.size() == 2 && e.args[0].unsized.depth;
+      if (from_2d_array) {
+        if (a.dims[0] == 0) a.dims[1] = 0;
+        return a;
+      }
+      if (e.args.size() == 3) {
+        const int64_t rows = as_int(e.args[1]), cols = as_int(e.args[2]);
+        if (checked_container_size({rows, cols}, e.name) != (int64_t)a.r.size())
+          fail("to_matrix: requested shape does not match source length",
+               e.raw);
+        a.dims = {rows, cols};
+      } else if (a.dims.size() == 2) {
+        // to_matrix(matrix) is the identity.
+      } else if (e.args[0].unsized.leaf == mir::UnsizedLeaf::RowVector) {
+        a.dims = {1, (int64_t)a.r.size()};
+      } else {
+        a.dims = {(int64_t)a.r.size(), 1};
+      }
       return a;
     }
     if (e.name == "to_array_1d") {
@@ -2504,6 +2847,10 @@ class MirInterp {
     }
     if (e.name == "positive_infinity") {
       r.r = {T(std::numeric_limits<double>::infinity())};
+      return r;
+    }
+    if (e.name == "not_a_number") {
+      r.r = {T(std::numeric_limits<double>::quiet_NaN())};
       return r;
     }
     if (e.name == "student_t_lccdf" && e.args.size() == 4) {
@@ -2600,7 +2947,12 @@ class MirInterp {
     // factor. Interpreter storage is first-index-fast: the N array elements
     // are the fast axis and each observation must therefore be gathered with
     // stride N before it is handed to Stan Math.
-    if (e.name == "multi_normal_cholesky_lpdf" && e.args.size() == 3) {
+    if ((e.name == "multi_normal_cholesky_lpdf" ||
+         e.name == "multi_normal_lpdf") &&
+        e.args.size() == 3) {
+      // multi_normal takes a covariance matrix where the cholesky form
+      // takes its factor; both are width x width and enter the same way.
+      const bool cholesky = e.name == "multi_normal_cholesky_lpdf";
       Value y = eval(e.args[0]), mu_value = eval(e.args[1]),
             factor = eval(e.args[2]);
       const auto vector_shape = [&](const mir::Expr& expression,
@@ -2637,16 +2989,17 @@ class MirInterp {
         fail(e.name + ": random variable and location sizes differ", e.raw);
       if (observations != locations && observations != 1 && locations != 1)
         fail(e.name + ": vectorized argument sizes differ", e.raw);
+      const char* mrole = cholesky ? "Cholesky factor" : "covariance matrix";
       if (e.args[2].unsized.depth != 0 ||
           e.args[2].unsized.leaf != mir::UnsizedLeaf::Matrix ||
           factor.dims.size() != 2)
-        fail(e.name + ": Cholesky factor is not a matrix", e.raw);
+        fail(e.name + ": " + mrole + " is not a matrix", e.raw);
       if (width != 0 && width > std::numeric_limits<int64_t>::max() / width)
-        fail(e.name + ": Cholesky factor extent overflows", e.raw);
+        fail(e.name + ": " + mrole + " extent overflows", e.raw);
       const int64_t factor_size = width * width;
       if (factor.dims[0] != width || factor.dims[1] != width ||
           (int64_t)factor.r.size() != factor_size)
-        fail(e.name + ": Cholesky factor has the wrong shape", e.raw);
+        fail(e.name + ": " + mrole + " has the wrong shape", e.raw);
 
       using Vec = Eigen::Matrix<T, Eigen::Dynamic, 1>;
       using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
@@ -2660,16 +3013,19 @@ class MirInterp {
         for (int64_t i = 0; i < width; ++i)
           mus[(size_t)k]((Eigen::Index)i) =
               mu_value.r.at((size_t)(i * locations + k));
-      Mat L((Eigen::Index)width, (Eigen::Index)width);
+      Mat M((Eigen::Index)width, (Eigen::Index)width);
       for (int64_t j = 0; j < width; ++j)
         for (int64_t i = 0; i < width; ++i)
-          L((Eigen::Index)i, (Eigen::Index)j) =
+          M((Eigen::Index)i, (Eigen::Index)j) =
               factor.r[(size_t)(j * width + i)];
       const bool propto = e.fn_propto && propto_ctx_;
       const auto density = [&](const auto& yy, const auto& mm) -> T {
-        return propto
-                   ? stan::math::multi_normal_cholesky_lpdf<true>(yy, mm, L)
-                   : stan::math::multi_normal_cholesky_lpdf<false>(yy, mm, L);
+        if (cholesky)
+          return propto
+                     ? stan::math::multi_normal_cholesky_lpdf<true>(yy, mm, M)
+                     : stan::math::multi_normal_cholesky_lpdf<false>(yy, mm, M);
+        return propto ? stan::math::multi_normal_lpdf<true>(yy, mm, M)
+                      : stan::math::multi_normal_lpdf<false>(yy, mm, M);
       };
       if (observations == 1 && locations == 1)
         r.r = {density(ys[0], mus[0])};
@@ -2693,7 +3049,8 @@ class MirInterp {
         e.name == "binomial_lpmf" || e.name == "poisson_lpmf" ||
         e.name == "poisson_log_lpmf" || e.name == "bernoulli_logit_lpmf" ||
         e.name == "binomial_logit_lpmf" || e.name == "hypergeometric_lpmf" ||
-        e.name == "discrete_range_lpmf") {
+        e.name == "discrete_range_lpmf" || e.name == "neg_binomial_2_lpmf" ||
+        e.name == "neg_binomial_2_log_lpmf") {
       if (shared_id >= 0 &&
           e.args.size() != (size_t)program_density_arity(shared_id))
         fail(e.name + " takes " +
@@ -2743,6 +3100,11 @@ class MirInterp {
                                                  ic(3, i));
         else if (e.name == "discrete_range_lpmf")
           acc += stan::math::discrete_range_lpmf(ic(0, i), ic(1, i), ic(2, i));
+        else if (e.name == "neg_binomial_2_lpmf")
+          acc += stan::math::neg_binomial_2_lpmf(ic(0, i), sc(1, i), sc(2, i));
+        else if (e.name == "neg_binomial_2_log_lpmf")
+          acc +=
+              stan::math::neg_binomial_2_log_lpmf(ic(0, i), sc(1, i), sc(2, i));
         else if (e.name == "student_t_lpdf")
           acc += stan::math::student_t_lpdf(sc(0, i), sc(1, i), sc(2, i),
                                             sc(3, i));
@@ -2752,13 +3114,27 @@ class MirInterp {
       r.r = {acc};
       return r;
     }
-    if (e.name == "rep_array" && e.args.size() == 2) {
+    if (e.name == "rep_array" && e.args.size() >= 2 && e.args.size() <= 4) {
       Value v = eval(e.args[0]);
-      const long n = as_int(e.args[1]);
+      for (size_t k = 1; k < e.args.size(); ++k)
+        r.dims.push_back(as_int(e.args[k]));
+      // The element keeps its own shape; rep_array only prepends the new
+      // outer dimension(s). Interpreter storage is first-index-fast, so the
+      // prepended axes vary fastest: element cell k lands at stride `copies`
+      // across the result, not as a contiguous block.
+      const int64_t copies = checked_container_size(r.dims, e.name);
       r.is_int = v.is_int;
-      r.dims = {n};
-      r.r.assign(n, v.r.at(0));
-      if (v.is_int) r.i.assign(n, v.i.at(0));
+      for (const int64_t d : v.dims) r.dims.push_back(d);
+      const size_t width = std::max(v.r.size(), v.i.size());
+      const int64_t size =
+          checked_container_size({copies, (int64_t)width}, e.name);
+      r.r.assign((size_t)size, T(0.0));
+      if (v.is_int) r.i.assign((size_t)size, 0);
+      for (size_t k = 0; k < width; ++k)
+        for (long c = 0; c < copies; ++c) {
+          r.r[k * (size_t)copies + (size_t)c] = v.r.at(k);
+          if (v.is_int) r.i[k * (size_t)copies + (size_t)c] = v.i.at(k);
+        }
       return r;
     }
     if (e.name == "csr_extract_w" && e.args.size() == 1) {
@@ -2771,6 +3147,27 @@ class MirInterp {
       const auto weights = stan::math::csr_extract_w(matrix);
       r.r.assign(weights.data(), weights.data() + weights.size());
       r.dims = {(int64_t)r.r.size()};
+      return r;
+    }
+    // csr_extract_v (column indices) and csr_extract_u (row-start offsets)
+    // are the integer companions to csr_extract_w. stan-math needs a
+    // concrete (double) sparse view, so evaluate the value_of matrix.
+    if ((e.name == "csr_extract_v" || e.name == "csr_extract_u") &&
+        e.args.size() == 1) {
+      Value a = eval(e.args[0]);
+      if (a.dims.size() != 2)
+        fail(e.name + ": argument must be a matrix", e.raw);
+      Eigen::MatrixXd matrix(a.dims[0], a.dims[1]);
+      for (int64_t k = 0; k < (int64_t)a.r.size(); ++k)
+        matrix.data()[k] = val(a.r[(size_t)k]);
+      const std::vector<int> idx = e.name == "csr_extract_v"
+                                       ? stan::math::csr_extract_v(matrix)
+                                       : stan::math::csr_extract_u(matrix);
+      r.is_int = true;
+      r.dims = {(int64_t)idx.size()};
+      r.i.assign(idx.begin(), idx.end());
+      r.r.reserve(idx.size());
+      for (const int x : idx) r.r.push_back(T((double)x));
       return r;
     }
     if (e.name == "append_array" && e.args.size() == 2) {

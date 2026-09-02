@@ -23,6 +23,7 @@
 // to end, which makes that reachable rather than theoretical. Such slots are
 // refused, and the refusal cascades to everything downstream of them.
 #include <stanli/constfold.hpp>
+#include <stanli/island.hpp>
 #include <stanli/optable.hpp>
 
 #include <cstdlib>
@@ -53,7 +54,15 @@ std::vector<char> mark_constant_ops(const Graph& g) {
       // Effects are graph semantics, even when all their values are data.
       // Executing them in this compile-time pass would erase them from every
       // subsequent evaluation (and print/reject while compiling instead).
+      // A compiled region carries its effects inside its own program, so the
+      // opcode alone does not say: ask the payload. Such a region would
+      // refuse to run here anyway (no evaluation state), but the refusal is
+      // an exception that abandons this whole pass; excluding the region
+      // leaves the rest of the constant sub-graph foldable.
       bool c = op.n_in > 0 && !is_effectful_op(op.opcode);
+      if (c && op.opcode == OP_ISLAND && op.udata != nullptr &&
+          island_has_effect(*static_cast<const IslandProg*>(op.udata)))
+        c = false;
       for (int k = 0; k < op.n_in; ++k)
         if (op.in[k] >= 0 && live[(size_t)op.in[k]]) c = false;
       if (c && op.out >= 0 && no_fold[(size_t)op.out]) c = false;

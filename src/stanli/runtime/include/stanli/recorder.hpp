@@ -16,7 +16,7 @@
 #ifndef STANLI_RECORDER_HPP
 #define STANLI_RECORDER_HPP
 
-#include <stanli/graph.hpp>
+#include <stanli/kernel_types.hpp>
 
 #include <stan/math/prim/meta.hpp>
 #include <stan/math/prim/fun/Eigen.hpp>

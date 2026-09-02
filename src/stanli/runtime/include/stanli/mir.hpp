@@ -4,9 +4,12 @@
 #ifndef STANLI_MIR_HPP
 #define STANLI_MIR_HPP
 
+#include <stanli/expression_layout.hpp>
+#include <stanli/optable.hpp>
 #include <stanli/sexp.hpp>
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -82,72 +85,211 @@ inline bool is_matrix_row_value(const Expr& value) {
   return implicit_all || explicit_all;
 }
 
-enum class ProdGrouping : uint8_t { Legacy, Packet, Scalar };
-
-// Classify only the syntax whose Eigen evaluator provenance has been audited.
-// Legacy means "retain MirInterp's old scalar fold / refuse native lowering",
-// not a guess about an arbitrary expression's Eigen flags.
-inline ProdGrouping prod_grouping(const Expr& product_arg) {
-  if (is_matrix_row_value(product_arg)) return ProdGrouping::Scalar;
-  if (product_arg.kind == Expr::Var) return ProdGrouping::Packet;
-  if (product_arg.kind == Expr::FunApp &&
-      product_arg.fn_lib == Expr::Lib::StanLib &&
-      (product_arg.name == "Transpose__" || product_arg.name == "transpose") &&
-      product_arg.args.size() == 1 && product_arg.args[0].kind == Expr::Var)
-    return ProdGrouping::Packet;
-  if (product_arg.kind != Expr::FunApp ||
-      product_arg.fn_lib != Expr::Lib::StanLib ||
-      product_arg.name != "Minus__" || product_arg.args.size() != 2)
-    return ProdGrouping::Legacy;
-
-  bool scalar = false;
-  for (const Expr& operand : product_arg.args) {
-    if (is_matrix_row_value(operand)) {
-      scalar = true;
-      continue;
-    }
-    if (operand.unsized.depth == 0 &&
-        (operand.kind == Expr::LitInt || operand.kind == Expr::LitReal))
-      continue;
-    if (operand.kind == Expr::Var) continue;
-    if (operand.kind == Expr::FunApp && operand.fn_lib == Expr::Lib::StanLib &&
-        (operand.name == "Transpose__" || operand.name == "transpose") &&
-        operand.args.size() == 1 && operand.args[0].kind == Expr::Var)
-      continue;
-    if (operand.kind == Expr::FunApp && operand.fn_lib == Expr::Lib::StanLib &&
-        operand.name == "rep_vector" && operand.args.size() == 2 &&
-        (operand.args[0].kind == Expr::LitInt ||
-         operand.args[0].kind == Expr::LitReal))
-      continue;
-    return ProdGrouping::Legacy;
-  }
-  return scalar ? ProdGrouping::Scalar : ProdGrouping::Packet;
+inline bool reduction_container(const Expr& e) {
+  if (e.unsized.depth == 0)
+    return e.unsized.leaf == UnsizedLeaf::Vector ||
+           e.unsized.leaf == UnsizedLeaf::RowVector ||
+           e.unsized.leaf == UnsizedLeaf::Matrix;
+  return e.unsized.depth == 1 && (e.unsized.leaf == UnsizedLeaf::Real ||
+                                  e.unsized.leaf == UnsizedLeaf::Int);
 }
 
-// One-argument min/max is overloaded across scalars, arrays, matrices, and
-// Eigen expressions.  Only a named Eigen vector has the owning-storage
-// evaluator provenance audited by the generated-quantities extrema opcode.
-// Keeping the function kind in the classifier makes every excluded or
-// malformed call an explicit Legacy result instead of inferring semantics
-// from a loosely typed argument.
+inline bool language_scalar(const Expr& e) {
+  return e.unsized.depth == 0 && (e.unsized.leaf == UnsizedLeaf::Int ||
+                                  e.unsized.leaf == UnsizedLeaf::Real);
+}
+
+inline bool source_unary_elementwise(const std::string& name) {
+  bool unary = false;
+#define STANLI_SOURCE_UNARY(code, fn_name, value, delta, topology) \
+  unary = unary || name == #fn_name;
+  STANLI_SCALAR_UNARY_LIST(STANLI_SOURCE_UNARY)
+#undef STANLI_SOURCE_UNARY
+  return unary || name == "PMinus__" || name == "minus" || name == "exp" ||
+         name == "log" || name == "inv_logit" || name == "sqrt" ||
+         name == "square" || name == "log1m" || name == "tanh" ||
+         name == "trigamma" || name == "std_normal_qf" || name == "logit";
+}
+
+inline bool source_binary_elementwise(const std::string& name) {
+  bool binary = false;
+#define STANLI_SOURCE_BINARY(code, fn_name, fn) \
+  binary = binary || name == #fn_name;
+  STANLI_SCALAR_BINARY_LIST(STANLI_SOURCE_BINARY)
+  STANLI_SCALAR_BINARY_INT_FIRST_LIST(STANLI_SOURCE_BINARY)
+  STANLI_SCALAR_BINARY_INT_SECOND_LIST(STANLI_SOURCE_BINARY)
+#undef STANLI_SOURCE_BINARY
+  return binary || name == "Plus__" || name == "Minus__" ||
+         name == "EltTimes__" || name == "EltDivide__" || name == "EltPow__" ||
+         name == "add" || name == "subtract" || name == "elt_multiply" ||
+         name == "elt_divide" || name == "plus";
+}
+
+// Conservative source-level counterpart of Lowering::Val::layout for the MIR
+// interpreter. Both product and extrema consume this one classification so a
+// newly admitted expression cannot acquire two different grouping rules.
+inline ExpressionLayout source_expression_layout(const Expr& e) {
+  if (language_scalar(e)) return ExpressionLayout::scalar();
+  if (e.kind == Expr::Promotion && e.args.size() == 1)
+    return source_expression_layout(e.args[0]);
+  if (e.kind == Expr::Var && reduction_container(e))
+    return ExpressionLayout::direct();
+  if (e.kind == Expr::FunApp && e.fn_lib == Expr::Lib::UserDefined &&
+      reduction_container(e))
+    return ExpressionLayout::direct();
+  if (is_matrix_row_value(e)) return ExpressionLayout::scalar();
+  if (e.kind == Expr::Indexed && reduction_container(e) && !e.args.empty()) {
+    const Expr& base = e.args[0];
+    if (base.kind != Expr::Var || e.args.size() < 2)
+      return ExpressionLayout::unknown();
+    const Expr& index = e.args[1];
+    if (base.unsized.depth > 0) {
+      // Single outer-array indices expose an independently owning Eigen leaf.
+      // A following range then has a phase relative to that leaf, never the
+      // flattened offset of the preceding array elements. Non-single outer
+      // indices instead build a new std::vector result at offset zero.
+      bool selected_one_leaf = base.unsized.leaf == UnsizedLeaf::Vector ||
+                               base.unsized.leaf == UnsizedLeaf::RowVector;
+      for (uint8_t i = 0; i < base.unsized.depth; ++i)
+        selected_one_leaf = selected_one_leaf && i + 1 < e.args.size() &&
+                            e.args[i + 1].kind == Expr::FunApp &&
+                            e.args[i + 1].name == "IndexSingle";
+      const size_t leaf_index = static_cast<size_t>(base.unsized.depth) + 1;
+      if (selected_one_leaf && leaf_index < e.args.size()) {
+        const Expr& inner = e.args[leaf_index];
+        if (inner.kind != Expr::FunApp) return ExpressionLayout::unknown();
+        if (inner.name == "IndexMulti") return ExpressionLayout::scalar();
+        if ((inner.name == "IndexBetween" || inner.name == "IndexUpfrom") &&
+            !inner.args.empty() && inner.args[0].kind == Expr::LitInt &&
+            inner.args[0].lit_i >= 1)
+          return ExpressionLayout::direct(
+              static_cast<int64_t>(inner.args[0].lit_i - 1));
+        if (inner.name != "IndexAll") return ExpressionLayout::unknown();
+      }
+      return ExpressionLayout::direct();
+    }
+    if (index.kind != Expr::FunApp) return ExpressionLayout::unknown();
+    if (index.name == "IndexMulti") return ExpressionLayout::scalar();
+    if ((index.name == "IndexBetween" || index.name == "IndexUpfrom") &&
+        !index.args.empty() && index.args[0].kind == Expr::LitInt &&
+        index.args[0].lit_i >= 1)
+      return ExpressionLayout::direct(
+          static_cast<int64_t>(index.args[0].lit_i - 1));
+    if (index.name == "IndexAll") return source_expression_layout(base);
+    return ExpressionLayout::unknown();
+  }
+  if (e.kind != Expr::FunApp || e.fn_lib != Expr::Lib::StanLib ||
+      !reduction_container(e))
+    return ExpressionLayout::unknown();
+  if (e.name == "segment" && e.args.size() == 3 &&
+      e.args[1].kind == Expr::LitInt && e.args[1].lit_i >= 1)
+    return expression_layout::contiguous(
+        source_expression_layout(e.args[0]),
+        static_cast<int64_t>(e.args[1].lit_i - 1));
+  if (e.args.size() == 1 &&
+      (e.name == "Transpose__" || e.name == "transpose")) {
+    if (e.unsized.leaf == UnsizedLeaf::Matrix)
+      return ExpressionLayout::unknown();
+    return source_expression_layout(e.args[0]);
+  }
+  if (e.args.size() == 1 && (e.name == "PPlus__" || e.name == "plus"))
+    return source_expression_layout(e.args[0]);
+  if (e.name == "softmax" || e.name == "log_softmax" ||
+      e.name == "cumulative_sum" || e.name == "rep_vector" ||
+      e.name == "rep_row_vector" || e.name == "to_vector" ||
+      e.name == "to_row_vector")
+    return ExpressionLayout::packet();
+  if (e.args.size() == 1 && source_unary_elementwise(e.name)) {
+    const ExpressionLayout input = source_expression_layout(e.args[0]);
+    if (!input.known()) return ExpressionLayout::unknown();
+    return input.packet_access() ? ExpressionLayout::packet()
+                                 : ExpressionLayout::scalar();
+  }
+  if (e.args.size() == 2 && source_binary_elementwise(e.name)) {
+    bool saw_container = false;
+    bool all_known = true;
+    bool all_packet_access = true;
+    for (const Expr& operand : e.args) {
+      if (language_scalar(operand)) continue;
+      if (!reduction_container(operand)) return ExpressionLayout::unknown();
+      const ExpressionLayout input = source_expression_layout(operand);
+      saw_container = true;
+      all_known = all_known && input.known();
+      all_packet_access = all_packet_access && input.packet_access();
+    }
+    if (!saw_container) return ExpressionLayout::unknown();
+    return expression_layout::elementwise(false, true, all_known,
+                                          all_packet_access);
+  }
+  return ExpressionLayout::unknown();
+}
+
+// min/max is overloaded across scalars, arrays, matrices, and Eigen
+// expressions. The overload surface is independent of expression provenance;
+// the graph lowerer obtains the latter from Val::layout after lowering.
 enum class ExtremaKind : uint8_t { Legacy, Min, Max };
 
-inline ExtremaKind extrema_kind(const Expr& call) {
-  if (call.kind != Expr::FunApp || call.fn_lib != Expr::Lib::StanLib ||
-      call.args.size() != 1 || call.type_ != "UReal" ||
-      call.unsized.leaf != UnsizedLeaf::Real || call.unsized.depth != 0)
-    return ExtremaKind::Legacy;
-  const Expr& arg = call.args[0];
-  const bool vector_arg = arg.kind == Expr::Var && arg.type_ == "UVector" &&
-                          arg.unsized.leaf == UnsizedLeaf::Vector &&
-                          arg.unsized.depth == 0;
-  const bool row_vector_arg =
-      arg.kind == Expr::Var && arg.type_ == "URowVector" &&
-      arg.unsized.leaf == UnsizedLeaf::RowVector && arg.unsized.depth == 0;
-  if (!vector_arg && !row_vector_arg) return ExtremaKind::Legacy;
-  if (call.name == "min") return ExtremaKind::Min;
-  if (call.name == "max") return ExtremaKind::Max;
-  return ExtremaKind::Legacy;
+enum class ExtremaSurface : uint8_t {
+  Legacy,
+  RealVector,
+  RealMatrix,
+  RealArray,
+  IntArray,
+  IntPair,
+};
+
+struct ExtremaCall {
+  ExtremaKind kind = ExtremaKind::Legacy;
+  ExtremaSurface surface = ExtremaSurface::Legacy;
+};
+
+inline bool extrema_typed(const Expr& e, const char* type, UnsizedLeaf leaf,
+                          uint8_t depth) {
+  return e.type_ == type && e.unsized.leaf == leaf && e.unsized.depth == depth;
+}
+
+// Determine the overload from language-level types only. A vector expression
+// or a gathered array element is still the same overload as its named source;
+// ExpressionLayout decides whether the native kernel can reproduce its
+// evaluation grouping.
+inline ExtremaSurface extrema_container(const Expr& arg) {
+  if (extrema_typed(arg, "UVector", UnsizedLeaf::Vector, 0) ||
+      extrema_typed(arg, "URowVector", UnsizedLeaf::RowVector, 0))
+    return ExtremaSurface::RealVector;
+  if (extrema_typed(arg, "UMatrix", UnsizedLeaf::Matrix, 0))
+    return ExtremaSurface::RealMatrix;
+  if (extrema_typed(arg, "UArray", UnsizedLeaf::Real, 1))
+    return ExtremaSurface::RealArray;
+  if (extrema_typed(arg, "UArray", UnsizedLeaf::Int, 1))
+    return ExtremaSurface::IntArray;
+  return ExtremaSurface::Legacy;
+}
+
+inline ExtremaCall extrema_call(const Expr& call) {
+  if (call.kind != Expr::FunApp || call.fn_lib != Expr::Lib::StanLib) return {};
+  ExtremaKind kind = ExtremaKind::Legacy;
+  if (call.name == "min")
+    kind = ExtremaKind::Min;
+  else if (call.name == "max")
+    kind = ExtremaKind::Max;
+  else
+    return {};
+
+  const bool real_result = extrema_typed(call, "UReal", UnsizedLeaf::Real, 0);
+  const bool int_result = extrema_typed(call, "UInt", UnsizedLeaf::Int, 0);
+  if (call.args.size() == 2) {
+    if (!int_result ||
+        !extrema_typed(call.args[0], "UInt", UnsizedLeaf::Int, 0) ||
+        !extrema_typed(call.args[1], "UInt", UnsizedLeaf::Int, 0))
+      return {};
+    return {kind, ExtremaSurface::IntPair};
+  }
+  if (call.args.size() != 1) return {};
+  const ExtremaSurface surface = extrema_container(call.args[0]);
+  if (surface == ExtremaSurface::Legacy) return {};
+  const bool result_matches =
+      surface == ExtremaSurface::IntArray ? int_result : real_result;
+  return result_matches ? ExtremaCall{kind, surface} : ExtremaCall{};
 }
 
 struct Transform {
@@ -242,6 +384,13 @@ struct Stmt {
   // are its bounds.
   std::optional<Transform> check_transform;
   std::string check_var_name;
+  // FnWriteParam in transform_inits: the transform to INVERT, so that a
+  // constrained value supplied by the user becomes a free one. write_array's
+  // own FnWriteParam leaves this empty -- its value is constrained already.
+  // Both readers split this out of the one optional-transform slot the wire
+  // and the S-expression share with FnCheck, so consumers never have to ask
+  // which meaning a transform carries.
+  std::optional<Transform> write_transform;
   // For
   std::string loopvar;
   Expr lower, upper;
@@ -298,12 +447,94 @@ struct Program {
   // FnWriteParam. Gated on emit_transformed_parameters__ /
   // emit_generated_quantities__, which the lowering pins to 1.
   std::vector<Stmt> generate_quantities;
+  // stanc3's `transform_inits`: reads each parameter by name from a caller
+  // supplied context (FnReadData names the PARAMETER here, not model data)
+  // and emits one FnWriteParam per parameter carrying the transform to
+  // invert. This is the inverse direction of the log_prob graph's
+  // FnReadParam constrains, and the only place stanli can learn it.
+  // Presence is separate from content: a current parameterless model carries
+  // an explicitly empty section, while an older producer carries no section.
+  bool has_transform_inits = false;
+  std::vector<Stmt> transform_inits;
   std::vector<FunDef> fun_defs;
   // Output variable names (params, transformed params, generated
   // quantities) in FnWriteParam emission order, from the MIR's
   // output_vars section.
   std::vector<std::string> output_vars;
 };
+
+// reduce_sum(f, sliced, grainsize, shared...) reaches its partial-sum
+// function through a bare Var rather than a call, so both engines need the
+// same three answers about that reference: whether this is a reduce_sum at
+// all, which definition the name means, and what propto it asks for.
+
+inline bool is_reduce_sum(const Expr& e) {
+  return e.kind == Expr::FunApp && e.fn_lib == Expr::Lib::StanLib &&
+         (e.name == "reduce_sum" || e.name == "reduce_sum_static");
+}
+
+// The `_lupdf` / `_lupmf` spelling at the functor reference is stanc3's
+// propto marker; the definition is always the normalized `_lpdf` / `_lpmf`.
+// The marker is the only surviving propto signal here: the functor's
+// `(FnLpdf true)` type is not part of the portable encoding, and the
+// reduce_sum node itself is FnPlain, so neither can be consulted instead.
+inline std::string reduce_sum_partial_name(const std::string& functor,
+                                           bool* propto) {
+  const auto unnormalized = [&](const char* marker) {
+    return functor.size() > 6 &&
+           functor.compare(functor.size() - 6, 6, marker) == 0;
+  };
+  if (unnormalized("_lupdf")) {
+    *propto = true;
+    return functor.substr(0, functor.size() - 6) + "_lpdf";
+  }
+  if (unnormalized("_lupmf")) {
+    *propto = true;
+    return functor.substr(0, functor.size() - 6) + "_lpmf";
+  }
+  *propto = false;
+  return functor;
+}
+
+// The formals reduce_sum calls its partial-sum function with, in order: the
+// slice, its two bounds, then every shared argument unchanged.
+inline std::vector<UnsizedView> reduce_sum_partial_views(const Expr& e) {
+  std::vector<UnsizedView> views;
+  if (e.args.size() < 3) return views;
+  views.reserve(e.args.size());
+  views.push_back(e.args[1].unsized);
+  views.push_back({0, UnsizedLeaf::Int});
+  views.push_back({0, UnsizedLeaf::Int});
+  for (size_t i = 3; i < e.args.size(); ++i) views.push_back(e.args[i].unsized);
+  return views;
+}
+
+// The reader mangles an overloaded definition's name and rewrites its call
+// sites, but a functor reference is a Var and is never rewritten. Take the
+// unmangled name when it is the only one, and otherwise select the overload
+// whose formals match the call reduce_sum will make. Returns null when the
+// name resolves to nothing or, impossibly, to more than one.
+inline const FunDef* resolve_reduce_sum_partial(
+    const std::map<std::string, const FunDef*>& funs, const std::string& base,
+    const std::vector<UnsizedView>& views) {
+  const auto exact = funs.find(base);
+  if (exact != funs.end()) return exact->second;
+  const FunDef* match = nullptr;
+  for (const auto& [name, def] : funs) {
+    if (name.size() <= base.size() || name.compare(0, base.size(), base) != 0 ||
+        name[base.size()] != '(')
+      continue;
+    if (def->arg_views.size() != views.size()) continue;
+    bool same = true;
+    for (size_t i = 0; i < views.size() && same; ++i)
+      same = def->arg_views[i].depth == views[i].depth &&
+             def->arg_views[i].leaf == views[i].leaf;
+    if (!same) continue;
+    if (match) return nullptr;
+    match = def;
+  }
+  return match;
+}
 
 Program read_program(const sexp::Node& root);
 

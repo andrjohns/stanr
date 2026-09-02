@@ -104,6 +104,11 @@ class Reader {
     if (position_ != bytes_.size()) fail("trailing bytes");
   }
 
+  // True once every required section has been read. The transform_inits
+  // section is appended after them, so its absence is what distinguishes a
+  // document written before it existed from a truncated one.
+  bool at_end() const { return position_ == bytes_.size(); }
+
   uint8_t u8() {
     count_value();
     require(1);
@@ -443,6 +448,13 @@ Stmt read_stmt(Reader& reader) {
       value.check_transform = read_optional_transform(reader);
       value.check_var_name = reader.string();
       value.raw = reader.string();
+      // FnCheck and FnWriteParam share the wire's optional-transform slot.
+      // Split them here so the rest of the runtime never has to ask which
+      // meaning a transform carries: FnCheck verifies a constraint,
+      // FnWriteParam names one to invert.
+      if (value.fn_name == "FnWriteParam")
+        value.write_transform =
+            std::exchange(value.check_transform, std::nullopt);
       break;
     case Stmt::Return:
       value.has_init = reader.boolean();
@@ -496,6 +508,15 @@ Program read_program(Reader& reader) {
   result.generate_quantities = read_stmts(reader);
   result.fun_defs = reader.list<FunDef>([&] { return read_fun(reader); });
   result.output_vars = read_strings(reader);
+  // Appended after the sections every v2 document carries. A document from a
+  // producer that predates it simply ends here, and decodes with no inverse
+  // parameter transforms -- the same state as a model whose section could not
+  // be encoded. Anything else still has to be a well-formed statement list,
+  // and finish() still rejects bytes beyond it.
+  if (!reader.at_end()) {
+    result.has_transform_inits = true;
+    result.transform_inits = read_stmts(reader);
+  }
   return result;
 }
 

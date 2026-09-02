@@ -4,65 +4,104 @@
 #ifndef STANLI_GRAPH_HPP
 #define STANLI_GRAPH_HPP
 
+#include <stanli/kernel_types.hpp>
+
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <string>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace stanli {
 
-class WaRng;
-
-// Per-evaluation resources that are neither graph structure nor arena state.
-// The caller owns every pointed-to resource. In particular, an RNG stream
-// belongs to one chain/drawing thread, never to a compiled model or executor.
-struct EvalState {
-  WaRng* wa_rng = nullptr;
-};
-
-// A view of one contiguous buffer. len == 1 means scalar.
-struct Desc {
-  double* data;
-  int64_t len;
-};
-
-// A value in the graph. Slots with is_param are the unconstrained parameter
-// vector, in declaration order; everything else is data or an intermediate.
-struct Slot {
-  int64_t offset = 0;  // into the value arena (filled at bind)
-  int64_t len = 0;
-  bool is_param = false;
-};
-
-struct Op {
-  uint16_t opcode = 0;
-  // Opcode-specific compact mode. Density kernels use bits 0..5 for
-  // per-argument activity, bit 6 for elementwise lp, and bit 7 for propto;
-  // other kernels use it for contracts such as ODE scalar types or RNG family.
-  uint8_t variant = 0;
-  int out = -1;
-  int out2 = -1;  // optional second output (e.g. constrain jacobian term)
-  int in[6] = {-1, -1, -1, -1, -1, -1};
-  int n_in = 0;
-  const int* idata = nullptr;  // integer immediates (outcome counts, dims)
-  int64_t n_idata = 0;
-  // Opaque per-op payload for kernels that need compile-time structure the
-  // integer immediates cannot carry (ODEs, messages, declaration checks).
-  const void* udata = nullptr;
-  int64_t scratch_off = 0;  // into the scratch arena (filled at bind)
-  int64_t scratch_len = 0;
-};
-
 struct Graph {
   std::vector<Slot> slots;
   std::vector<Op> ops;
-  std::vector<std::vector<int>> idata_pool;  // owns per-op integer arrays
-  // Owns per-op opaque payloads; pointers into this outlive lowering because
-  // the graph is moved, never copied element-wise.
+  // Mutable construction storage for per-op integer arrays. Owned views into
+  // this pool always name data(), not an interior element. Copies rebind them
+  // into copied vectors. compact_idata() can replace this pool at the final
+  // execution boundary with immutable storage shared by Graph copies.
+  std::vector<std::vector<int>> idata_pool;
+  // Owns per-op opaque payloads. Graph copies share these immutable payloads,
+  // so the raw pointers in copied ops continue to name the shared objects.
   std::vector<std::shared_ptr<void>> udata_pool;
   int result_slot = -1;
+
+  Graph() = default;
+
+  Graph(const Graph& src)
+      : slots(src.slots),
+        ops(src.ops),
+        idata_pool(src.idata_pool),
+        udata_pool(src.udata_pool),
+        result_slot(src.result_slot),
+        compact_idata_(src.compact_idata_) {
+    // Finalized graphs usually have no mutable pool: their raw idata views
+    // remain valid through the shared immutable owner, with no rebinding.
+    if (src.idata_pool.empty()) return;
+    // One sorted, contiguous temporary keeps graph cloning O(P log P) without
+    // one hash-node allocation per integer payload. External Op::idata
+    // pointers, if a hand-built graph has one, retain their caller-owned
+    // lifetime; pointers owned by idata_pool are rebound to this graph.
+    using Rebind = std::pair<const int*, const int*>;
+    std::vector<Rebind> rebind;
+    rebind.reserve(src.idata_pool.size());
+    for (size_t i = 0; i < src.idata_pool.size(); ++i) {
+      if (!src.idata_pool[i].empty())
+        rebind.emplace_back(src.idata_pool[i].data(), idata_pool[i].data());
+    }
+    const auto before = [](const Rebind& a, const Rebind& b) {
+      return std::less<const int*>{}(a.first, b.first);
+    };
+    std::sort(rebind.begin(), rebind.end(), before);
+    for (size_t i = 0; i < src.ops.size(); ++i) {
+      const int* p = src.ops[i].idata;
+      if (p == nullptr) continue;
+      const auto it = std::lower_bound(rebind.begin(), rebind.end(),
+                                       Rebind{p, nullptr}, before);
+      if (it != rebind.end() && it->first == p) ops[i].idata = it->second;
+    }
+  }
+
+  Graph(Graph&&) noexcept = default;
+  Graph& operator=(Graph&&) noexcept = default;
+
+  Graph& operator=(const Graph& src) {
+    if (this != &src) {
+      Graph copy(src);
+      *this = std::move(copy);
+    }
+    return *this;
+  }
+
+  // Finalize integer ownership after all graph rewrites have returned. This
+  // invalidates views into idata_pool other than the ones in ops; custom
+  // opaque payloads must own their integer data, not borrow from that pool.
+  // Exact owned bases are packed once, dead arrays are released, and copies
+  // share the resulting immutable buffer. Borrowed/unrecognized views or
+  // invalid lengths conservatively leave the whole graph unchanged.
+  //
+  // Idempotent and one-shot: a finalized graph can still be copied/extended,
+  // but any subsequently appended mutable arrays keep their ordinary deep-
+  // copy ownership rather than moving existing finalized views again.
+  void compact_idata();
+
+  // Retained integer elements and nonempty buffers, excluding borrowed data.
+  // These expose storage accounting without exposing the compact owner.
+  size_t integer_storage_size() const {
+    size_t size = compact_idata_ ? compact_idata_->size() : 0;
+    for (const auto& payload : idata_pool) size += payload.size();
+    return size;
+  }
+  size_t integer_storage_blocks() const {
+    size_t blocks = compact_idata_ ? 1 : 0;
+    for (const auto& payload : idata_pool) blocks += !payload.empty();
+    return blocks;
+  }
 
   int add_slot(int64_t len, bool is_param) {
     slots.push_back(Slot{0, len, is_param});
@@ -91,26 +130,9 @@ struct Graph {
     ops.push_back(op);
     return static_cast<int>(ops.size()) - 1;
   }
-};
 
-// Per-call view handed to kernels. Assembled by the executor; kernels never
-// see slots or arenas directly.
-struct KernelCtx {
-  Desc in[6];
-  int n_in = 0;
-  Desc out{nullptr, 0};
-  uint8_t variant = 0;
-  double* scratch = nullptr;
-  const int* idata = nullptr;
-  int64_t n_idata = 0;
-  const void* udata = nullptr;
-  EvalState* eval_state = nullptr;
-  Desc out2{nullptr, 0};  // second output value (scalar), if any
-  // Backward only. Data inputs get {nullptr, len}: kernels skip them.
-  Desc in_adj[6];
-  double out_adj = 0;            // scalar-output ops
-  Desc out_adj_vec{nullptr, 0};  // vector-output ops
-  double out2_adj = 0;           // adjoint of the second output
+ private:
+  std::shared_ptr<const std::vector<int>> compact_idata_;
 };
 
 // Payload for OP_REJECT and OP_PRINT: the literal chunks of the message,
@@ -210,7 +232,8 @@ class Executor {
 
  private:
   void bind_();
-  KernelCtx make_ctx_(const Op& op, const std::vector<char>& written,
+  KernelCtx make_ctx_(const Op& op, int64_t scratch_offset,
+                      const std::vector<char>& written,
                       const std::vector<int64_t>& adjoint_offsets);
 
   struct ProfEntry {

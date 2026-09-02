@@ -82,8 +82,14 @@ void gp_cov_fwd(KernelCtx& ctx) {
   MapM(ctx.out.data, N, N) = c;
 }
 void gp_cov_bwd(KernelCtx& ctx) {
-  auto pts = gp_points(ctx);
+  // x may be a parameter: rebuild the points from the promoted xs[0] so its
+  // adjoints flow back too. nary_bwd copies back whatever input carries an
+  // adjoint slot, so a data x simply contributes nothing here.
+  const int64_t N = ctx.idata[0], D = ctx.idata[1];
   nary_bwd(ctx, [&](std::vector<VarV>& xs) {
+    std::vector<VarV> pts(N, VarV(D));
+    for (int64_t n = 0; n < N; ++n)
+      for (int64_t d = 0; d < D; ++d) pts[n](d) = xs[0](n * D + d);
     return stan::math::gp_exp_quad_cov(pts, xs[1](0), xs[2](0));
   });
 }
@@ -671,6 +677,35 @@ void crossprod_bwd(KernelCtx& ctx) {
   });
 }
 
+// ---- multiply_lower_tri_self_transpose(L): out = tril(L) * tril(L)' -------
+// idata = {rows, cols}; variant bit 0 records an autodiff result. The upper
+// triangle is dropped, not read: a plain L * L' agrees only when L already
+// has zeros above the diagonal, which a cholesky_factor_* parameter does and
+// an ordinary matrix does not. As with crossprod the two stan-math overloads
+// group the arithmetic differently -- the double one accumulates each entry
+// as a dot product over the shared head of two columns, the reverse-mode one
+// masks first and forms a triangular-times-dense product -- so a forward-only
+// evaluation takes the former and a gradient evaluation the latter.
+void mlt_self_transpose_fwd(KernelCtx& ctx) {
+  const int64_t rows = ctx.idata[0], cols = ctx.idata[1];
+  const CMapM a(ctx.in[0].data, rows, cols);
+  if ((ctx.variant & 1u) && !values_only()) {
+    const MatD masked = a.triangularView<Eigen::Lower>();
+    MapM(ctx.out.data, rows, rows) =
+        masked.triangularView<Eigen::Lower>() * masked.transpose();
+  } else {
+    MapM(ctx.out.data, rows, rows) =
+        stan::math::multiply_lower_tri_self_transpose(a);
+  }
+}
+void mlt_self_transpose_bwd(KernelCtx& ctx) {
+  const int64_t rows = ctx.idata[0], cols = ctx.idata[1];
+  nary_bwd(ctx, [rows, cols](std::vector<VarV>& xs) {
+    Eigen::Map<VarM> a(xs[0].data(), rows, cols);
+    return stan::math::multiply_lower_tri_self_transpose(a);
+  });
+}
+
 // ---- matrix solves: `A \ B` and `B / A` -----------------------------------
 // Argument order is the operator's, so in = {A, B} for the left solve and
 // {B, A} for the right one; idata = {n, k} with n the divisor's order and k
@@ -883,10 +918,18 @@ double nid_glm_eval(KernelCtx& ctx) {
   // out of `theta ~ normal(X * b, s)`: the outcome needs its gradient
   // back. y-as-data (every hand-written GLM) keeps the double fast path.
   const bool y_var = (ctx.variant & 0x1u) != 0;
+  // X is a parameter when the model reads `y ~ normal_id_glm(X, ...)` with a
+  // parameter design matrix; a data X (the common case) keeps the map.
+  const bool x_var = (ctx.variant & 0x2u) != 0;
   stan::math::nested_rev_autodiff nested;
   using stan::math::var;
+  using VarM = Eigen::Matrix<var, -1, -1>;
   CMapV yd(ctx.in[0].data, rows);
-  CMapM X(ctx.in[1].data, rows, cols);
+  CMapM Xd(ctx.in[1].data, rows, cols);
+  VarM Xv(x_var ? rows : 0, x_var ? cols : 0);
+  for (int64_t j = 0; j < Xv.cols(); ++j)
+    for (int64_t i = 0; i < Xv.rows(); ++i)
+      Xv(i, j) = ctx.in[1].data[j * rows + i];
   VarV yv(y_var ? rows : 0);
   for (int64_t i = 0; i < yv.size(); ++i) yv(i) = ctx.in[0].data[i];
   VarV alpha(ctx.in[2].len), beta(ctx.in[3].len), sigma(ctx.in[4].len);
@@ -895,24 +938,30 @@ double nid_glm_eval(KernelCtx& ctx) {
   for (int64_t i = 0; i < ctx.in[4].len; ++i) sigma(i) = ctx.in[4].data[i];
   var out;
   const bool one_a = ctx.in[2].len == 1, one_s = ctx.in[4].len == 1;
-  auto call = [&](auto&& y, auto&& a, auto&& s) {
-    return propto ? stan::math::normal_id_glm_lpdf<true>(y, X, a, beta, s)
-                  : stan::math::normal_id_glm_lpdf<false>(y, X, a, beta, s);
+  auto call = [&](auto&& y, auto&& x, auto&& a, auto&& s) {
+    return propto ? stan::math::normal_id_glm_lpdf<true>(y, x, a, beta, s)
+                  : stan::math::normal_id_glm_lpdf<false>(y, x, a, beta, s);
   };
-  auto dispatch = [&](auto&& y) {
+  auto dispatch = [&](auto&& y, auto&& x) {
     if (one_a && one_s)
-      out = call(y, alpha(0), sigma(0));
+      out = call(y, x, alpha(0), sigma(0));
     else if (one_a)
-      out = call(y, alpha(0), sigma);
+      out = call(y, x, alpha(0), sigma);
     else if (one_s)
-      out = call(y, alpha, sigma(0));
+      out = call(y, x, alpha, sigma(0));
     else
-      out = call(y, alpha, sigma);
+      out = call(y, x, alpha, sigma);
+  };
+  auto pick_x = [&](auto&& y) {
+    if (x_var)
+      dispatch(y, Xv);
+    else
+      dispatch(y, Xd);
   };
   if (y_var)
-    dispatch(yv);
+    pick_x(yv);
   else
-    dispatch(yd);
+    pick_x(yd);
   const double v = out.val();
   // One tape per gradient, not two. The forward differentiates it once
   // with a seed of 1 and keeps the partials; the backward is then the
@@ -923,6 +972,9 @@ double nid_glm_eval(KernelCtx& ctx) {
   stan::math::grad(out.vi_);
   double* s = ctx.scratch;
   for (int64_t i = 0; i < yv.size(); ++i) *s++ = yv(i).adj();
+  // Column-major, matching the slot layout the backward scatters into.
+  for (int64_t j = 0; j < Xv.cols(); ++j)
+    for (int64_t i = 0; i < Xv.rows(); ++i) *s++ = Xv(i, j).adj();
   for (int64_t i = 0; i < ctx.in[2].len; ++i) *s++ = alpha(i).adj();
   for (int64_t i = 0; i < ctx.in[3].len; ++i) *s++ = beta(i).adj();
   for (int64_t i = 0; i < ctx.in[4].len; ++i) *s++ = sigma(i).adj();
@@ -930,10 +982,11 @@ double nid_glm_eval(KernelCtx& ctx) {
 }
 
 int64_t nid_glm_scratch(const Op& op, const Slot* slots) {
-  // The y section exists only when y is active (variant bit 0), but the
-  // sizing hook cannot see the variant, so reserve it unconditionally.
-  return slots[op.in[0]].len + slots[op.in[2]].len + slots[op.in[3]].len +
-         slots[op.in[4]].len;
+  // The y and X sections exist only when those inputs are active (variant
+  // bits 0 and 1), but the sizing hook cannot see the variant, so reserve
+  // both unconditionally.
+  return slots[op.in[0]].len + slots[op.in[1]].len + slots[op.in[2]].len +
+         slots[op.in[3]].len + slots[op.in[4]].len;
 }
 
 void nid_glm_fwd(KernelCtx& ctx) { ctx.out.data[0] = nid_glm_eval(ctx); }
@@ -950,6 +1003,12 @@ void nid_glm_bwd(KernelCtx& ctx) {
       for (int64_t i = 0; i < ctx.in[0].len; ++i)
         ctx.in_adj[0].data[i] += w * s[i];
     s += ctx.in[0].len;
+  }
+  if (ctx.variant & 0x2u) {
+    if (ctx.in_adj[1].data)
+      for (int64_t i = 0; i < ctx.in[1].len; ++i)
+        ctx.in_adj[1].data[i] += w * s[i];
+    s += ctx.in[1].len;
   }
   for (int k = 2; k <= 4; ++k) {
     const bool active = (mask & (0x4u << (k - 2))) && ctx.in_adj[k].data;
@@ -1460,6 +1519,9 @@ void register_matrix_kernels() {
                   Kernel{mnprec_fwd, mnprec_bwd, nullptr});
   register_kernel(OP_GEMM, Kernel{gemm_fwd, gemm_bwd, nullptr});
   register_kernel(OP_CROSSPROD, Kernel{crossprod_fwd, crossprod_bwd, nullptr});
+  register_kernel(
+      OP_MULT_LOWER_TRI_SELF_TRANSPOSE,
+      Kernel{mlt_self_transpose_fwd, mlt_self_transpose_bwd, nullptr});
   register_kernel(OP_MDIVIDE_LEFT,
                   Kernel{solve_fwd<true>, solve_bwd<true>, nullptr});
   register_kernel(OP_MDIVIDE_RIGHT,

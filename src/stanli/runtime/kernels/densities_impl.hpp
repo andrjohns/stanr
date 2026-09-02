@@ -13,7 +13,9 @@
 #ifndef STANLI_KERNELS_DENSITIES_IMPL_HPP
 #define STANLI_KERNELS_DENSITIES_IMPL_HPP
 
-#include <stanli/graph.hpp>
+// Deliberately depend on the kernel-facing layouts rather than graph.hpp:
+// otherwise any Graph or Executor edit reinstantiates every density shard.
+#include <stanli/kernel_types.hpp>
 #include <stanli/optable.hpp>
 #include <stanli/recorder.hpp>
 

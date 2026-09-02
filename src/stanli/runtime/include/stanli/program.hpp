@@ -20,6 +20,7 @@
 #ifndef STANLI_PROGRAM_HPP
 #define STANLI_PROGRAM_HPP
 
+#include <stanli/kernel_types.hpp>
 #include <stanli/program_density.hpp>
 
 #include <stan/math.hpp>
@@ -27,13 +28,14 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace stanli {
 
-struct KernelCtx;  // graph.hpp; only CALL's helpers touch it
+using KernelFn = void (*)(KernelCtx&);
 
 // Structural facts used by the program compilers and the generated-adjoint
 // pass. The evaluator's arithmetic stays in the explicit switch below: its
@@ -114,8 +116,11 @@ enum ProgramOpFlag : uint16_t {
                            kProgramRangeOutput | kProgramNoAdjoint)          \
   X(QUAD_FORM_SYM, kProgramRangeA | kProgramRangeB | kProgramReadB |         \
                        kProgramRangeOutput | kProgramNoAdjoint)              \
+  X(MULT_LOWER_TRI_SELF_TRANSPOSE, kProgramRangeA | kProgramNoAdjoint)       \
   X(DENSITY, 0)                                                              \
-  X(CALL, 0)
+  X(CALL, 0)                                                                 \
+  X(REJECT, kProgramNoInputs | kProgramNoAdjoint | kProgramNoOutput)         \
+  X(DENSITY_VEC, kProgramNoAdjoint)
 
 struct Program {
   enum Code : uint8_t {
@@ -162,28 +167,62 @@ struct Program {
   // A CALL's payload: which kernel, and which register ranges stand in
   // for its slots. `scratch` is a range inside the register file, so the
   // partials the forward stashes are retained for the backward the same
-  // way every value is. `bwd_in`/`bwd_out` are where the VALUES live at
-  // backward time -- the same registers, unless the adjoint generator
-  // had to checkpoint them (some kernel backwards re-read their inputs;
-  // backward_ignores_values is a whitelist, not a guarantee).
+  // way every value is. The adjoint generator normalizes each CALL
+  // instruction to its own payload and binds checkpointed value and compact
+  // adjoint ranges below (adjoint.hpp).
   struct Call {
     uint16_t opcode = 0;
     uint8_t variant = 0;
     int8_t n_in = 0;
+    // Resolved once when the call site is built. A registered kernel's
+    // function identity is stable, so repeated table lookup during program
+    // execution can add no information. The generated adjoint uses the same
+    // bound `backward` pointer.
+    KernelFn forward = nullptr;
+    KernelFn backward = nullptr;
     int32_t in[6] = {0, 0, 0, 0, 0, 0};
     int32_t in_len[6] = {0, 0, 0, 0, 0, 0};
     int32_t out = 0;
     int32_t out_len = 0;
     int32_t scratch = 0;
     int32_t scratch_len = 0;
-    int32_t bwd_in[6] = {0, 0, 0, 0, 0, 0};
-    int32_t bwd_out = 0;
     std::vector<int> idata;
+    // Generated reverse binding. gen_adjoint normalizes CALL instructions to
+    // one payload each, then caches their checkpointed value ranges and
+    // compact adjoint ranges here. Forward-only Programs leave these zero.
+    int32_t bwd_value_in[6] = {0, 0, 0, 0, 0, 0};
+    int32_t bwd_adj_in[6] = {0, 0, 0, 0, 0, 0};
+    int32_t bwd_value_out = 0;
+    int32_t bwd_adj_out = 0;
+  };
+
+  // A DENSITY_VEC's payload: same density id DENSITY uses, but one or more
+  // arguments is a same-length container rather than a scalar, evaluated
+  // with one propto-OFF call the way CmdStan's generated code would (its
+  // Eigen broadcasting, not N scalar calls summed by hand -- see
+  // program_density_vec). `container_mask` bit k says argument k is `len`
+  // consecutive registers starting at `arg_reg[k]`; a clear bit says it is
+  // the one register at `arg_reg[k]`, same as DENSITY's scalar argument.
+  // No `scratch`: unlike CALL, this runs under both double and var by
+  // re-evaluating the same stan-math call, so there is no forward-computed
+  // partial to carry to a hand-written backward.
+  struct VecDensity {
+    uint16_t density_id = 0;
+    uint8_t arity = 0;
+    uint8_t container_mask = 0;
+    int32_t len = 0;
+    int32_t arg_reg[4] = {0, 0, 0, 0};
   };
 
   std::vector<Instr> code;
   std::vector<Call> calls;   // CALL payloads, indexed by Instr::a
   std::vector<double> pool;  // CONSTR data
+  // REJECT's literal message text, indexed by Instr::a. Never touched as a
+  // register (REJECT is kProgramNoInputs), so it rides beside the register
+  // file rather than in it.
+  std::vector<std::string> messages;
+  // DENSITY_VEC payloads, indexed by Instr::a.
+  std::vector<VecDensity> vec_densities;
   int n_regs = 0;
   std::vector<int> out_regs;  // the values the caller reads back
 };
@@ -216,13 +255,18 @@ inline constexpr int program_output_len(const Program::Instr& instr) {
   if (instr.code == Program::DIAG_PRE_MULTIPLY ||
       instr.code == Program::DIAG_POST_MULTIPLY)
     return static_cast<int>(static_cast<int64_t>(instr.c) * instr.len);
+  // Squares a rows x cols argument into a rows x rows result, so `len`
+  // measures the input run (kProgramRangeA) and the output is its own size.
+  if (instr.code == Program::MULT_LOWER_TRI_SELF_TRANSPOSE)
+    return static_cast<int>(static_cast<int64_t>(instr.b) * instr.b);
   const ProgramOpSpec& spec = program_code_spec(instr.code);
   return spec.has(kProgramNoOutput)      ? 0
          : spec.has(kProgramRangeOutput) ? instr.len
                                          : 1;
 }
 
-static_assert(program_code_count() == static_cast<size_t>(Program::CALL) + 1,
+static_assert(program_code_count() ==
+                  static_cast<size_t>(Program::DENSITY_VEC) + 1,
               "every Program::Code needs exactly one ProgramOpSpec");
 
 // Drop the initializer fills and the copies the MIR spells out, then
@@ -243,17 +287,38 @@ bool compact_program_gated(Program& p, std::vector<std::pair<int, int>>& seeded,
 // Backward-only fields are left null; run_adjoint fills its own.
 KernelCtx call_fwd_ctx(const Program::Call& call, double* reg);
 
-// Run one CALL forward. Out of line: KernelCtx lives in graph.hpp and
-// the kernel table in the executor, neither of which this header needs
-// for anything else.
-void run_call(const Program::Call& call, double* reg);
+// Resolve a manually constructed call site once. Production carvers already
+// have the Kernel in hand and bind its pointers directly. False leaves the
+// call unbound, so malformed or unavailable opcodes fail closed.
+bool bind_call(Program::Call& call);
+
+// Run one CALL forward through its pre-resolved function. `state` is the
+// caller's evaluation state, which is how a generated-quantities region
+// reaches the draw stream OP_RNG needs; null for every other caller, and
+// the RNG kernel rejects a null one rather than inventing a stream.
+void run_call(const Program::Call& call, double* reg,
+              EvalState* state = nullptr);
+
+// Reuse a caller-owned transient context. Its pointer fields are rebound per
+// site, while construction/defaulting of the full packet is not paid again.
+void run_call(const Program::Call& call, double* reg, KernelCtx& ctx,
+              EvalState* state);
 
 // Run `p` over `reg`, which the caller has seeded and sized to at least
 // p.n_regs. The compilers guarantee every register is written before it is
 // read, so a reused file never leaks a previous call's values.
-template <typename T>
-void run_program(const Program& p, T* reg) {
+template <bool ReuseCallCtx>
+struct ProgramCallCtx {};
+
+template <>
+struct ProgramCallCtx<true> {
+  KernelCtx ctx;
+};
+
+template <bool ReuseCallCtx, typename T>
+void run_program_impl(const Program& p, T* reg, EvalState* state = nullptr) {
   using VecT = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+  ProgramCallCtx<ReuseCallCtx> call_ctx;
   const int64_t n = (int64_t)p.code.size();
   for (int64_t pc = 0; pc < n; ++pc) {
     const Program::Instr& I = p.code[(size_t)pc];
@@ -438,6 +503,25 @@ void run_program(const Program& p, T* reg) {
           out = stan::math::diag_post_multiply(m, v);
         break;
       }
+      case Program::MULT_LOWER_TRI_SELF_TRANSPOSE: {
+        using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+        const int32_t rows = I.b, cols = I.c;
+        if (rows == 0) break;
+        // A rows x 0 argument has no lower triangle to multiply, and
+        // stan-math answers with the zero matrix rather than reading it.
+        if (cols == 0) {
+          for (int32_t k = 0; k < rows * rows; ++k) reg[I.dst + k] = T(0.0);
+          break;
+        }
+        // Materialise rather than hand stan-math a Map: the reverse-mode
+        // overload copies its argument into arena storage, which wants a
+        // plain matrix type. One call keeps the upper-triangle mask and the
+        // triangular pullback exactly as CmdStan would have them.
+        const MatT input = Eigen::Map<const MatT>(reg + I.a, rows, cols);
+        Eigen::Map<MatT> output(reg + I.dst, rows, rows);
+        output = stan::math::multiply_lower_tri_self_transpose(input);
+        break;
+      }
       case Program::MATRIX_EXP: {
         using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
         const int32_t rows = I.b, cols = I.c;
@@ -509,7 +593,10 @@ void run_program(const Program& p, T* reg) {
       // program.
       case Program::CALL:
         if constexpr (std::is_same_v<T, double>) {
-          run_call(p.calls[(size_t)I.a], reg);
+          if constexpr (ReuseCallCtx)
+            run_call(p.calls[(size_t)I.a], reg, call_ctx.ctx, state);
+          else
+            run_call(p.calls[(size_t)I.a], reg, state);
         } else {
           // Kernels are double machinery; a program that reaches here
           // under var was carved wrong, and saying so beats corrupting
@@ -517,6 +604,12 @@ void run_program(const Program& p, T* reg) {
           throw std::logic_error("CALL instruction in a var replay");
         }
         break;
+      // reject(): the same exception CmdStan's generated code throws from
+      // the same place, so the sampler counts it as a rejected proposal
+      // rather than a failure. No adjoint reaches this -- the forward
+      // already threw -- so there is nothing to do under var either.
+      case Program::REJECT:
+        throw std::domain_error(p.messages[(size_t)I.a]);
       case Program::DENSITY: {
         const int ar = program_density_arity(I.len);
         if (ar > 3) {
@@ -530,13 +623,31 @@ void run_program(const Program& p, T* reg) {
         d() = program_density<T>(I.len, args);
         break;
       }
+      case Program::DENSITY_VEC: {
+        const Program::VecDensity& v = p.vec_densities[(size_t)I.a];
+        d() = program_density_vec<T>(v.density_id, v.container_mask, v.len, reg,
+                                     v.arg_reg);
+        break;
+      }
     }
   }
 }
 
 template <typename T>
-inline void run_program(const Program& p, std::vector<T>& reg) {
-  run_program(p, reg.data());
+void run_program(const Program& p, T* reg, EvalState* state = nullptr) {
+  if constexpr (std::is_same_v<T, double>) {
+    if (!p.calls.empty()) {
+      run_program_impl<true>(p, reg, state);
+      return;
+    }
+  }
+  run_program_impl<false>(p, reg, state);
+}
+
+template <typename T>
+inline void run_program(const Program& p, std::vector<T>& reg,
+                        EvalState* state = nullptr) {
+  run_program(p, reg.data(), state);
 }
 
 }  // namespace stanli

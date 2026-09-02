@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -67,12 +68,13 @@ const Kernel* find_kernel(uint16_t opcode) {
   return k.forward ? &k : nullptr;
 }
 
-// CALL support (program.hpp): the register machine invoking a graph
-// kernel. The context is assembled per call from the payload's ranges --
-// every field is a pointer into the register file plus immediates, so
-// this is loads and stores, no allocation.
-KernelCtx call_fwd_ctx(const Program::Call& call, double* reg) {
-  KernelCtx ctx;
+// CALL support (program.hpp): the register machine invoking a graph kernel.
+// Only pointer fields vary with a register-file base. Dispatch and the
+// integer/shape metadata are immutable call-site facts, so builders resolve
+// the former once and a program invocation reuses one context packet across
+// all of its CALL instructions.
+static void bind_call_fwd_ctx(const Program::Call& call, double* reg,
+                              KernelCtx& ctx, EvalState* state) {
   ctx.n_in = call.n_in;
   for (int k = 0; k < call.n_in; ++k)
     ctx.in[k] = Desc{reg + call.in[k], call.in_len[k]};
@@ -81,13 +83,38 @@ KernelCtx call_fwd_ctx(const Program::Call& call, double* reg) {
   ctx.scratch = reg + call.scratch;
   ctx.idata = call.idata.data();
   ctx.n_idata = (int64_t)call.idata.size();
+  // Not a call-site fact: the draw stream belongs to the evaluation, so it
+  // is rebound with the pointer fields rather than resolved once.
+  ctx.eval_state = state;
+}
+
+KernelCtx call_fwd_ctx(const Program::Call& call, double* reg) {
+  KernelCtx ctx;
+  bind_call_fwd_ctx(call, reg, ctx, nullptr);
   return ctx;
 }
 
-void run_call(const Program::Call& call, double* reg) {
-  KernelCtx ctx = call_fwd_ctx(call, reg);
+bool bind_call(Program::Call& call) {
+  call.forward = nullptr;
+  call.backward = nullptr;
   const Kernel* k = find_kernel(call.opcode);
-  k->forward(ctx);
+  if (k == nullptr || k->forward == nullptr) return false;
+  call.forward = k->forward;
+  call.backward = k->backward;
+  return true;
+}
+
+void run_call(const Program::Call& call, double* reg, KernelCtx& ctx,
+              EvalState* state) {
+  if (call.forward == nullptr)
+    throw std::logic_error("unbound Program::CALL forward");
+  bind_call_fwd_ctx(call, reg, ctx, state);
+  call.forward(ctx);
+}
+
+void run_call(const Program::Call& call, double* reg, EvalState* state) {
+  KernelCtx ctx;
+  run_call(call, reg, ctx, state);
 }
 
 void register_elementwise_kernels();
@@ -126,8 +153,85 @@ static void ensure_registered() {
   (void)once;
 }
 
+void Graph::compact_idata() {
+  if (compact_idata_ || idata_pool.empty()) return;
+
+  bool has_views = false;
+  for (const Op& op : ops) {
+    if (op.n_idata < 0 || (op.n_idata > 0 && op.idata == nullptr)) return;
+    has_views |= op.idata != nullptr;
+  }
+  if (!has_views) {
+    // Rewrites can remove every integer-using op but leave its pool behind.
+    // No lookup or temporary allocation is needed to release an all-dead pool.
+    std::vector<std::vector<int>>{}.swap(idata_pool);
+    return;
+  }
+
+  // Exact bases are the mutable pool's ownership contract. In particular,
+  // do not infer ownership using pointer ranges: const-folding subgraphs
+  // borrow parent payloads, and hand-built graphs can borrow external data.
+  constexpr size_t unused = std::numeric_limits<size_t>::max();
+  struct Entry {
+    const int* data;
+    size_t pool_index;
+    size_t offset = unused;
+  };
+  std::vector<Entry> entries;
+  entries.reserve(idata_pool.size());
+  for (size_t i = 0; i < idata_pool.size(); ++i)
+    if (!idata_pool[i].empty()) entries.push_back({idata_pool[i].data(), i});
+  std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+    return std::less<const int*>{}(a.data, b.data);
+  });
+  const auto find = [&](const int* p) {
+    return std::lower_bound(entries.begin(), entries.end(), p,
+                            [](const Entry& entry, const int* value) {
+                              return std::less<const int*>{}(entry.data, value);
+                            });
+  };
+
+  size_t total = 0;
+  const size_t max_size = std::vector<int>{}.max_size();
+  for (const Op& op : ops) {
+    if (op.idata == nullptr) continue;
+    const auto entry = find(op.idata);
+    if (entry == entries.end() || entry->data != op.idata) return;
+    const size_t size = idata_pool[entry->pool_index].size();
+    if (static_cast<uint64_t>(op.n_idata) > size) return;
+    if (entry->offset == unused) {
+      if (size > max_size - total)
+        throw std::length_error("integer payload storage is too large");
+      entry->offset = total;
+      total += size;
+    }
+  }
+
+  std::shared_ptr<std::vector<int>> compact;
+  if (total != 0) {
+    compact = std::make_shared<std::vector<int>>(total);
+    for (const Entry& entry : entries) {
+      if (entry.offset == unused) continue;
+      const auto& payload = idata_pool[entry.pool_index];
+      std::copy(payload.begin(), payload.end(), compact->data() + entry.offset);
+    }
+  }
+
+  // Every allocation and refusal precedes publication. The remaining raw
+  // pointer assignments, shared_ptr move and vector swap cannot throw.
+  compact_idata_ = std::move(compact);
+  for (Op& op : ops) {
+    if (op.idata == nullptr) continue;
+    const auto entry = find(op.idata);
+    op.idata = compact_idata_->data() + entry->offset;
+  }
+  // clear() would retain the outer vector's per-payload metadata capacity.
+  std::vector<std::vector<int>>{}.swap(idata_pool);
+}
+
 Executor::Executor(Graph g) : graph_(std::move(g)) {
   ensure_registered();
+  graph_.compact_idata();
   bind_();
 }
 
@@ -198,7 +302,11 @@ void Executor::bind_() {
   }
 
   int64_t scratch = 0;
-  for (auto& op : graph_.ops) {
+  // Scratch layout is binding state, not graph structure. Only the bound
+  // context pointers survive this function; copies compute their own layout.
+  std::vector<int64_t> scratch_offsets;
+  scratch_offsets.reserve(graph_.ops.size());
+  for (const auto& op : graph_.ops) {
     const Kernel& k = kernel(op.opcode);
     if (op.opcode == OP_NONE_ || k.forward == nullptr)
       // Name it. A browser build can be missing a kernel because its
@@ -206,10 +314,8 @@ void Executor::bind_() {
       // to do from this string.
       throw std::runtime_error(std::string("opcode not registered: ") +
                                opcode_name(op.opcode));
-    op.scratch_off = scratch;
-    op.scratch_len =
-        k.scratch_size ? k.scratch_size(op, graph_.slots.data()) : 0;
-    scratch += op.scratch_len;
+    scratch_offsets.push_back(scratch);
+    scratch += k.scratch_size ? k.scratch_size(op, graph_.slots.data()) : 0;
   }
   scratch_.assign(scratch, 0.0);
 
@@ -221,7 +327,8 @@ void Executor::bind_() {
   ctx_.resize(graph_.ops.size());
   out2_adj_ptr_.assign(graph_.ops.size(), nullptr);
   for (size_t i = 0; i < graph_.ops.size(); ++i) {
-    ctx_[i] = make_ctx_(graph_.ops[i], written, adjoint_offsets);
+    ctx_[i] =
+        make_ctx_(graph_.ops[i], scratch_offsets[i], written, adjoint_offsets);
     const int o2 = graph_.ops[i].out2;
     if (o2 >= 0) {
       out2_adj_ptr_[i] = adjoints_.data() + adjoint_offsets[o2];
@@ -240,7 +347,8 @@ void Executor::bind_() {
   }
 }
 
-KernelCtx Executor::make_ctx_(const Op& op, const std::vector<char>& written,
+KernelCtx Executor::make_ctx_(const Op& op, int64_t scratch_offset,
+                              const std::vector<char>& written,
                               const std::vector<int64_t>& adjoint_offsets) {
   KernelCtx ctx;
   ctx.n_in = op.n_in;
@@ -255,7 +363,7 @@ KernelCtx Executor::make_ctx_(const Op& op, const std::vector<char>& written,
     ctx.out2 = Desc{values_.data() + s2.offset, s2.len};
   }
   ctx.variant = op.variant;
-  ctx.scratch = scratch_.data() + op.scratch_off;
+  ctx.scratch = scratch_.empty() ? nullptr : scratch_.data() + scratch_offset;
   ctx.idata = op.idata;
   ctx.udata = op.udata;
   ctx.eval_state = &eval_state_;

@@ -3,7 +3,7 @@
 # convention for bundled libraries
 set -e
 
-STANLI_REF="8c4b874"
+STANLI_REF="e8d2c06"
 STANLI_TARBALL="stanli-$STANLI_REF.tar.gz"
 STANLI_URL="https://github.com/seantalts/stanli/archive/$STANLI_REF.tar.gz"
 
@@ -20,6 +20,10 @@ test -n "$STANLI_DIR" && test -d "$STANLI_DIR"
 SRC=../src/stanli
 
 rm -rf "$SRC"
+# The PCH only depends on its umbrella header, not the vendored headers it
+# includes.  Invalidate it so the next package build cannot reuse the prior
+# stanli revision's cache.
+rm -f ../src/include/stanli_pch.hpp.gch ../src/include/stanli_pch.hpp.pch
 mkdir -p "$SRC/runtime"
 
 cp -f "$STANLI_DIR/LICENSE" "$SRC/"

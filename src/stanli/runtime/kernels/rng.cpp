@@ -1,11 +1,14 @@
 // Scalar generated-quantities draws on the compiled write_array graph.
 //
 // OP_RNG is deliberately one effectful opcode. Its variant names the family;
-// variants 0..5 take scalar-double arguments, categorical takes one
-// probability-vector slot, and multi-normal takes a mean vector plus a square
-// covariance and produces a vector. The stream is evaluation state, not
-// graph/model state, so callers can interleave independent chains through one
-// compiled model without sharing or resetting a stream.
+// the ScalarRng range takes scalar-double arguments (one int-typed, cast in
+// scalar_rng_draw, for the two families whose first argument is a
+// population count), categorical takes one probability-vector slot,
+// multi-normal takes a mean vector plus a square covariance and produces a
+// vector, and dirichlet takes one concentration vector and produces a
+// same-length simplex draw. The stream is evaluation state, not graph/model
+// state, so callers can interleave independent chains through one compiled
+// model without sharing or resetting a stream.
 #include <stanli/graph.hpp>
 #include <stanli/optable.hpp>
 #include <stanli/wa_interp.hpp>
@@ -17,9 +20,10 @@ namespace stanli {
 namespace {
 
 void rng_fwd(KernelCtx& ctx) {
-  if (ctx.variant > static_cast<uint8_t>(ScalarRng::Binomial) &&
+  if (ctx.variant > static_cast<uint8_t>(ScalarRng::Exponential) &&
       ctx.variant != kCategoricalRngVariant &&
-      ctx.variant != kMultiNormalRngVariant)
+      ctx.variant != kMultiNormalRngVariant &&
+      ctx.variant != kDirichletRngVariant)
     throw std::logic_error("malformed RNG op");
   if (ctx.variant == kCategoricalRngVariant) {
     if (ctx.out.len != 1 || ctx.n_in != 1 || ctx.in[0].len < 0)
@@ -49,12 +53,23 @@ void rng_fwd(KernelCtx& ctx) {
                           *ctx.eval_state->wa_rng);
     return;
   }
+  if (ctx.variant == kDirichletRngVariant) {
+    if (ctx.n_in != 1 || ctx.in[0].len < 0 || ctx.out.len != ctx.in[0].len)
+      throw std::logic_error("malformed dirichlet RNG op");
+    if (ctx.eval_state == nullptr || ctx.eval_state->wa_rng == nullptr)
+      throw std::logic_error(
+          "OP_RNG requires caller-owned evaluation RNG state");
+    dirichlet_rng_draw(ctx.in[0].data, static_cast<size_t>(ctx.in[0].len),
+                       ctx.out.data, static_cast<size_t>(ctx.out.len),
+                       *ctx.eval_state->wa_rng);
+    return;
+  }
   if (ctx.out.len != 1) throw std::logic_error("malformed scalar RNG op");
   const ScalarRng family = static_cast<ScalarRng>(ctx.variant);
   const size_t nargs = scalar_rng_arity(family);
   if (ctx.n_in != static_cast<int>(nargs))
     throw std::logic_error("malformed scalar RNG op");
-  double args[2]{};
+  double args[3]{};
   for (size_t i = 0; i < nargs; ++i) {
     if (ctx.in[i].len != 1)
       throw std::logic_error("scalar RNG received a container argument");

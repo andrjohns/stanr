@@ -1,4 +1,5 @@
 // Native elementwise / structural ops with hand-written vjps.
+#include <stanli/extrema_grouping.hpp>
 #include <stanli/graph.hpp>
 #include <stanli/optable.hpp>
 
@@ -154,6 +155,7 @@ void sum_vec_bwd(KernelCtx& ctx) {
 // source expression contains a strided matrix row. Bit 1 marks an active
 // expression: Matrix<var> has no double packet reducer, so its value follows
 // the same ascending scalar order even for a contiguous named vector.
+// Bit 2 carries a known nonzero phase for a contiguous direct view.
 // Eigen's redux normally chooses its packet boundary from the input address.
 // Graph slots share one arena, so that would make the arithmetic grouping
 // depend on every slot laid out before this one.  The explicit same-type
@@ -161,7 +163,9 @@ void sum_vec_bwd(KernelCtx& ctx) {
 // first_default_aligned is consequently lane zero, matching the Eigen value
 // CmdStan passes to stan::math::prod without allocating a copy here.
 void prod_vec_fwd(KernelCtx& ctx) {
-  if (ctx.variant != 0) {
+  if (ctx.variant & 4u) {
+    ctx.out.data[0] = prod_phased(ctx.in[0].data, ctx.in[0].len, ctx.idata[0]);
+  } else if (ctx.variant & 3u) {
     double product = ctx.in[0].data[0];
     for (int64_t i = 1; i < ctx.in[0].len; ++i) product *= ctx.in[0].data[i];
     ctx.out.data[0] = product;
@@ -206,6 +210,11 @@ void extrema_vec_fwd(KernelCtx& ctx) {
                               : std::numeric_limits<double>::infinity();
     return;
   }
+  if (ctx.variant & 4u) {
+    ctx.out.data[0] =
+        extrema_phased(ctx.in[0].data, ctx.in[0].len, ctx.idata[0], maximum);
+    return;
+  }
   if (ctx.variant & 2u) {
     // Matrix<var> has no packet extrema reducer. Eigen retains coefficient
     // zero, then replaces it only on a strict comparison while scanning in
@@ -241,11 +250,22 @@ void extrema_vec_fwd(KernelCtx& ctx) {
   if (ctx.scratch != nullptr) ctx.scratch[0] = static_cast<double>(selected);
 }
 void extrema_vec_bwd(KernelCtx& ctx) {
+  // Phased variants exist only for forward-mode generated quantities and
+  // share transient scratch whose contents need not survive the sweep.
+  if (ctx.variant & 4u) return;
   if (!ctx.in_adj[0].data || ctx.in[0].len == 0) return;
   ctx.in_adj[0].data[static_cast<int64_t>(ctx.scratch[0])] += ctx.out_adj;
 }
 
 int64_t scalar_scratch(const Op&, const Slot*) { return 1; }
+
+// One selected coefficient for reverse mode. Phased reductions are emitted
+// only for the forward double path.
+int64_t extrema_scratch(const Op& op, const Slot* slots) {
+  (void)slots;
+  if ((op.variant & 4u) != 0) return 0;
+  return 1;
+}
 
 // OP_INDEX: scalar out = in[flat], idata = {flat}. Backward scatters.
 void index_fwd(KernelCtx& ctx) {
@@ -486,7 +506,7 @@ void register_elementwise_kernels() {
   register_kernel(OP_SUM_VEC, Kernel{sum_vec_fwd, sum_vec_bwd, nullptr});
   register_kernel(OP_PROD_VEC, Kernel{prod_vec_fwd, prod_vec_bwd, nullptr});
   register_kernel(OP_EXTREMA_VEC,
-                  Kernel{extrema_vec_fwd, extrema_vec_bwd, scalar_scratch});
+                  Kernel{extrema_vec_fwd, extrema_vec_bwd, extrema_scratch});
   register_kernel(OP_INDEX, Kernel{index_fwd, index_bwd, nullptr});
   register_kernel(OP_SET_INDEX, Kernel{set_index_fwd, set_index_bwd, nullptr});
   register_kernel(OP_SET_INDEX_INPLACE, Kernel{set_index_inplace_fwd,

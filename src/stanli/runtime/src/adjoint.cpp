@@ -45,8 +45,18 @@ bool gen_adjoint(IslandProg& p) {
   const int n0 = fwd.n_regs;
   // Reversing flat jumps needs the structured if/else form the instruction
   // stream has already lost. Such programs keep the var replay.
-  for (const auto& I : orig)
+  for (const auto& I : orig) {
     if (program_code_spec(I.code).has(kProgramNoAdjoint)) return false;
+    if (I.code != Program::CALL) continue;
+    if (I.a < 0 || (size_t)I.a >= fwd.calls.size()) return false;
+    const Program::Call& call = fwd.calls[(size_t)I.a];
+    // A forward-only call (including a malformed manually built payload)
+    // cannot acquire a generated derivative. Check before any checkpoint or
+    // call metadata is written so refusal leaves the program untouched.
+    if (call.n_in < 0 || call.n_in > 6 || call.forward == nullptr ||
+        call.backward == nullptr)
+      return false;
+  }
 
   // Where each register was first and last written. A value the backward
   // needs survives in place exactly when no later instruction overwrites it;
@@ -202,6 +212,8 @@ bool gen_adjoint(IslandProg& p) {
 
   std::vector<Program::Instr> ncode;
   ncode.reserve(orig.size());
+  std::vector<Program::Call> bound_calls;
+  bound_calls.reserve(fwd.calls.size());
   AdjProgram ap;
   ap.code.reserve(orig.size());
   ap.adj_reg.resize((size_t)n0);
@@ -298,18 +310,21 @@ bool gen_adjoint(IslandProg& p) {
       // scratch (backward_ignores_values is a whitelist, not a
       // guarantee), and some read their output values too -- so both are
       // checkpointed whenever a later instruction overwrites them.
-      Program::Call& call = fwd.calls[(size_t)I.a];
+      Program::Call call = fwd.calls[(size_t)I.a];
       for (int j = 0; j < call.n_in; ++j) {
-        (void)mapn(call.in[j], call.in_len[j]);
-        call.bwd_in[j] = save_range(call.in[j], call.in_len[j], i);
+        call.bwd_adj_in[j] = mapn(call.in[j], call.in_len[j]);
+        call.bwd_value_in[j] = save_range(call.in[j], call.in_len[j], i);
       }
-      (void)mapn(call.out, call.out_len);
+      call.bwd_adj_out = mapn(call.out, call.out_len);
       if (!mapped_ranges_ok) return false;
-      ncode.push_back(I);
-      call.bwd_out = save_range(call.out, call.out_len, i);
+      Program::Instr F = I;
+      F.a = static_cast<int32_t>(bound_calls.size());
+      ncode.push_back(F);
+      call.bwd_value_out = save_range(call.out, call.out_len, i);
       AdjInstr A;
       A.code = Program::CALL;
-      A.a = I.a;
+      A.a = static_cast<int32_t>(bound_calls.size());
+      bound_calls.push_back(std::move(call));
       ap.code.push_back(A);
       continue;
     }
@@ -390,6 +405,7 @@ bool gen_adjoint(IslandProg& p) {
 
   std::reverse(ap.code.begin(), ap.code.end());
   fwd.code = std::move(ncode);
+  fwd.calls = std::move(bound_calls);
   fwd.n_regs = n_regs;
   p.adj = std::move(ap);
   return true;
@@ -404,6 +420,11 @@ using CAdjA = Eigen::Map<const Eigen::ArrayXd>;
 
 void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
                  double* adj) {
+  KernelCtx* call_ctx = nullptr;
+  if (!fwd.calls.empty()) {
+    static thread_local KernelCtx worker_call_ctx;
+    call_ctx = &worker_call_ctx;
+  }
   for (const AdjInstr& I : ap.code) {
     if (I.code == Program::CALL) {
       // The kernel's own backward is the rule: values from the (possibly
@@ -414,25 +435,23 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
       // contiguity. Then the output's cells are cleared, the same
       // consume-and-clear every other rule performs.
       const Program::Call& call = fwd.calls[(size_t)I.a];
-      KernelCtx ctx;
+      KernelCtx& ctx = *call_ctx;
       ctx.n_in = call.n_in;
       for (int k = 0; k < call.n_in; ++k) {
-        ctx.in[k] =
-            Desc{const_cast<double*>(val) + call.bwd_in[k], call.in_len[k]};
-        const int in_adj = call.in_len[k] ? ap.adj_reg[(size_t)call.in[k]] : 0;
-        ctx.in_adj[k] = Desc{adj + in_adj, call.in_len[k]};
+        ctx.in[k] = Desc{const_cast<double*>(val) + call.bwd_value_in[k],
+                         call.in_len[k]};
+        ctx.in_adj[k] = Desc{adj + call.bwd_adj_in[k], call.in_len[k]};
       }
-      ctx.out = Desc{const_cast<double*>(val) + call.bwd_out, call.out_len};
-      const int out_adj = ap.adj_reg[(size_t)call.out];
-      ctx.out_adj_vec = Desc{adj + out_adj, call.out_len};
-      if (call.out_len == 1) ctx.out_adj = adj[out_adj];
+      ctx.out =
+          Desc{const_cast<double*>(val) + call.bwd_value_out, call.out_len};
+      ctx.out_adj_vec = Desc{adj + call.bwd_adj_out, call.out_len};
+      ctx.out_adj = call.out_len == 1 ? adj[call.bwd_adj_out] : 0.0;
       ctx.variant = call.variant;
       ctx.scratch = const_cast<double*>(val) + call.scratch;
       ctx.idata = call.idata.data();
       ctx.n_idata = (int64_t)call.idata.size();
-      const Kernel* k = find_kernel(call.opcode);
-      k->backward(ctx);
-      for (int j = 0; j < call.out_len; ++j) adj[out_adj + j] = 0.0;
+      call.backward(ctx);
+      for (int j = 0; j < call.out_len; ++j) adj[call.bwd_adj_out + j] = 0.0;
       continue;
     }
     // Every instruction consumes its output's adjoint and clears it: the
@@ -736,6 +755,9 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
       case Program::MDIVIDE_LEFT:
       case Program::MDIVIDE_RIGHT_SPD:
       case Program::QUAD_FORM_SYM:
+      case Program::MULT_LOWER_TRI_SELF_TRANSPOSE:
+      case Program::REJECT:
+      case Program::DENSITY_VEC:
         break;  // gen_adjoint refuses these; unreachable
       case Program::CALL:
         break;  // handled before this switch

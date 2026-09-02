@@ -299,7 +299,7 @@ test_that("numeric data.frame data is accepted as a matrix", {
   )
   s <- fit$summary()
   expect_equal(s$mean[s$variable == "out"], frame[2, 1])
-  expect_equal(s$mean[s$variable == "total"], 10)
+  expect_equal(s$mean[s$variable == "total"], sum(as.matrix(frame)))
 })
 
 test_that("non-numeric data.frame columns are rejected", {

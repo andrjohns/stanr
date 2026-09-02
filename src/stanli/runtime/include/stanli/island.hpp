@@ -78,15 +78,30 @@ struct Softmax3IslandProg : IslandProg {
   std::shared_ptr<const Program> optimized_double;
 };
 
-// OP_ISLAND's variant is otherwise unused. This value selects the derived
-// payload's double-only plan while retaining the ordinary island opcode and
-// kernel-table layout. Setting it on a plain IslandProg violates the tagged
-// payload contract; the graph carver is the only production producer. Its
+// This value selects the derived payload's double-only plan while retaining
+// the ordinary island opcode and kernel-table layout. Setting it on a plain
+// IslandProg violates the tagged payload contract; the graph carver is the
+// only production producer. Its
 // forward must leave outputs and scratch bitwise-identical to OP_ISLAND's
 // canonical forward: the profiled executor and direct kernel-table callers
 // use that path, and the generated adjoint consumes either register file.
 // test_softmax3_double_exact enforces this contract.
 constexpr uint8_t kIslandSoftmax3Variant = 1;
+// Generic variant for a canonical IslandProg whose forward bytecode contains
+// Program::CALL. Executor binding selects its context-reusing forward once;
+// ordinary islands retain the context-free evaluator with no runtime check.
+constexpr uint8_t kIslandCallVariant = 2;
+
+void island_calls_fwd(KernelCtx& ctx);
+
+// True when the region's program has an observable effect: a draw from the
+// caller's stream, or a reject. A pass that reasons about purity has to
+// leave such a region alone even when every one of its inputs is data.
+// Nothing depends on this for correctness -- an effect kernel refuses to run
+// without the evaluation state a compile-time pass has no business owning,
+// so folding one fails rather than erasing it -- but that refusal costs the
+// whole constant sub-graph, and naming the effect costs only the region.
+bool island_has_effect(const Program& p);
 
 // Run compact_program (program.hpp) over the region's forward code, live-ins
 // included, before the adjoint generator reads it -- so the backward is
@@ -113,7 +128,8 @@ std::shared_ptr<const Program> specialize_softmax3(const IslandProg& p,
 // inside the caller's nested_rev_autodiff). The register file is reused
 // between calls. Not reentrant; islands cannot contain islands.
 template <typename T>
-void run_island(const IslandProg& p, const T* const* in, T* out) {
+void run_island(const IslandProg& p, const T* const* in, T* out,
+                EvalState* state = nullptr) {
   static thread_local std::vector<T> reg;
   if ((int64_t)reg.size() < p.n_regs) reg.resize((size_t)p.n_regs);
   for (size_t k = 0; k < p.ins.size(); ++k) {
@@ -122,7 +138,7 @@ void run_island(const IslandProg& p, const T* const* in, T* out) {
       reg[(size_t)(p.ins[k].reg + i)] = in[input][p.ins[k].offset + i];
   }
 
-  run_program(p, reg);
+  run_program(p, reg, state);
 
   for (size_t i = 0; i < p.out_regs.size(); ++i)
     out[i] = reg[(size_t)p.out_regs[i]];

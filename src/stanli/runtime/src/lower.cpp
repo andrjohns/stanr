@@ -1,7 +1,9 @@
 #include <stanli/algebra.hpp>
 #include <stanli/compile.hpp>
+#include <stanli/unconstrain.hpp>
 #include <stanli/constfold.hpp>
 #include <stanli/cse.hpp>
+#include <stanli/expression_layout.hpp>
 #include <stanli/inplace.hpp>
 #include <stanli/mir_prog.hpp>
 #include <stanli/mir.hpp>
@@ -25,10 +27,13 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace stanli {
@@ -295,8 +300,414 @@ struct Lowering {
     int slot;
     bool autodiff = false;  // instantiated C++ scalar type carries var
     SlotInfo si;
+    ExpressionLayout layout;
   };
-  static_assert(sizeof(Val) == 32);
+  static_assert(sizeof(Val) == 48);
+
+  // A function argument starts as a MIR expression and becomes a graph value
+  // only when a consumer asks for it.  Keeping the source expression here is
+  // important: different function families need different representations,
+  // and constructing this wrapper must not change evaluation order or cause
+  // effects from an argument that the consumer never reads.
+  struct LoweredArgument {
+    struct Cache {
+      std::optional<DataMap::Entry> owned_pure_value;
+      // Observations live in Lowering::observations, whose std::map entries
+      // remain stable while a call is lowered. Do not duplicate their
+      // vector-owned payload merely to memoize the lookup here.
+      const DataMap::Entry* borrowed_pure_value = nullptr;
+      std::optional<std::vector<int>> converted_ints;
+      std::optional<long> constant_int;
+    };
+
+    Lowering* owner = nullptr;
+    const mir::Expr* source = nullptr;
+    std::optional<Val> lowered;
+    // Most arguments are only lowered to a Val. Keep the less common,
+    // potentially vector-owning compile-time caches off the inline argument
+    // record so ordinary calls neither construct them nor make the call frame
+    // large enough to offset CallArguments' inline storage win.
+    std::unique_ptr<Cache> cached;
+    bool pure_checked = false;
+
+    Cache& cache() {
+      if (!cached) cached = std::make_unique<Cache>();
+      return *cached;
+    }
+
+    const DataMap::Entry* pure_value() const {
+      if (!cached) return nullptr;
+      if (cached->borrowed_pure_value) return cached->borrowed_pure_value;
+      return cached->owned_pure_value ? &*cached->owned_pure_value : nullptr;
+    }
+
+    void borrow_pure_value(const DataMap::Entry& value) {
+      Cache& c = cache();
+      c.owned_pure_value.reset();
+      c.borrowed_pure_value = &value;
+    }
+
+    void own_pure_value(DataMap::Entry value) {
+      Cache& c = cache();
+      c.borrowed_pure_value = nullptr;
+      c.owned_pure_value = std::move(value);
+    }
+
+    const mir::Expr& expr() const { return *source; }
+
+    const Val& value() {
+      if (!lowered) lowered = owner->lower_expr(expr());
+      return *lowered;
+    }
+
+    // Some irregular calls probe a data-only actual before deciding whether
+    // they need a graph value. Cache a successful fold in the same slot as
+    // value(), so the fallback path cannot lower the actual twice.
+    std::optional<Val> try_fold() {
+      if (lowered) return std::nullopt;
+      auto folded = owner->fold_const(expr());
+      if (folded) lowered = *folded;
+      return folded;
+    }
+
+    const DataMap::Entry* observation() {
+      if (!pure_checked) {
+        pure_checked = true;
+        const Val& v = value();
+        if (const DataMap::Entry* en = owner->observation(v)) {
+          borrow_pure_value(*en);
+        } else if (auto evaluated = owner->try_eval_pure(expr())) {
+          owner->observe(v, std::move(*evaluated));
+          const DataMap::Entry* en = owner->observation(v);
+          borrow_pure_value(*en);
+        }
+      }
+      return pure_value();
+    }
+
+    const std::vector<double>& require_constant_reals(const char* role) {
+      if (!pure_value()) {
+        if (owner->expr_effectful(expr()))
+          owner->fail("effectful expression cannot be demanded at compile time",
+                      expr().raw);
+        if (!pure_checked) {
+          pure_checked = true;
+          if (auto evaluated = owner->try_eval_pure(expr()))
+            own_pure_value(std::move(*evaluated));
+        }
+        if (!pure_value()) {
+          const Val& v = value();
+          if (const DataMap::Entry* en = owner->observation(v)) {
+            borrow_pure_value(*en);
+          } else if (owner->g.slots[v.slot].len == 0) {
+            own_pure_value(DataMap::Entry{});
+          } else {
+            owner->fail(std::string(role) + " must be known at compile time",
+                        expr().raw);
+          }
+        }
+      }
+      return pure_value()->r;
+    }
+
+    const std::vector<int>& require_constant_ints(const char* role) {
+      if (!pure_value()) {
+        if (owner->expr_effectful(expr()))
+          owner->fail(
+              "effectful expression cannot be demanded as compile-time "
+              "integers",
+              expr().raw);
+        if (!pure_checked) {
+          pure_checked = true;
+          if (auto evaluated = owner->try_eval_pure(expr()))
+            own_pure_value(std::move(*evaluated));
+        }
+        if (!pure_value()) (void)require_constant_reals(role);
+      }
+      if (pure_value()->is_int) return pure_value()->i;
+      Cache& c = cache();
+      if (!c.converted_ints) {
+        c.converted_ints.emplace();
+        c.converted_ints->reserve(pure_value()->r.size());
+        for (double d : pure_value()->r)
+          c.converted_ints->push_back(static_cast<int>(d));
+      }
+      return *c.converted_ints;
+    }
+
+    long require_constant_int(const char* role) {
+      if (expr().data_only && expr().type_ == "UInt") {
+        Cache& c = cache();
+        if (!c.constant_int) c.constant_int = owner->eval_int(expr());
+        return *c.constant_int;
+      }
+      const std::vector<int>& values = require_constant_ints(role);
+      if (values.size() != 1)
+        owner->fail(std::string(role) + " must be one integer", expr().raw);
+      return values[0];
+    }
+  };
+
+  struct CallArguments {
+    // Six is the graph kernel input boundary and covers ordinary Stan and
+    // internal calls. UDFs and variadic solver calls can exceed it, so retain
+    // an exact-size heap fallback without penalizing the common case.
+    static constexpr size_t inline_capacity = 6;
+
+    Lowering* owner;
+    const mir::Expr* call;
+    std::array<LoweredArgument, inline_capacity> inline_args{};
+    std::unique_ptr<LoweredArgument[]> overflow_args;
+
+    CallArguments(Lowering& lowering, const mir::Expr& expression)
+        : owner(&lowering), call(&expression) {
+      if (size() > inline_capacity)
+        overflow_args = std::make_unique<LoweredArgument[]>(size());
+      for (size_t i = 0; i < size(); ++i) {
+        data()[i].owner = owner;
+        data()[i].source = &expression.args[i];
+      }
+    }
+
+    size_t size() const { return call->args.size(); }
+
+    LoweredArgument* data() {
+      return size() <= inline_capacity ? inline_args.data()
+                                       : overflow_args.get();
+    }
+
+    LoweredArgument& at(size_t i) {
+      if (i >= size())
+        owner->fail(call->name + ": argument index out of range", call->raw);
+      return data()[i];
+    }
+
+    void require_arity(size_t n) const {
+      if (size() != n)
+        owner->fail(call->name + ": expected " + std::to_string(n) +
+                        " arguments, got " + std::to_string(size()),
+                    call->raw);
+    }
+
+    void require_arity(size_t min, size_t max) const {
+      if (size() < min || size() > max)
+        owner->fail(call->name + ": expected between " + std::to_string(min) +
+                        " and " + std::to_string(max) + " arguments, got " +
+                        std::to_string(size()),
+                    call->raw);
+    }
+
+    void require_min_arity(size_t min) const {
+      if (size() < min)
+        owner->fail(call->name + ": expected at least " + std::to_string(min) +
+                        " arguments, got " + std::to_string(size()),
+                    call->raw);
+    }
+
+    const mir::Expr& call_expr() const { return *call; }
+  };
+
+  enum class BuiltinFamily {
+    MapRect,
+    ReduceSum,
+    MultiNormalRng,
+    DirichletRng,
+    CategoricalRng,
+    ScalarRng,
+    Density,
+    BoundTransform,
+    Elementwise,
+    AppendArray,
+    Matrix,
+    Algebra,
+    Ode,
+    ShapeQuery,
+  };
+
+  enum class RegularKind { Binary, BinaryIntFirst, BinaryIntSecond, Unary };
+
+  struct RegularSpec {
+    RegularKind kind;
+    uint16_t opcode;
+  };
+
+  struct BuiltinDispatch {
+    BuiltinFamily family = BuiltinFamily::Elementwise;
+    std::optional<RegularSpec> regular;
+    std::optional<ScalarRng> scalar_rng;
+
+    BuiltinDispatch() = default;
+    BuiltinDispatch(BuiltinFamily selected,
+                    std::optional<RegularSpec> regular_call = std::nullopt,
+                    std::optional<ScalarRng> rng = std::nullopt)
+        : family(selected), regular(regular_call), scalar_rng(rng) {}
+  };
+
+  static BuiltinDispatch regular_dispatch(RegularKind kind, uint16_t opcode) {
+    return {BuiltinFamily::Elementwise, RegularSpec{kind, opcode}};
+  }
+
+  static BuiltinDispatch rng_dispatch(ScalarRng family) {
+    return {BuiltinFamily::ScalarRng, std::nullopt, family};
+  }
+
+  static bool ends_with(std::string_view name, std::string_view suffix) {
+    return name.size() >= suffix.size() &&
+           name.substr(name.size() - suffix.size()) == suffix;
+  }
+
+  static bool bound_transform_name(std::string_view name) {
+    static constexpr std::string_view kStems[] = {
+        "lower_bound_", "upper_bound_", "lower_upper_bound_",
+        "offset_multiplier_"};
+    for (std::string_view stem : kStems) {
+      if (name.size() < stem.size() || name.substr(0, stem.size()) != stem)
+        continue;
+      const std::string_view tail = name.substr(stem.size());
+      return tail == "constrain" || tail == "jacobian" || tail == "unconstrain";
+    }
+    return false;
+  }
+
+  static BuiltinDispatch resolve_builtin(const mir::Expr& e) {
+    if (mir::is_reduce_sum(e)) return {BuiltinFamily::ReduceSum};
+    // These two names are overloaded by arity. Their reduction forms remain
+    // bespoke; their binary forms share the regular broadcast emitter.
+    if (e.name == "log_sum_exp")
+      return e.args.size() == 2 ? regular_dispatch(RegularKind::Binary, OP_LSE2)
+                                : BuiltinDispatch{};
+    if (e.name == "log_diff_exp")
+      return e.args.size() == 2
+                 ? regular_dispatch(RegularKind::Binary, OP_LOG_DIFF_EXP)
+                 : BuiltinDispatch{};
+
+    // Bespoke functions still own their semantic checks. This registry only
+    // selects the handler, replacing the old sequence in which every family
+    // was probed and declined in turn.
+    static const std::unordered_map<std::string_view, BuiltinDispatch>
+        kBuiltins = {
+            {"map_rect", BuiltinFamily::MapRect},
+            {"multi_normal_rng", BuiltinFamily::MultiNormalRng},
+            {"dirichlet_rng", BuiltinFamily::DirichletRng},
+            {"categorical_rng", BuiltinFamily::CategoricalRng},
+            {"append_array", BuiltinFamily::AppendArray},
+            {"algebra_solver", BuiltinFamily::Algebra},
+            {"ode_bdf", BuiltinFamily::Ode},
+            {"ode_bdf_tol", BuiltinFamily::Ode},
+            {"ode_adams", BuiltinFamily::Ode},
+            {"ode_adams_tol", BuiltinFamily::Ode},
+            {"ode_rk45", BuiltinFamily::Ode},
+            {"ode_rk45_tol", BuiltinFamily::Ode},
+            {"ode_ckrk", BuiltinFamily::Ode},
+            {"ode_ckrk_tol", BuiltinFamily::Ode},
+            {"integrate_ode_rk45", BuiltinFamily::Ode},
+            {"integrate_ode_bdf", BuiltinFamily::Ode},
+            {"integrate_ode_adams", BuiltinFamily::Ode},
+            {"Transpose__", BuiltinFamily::Matrix},
+            {"transpose", BuiltinFamily::Matrix},
+            {"tcrossprod", BuiltinFamily::Matrix},
+            {"crossprod", BuiltinFamily::Matrix},
+            {"diag_pre_multiply", BuiltinFamily::Matrix},
+            {"diag_post_multiply", BuiltinFamily::Matrix},
+            {"multiply_lower_tri_self_transpose", BuiltinFamily::Matrix},
+            {"to_matrix", BuiltinFamily::Matrix},
+            {"to_vector", BuiltinFamily::Matrix},
+            {"to_row_vector", BuiltinFamily::Matrix},
+            {"to_array_1d", BuiltinFamily::Matrix},
+            {"rep_matrix", BuiltinFamily::Matrix},
+            {"gp_exp_quad_cov", BuiltinFamily::Matrix},
+            {"diag_matrix", BuiltinFamily::Matrix},
+            {"cholesky_decompose", BuiltinFamily::Matrix},
+            {"matrix_exp", BuiltinFamily::Matrix},
+            {"inverse", BuiltinFamily::Matrix},
+            {"inverse_spd", BuiltinFamily::Matrix},
+            {"log_determinant", BuiltinFamily::Matrix},
+            {"eigenvalues_sym", BuiltinFamily::Matrix},
+            {"eigenvectors_sym", BuiltinFamily::Matrix},
+            {"quad_form_diag", BuiltinFamily::Matrix},
+            {"quad_form_sym", BuiltinFamily::Matrix},
+            {"quad_form", BuiltinFamily::Matrix},
+            {"add_diag", BuiltinFamily::Matrix},
+            {"append_row", BuiltinFamily::Matrix},
+            {"append_col", BuiltinFamily::Matrix},
+            {"segment", BuiltinFamily::Matrix},
+            {"sub_col", BuiltinFamily::Matrix},
+            {"block", BuiltinFamily::Matrix},
+            {"col", BuiltinFamily::Matrix},
+            {"diagonal", BuiltinFamily::Matrix},
+            {"row", BuiltinFamily::Matrix},
+            {"head", BuiltinFamily::Matrix},
+            {"tail", BuiltinFamily::Matrix},
+            {"reverse", BuiltinFamily::Matrix},
+            {"rows", BuiltinFamily::ShapeQuery},
+            {"cols", BuiltinFamily::ShapeQuery},
+            {"size", BuiltinFamily::ShapeQuery},
+            {"num_elements", BuiltinFamily::ShapeQuery},
+
+            // Regular elementwise families and their aliases share one emitter.
+            {"Plus__", regular_dispatch(RegularKind::Binary, OP_ADD)},
+            {"Minus__", regular_dispatch(RegularKind::Binary, OP_SUB)},
+            {"Divide__", regular_dispatch(RegularKind::Binary, OP_DIV)},
+            {"EltTimes__", regular_dispatch(RegularKind::Binary, OP_MUL)},
+            {"EltDivide__", regular_dispatch(RegularKind::Binary, OP_DIV)},
+            {"Pow__", regular_dispatch(RegularKind::Binary, OP_POW)},
+            {"EltPow__", regular_dispatch(RegularKind::Binary, OP_POW)},
+            {"pow", regular_dispatch(RegularKind::Binary, OP_POW)},
+            {"add", regular_dispatch(RegularKind::Binary, OP_ADD)},
+            {"subtract", regular_dispatch(RegularKind::Binary, OP_SUB)},
+            {"divide", regular_dispatch(RegularKind::Binary, OP_DIV)},
+            {"elt_multiply", regular_dispatch(RegularKind::Binary, OP_MUL)},
+            {"elt_divide", regular_dispatch(RegularKind::Binary, OP_DIV)},
+#define STANLI_DISPATCH_BINARY(code, name, fn) \
+  {#name, regular_dispatch(RegularKind::Binary, code)},
+            STANLI_SCALAR_BINARY_LIST(STANLI_DISPATCH_BINARY)
+#undef STANLI_DISPATCH_BINARY
+                {"multiply_log",
+                 regular_dispatch(RegularKind::Binary, OP_LMULTIPLY)},
+#define STANLI_DISPATCH_INT_FIRST(code, name, fn) \
+  {#name, regular_dispatch(RegularKind::BinaryIntFirst, code)},
+            STANLI_SCALAR_BINARY_INT_FIRST_LIST(STANLI_DISPATCH_INT_FIRST)
+#undef STANLI_DISPATCH_INT_FIRST
+#define STANLI_DISPATCH_INT_SECOND(code, name, fn) \
+  {#name, regular_dispatch(RegularKind::BinaryIntSecond, code)},
+                STANLI_SCALAR_BINARY_INT_SECOND_LIST(STANLI_DISPATCH_INT_SECOND)
+#undef STANLI_DISPATCH_INT_SECOND
+#define STANLI_DISPATCH_UNARY(code, name, value, delta, topology) \
+  {#name, regular_dispatch(RegularKind::Unary, code)},
+                    STANLI_SCALAR_UNARY_LIST(STANLI_DISPATCH_UNARY)
+#undef STANLI_DISPATCH_UNARY
+                        {"PMinus__",
+                         regular_dispatch(RegularKind::Unary, OP_NEG)},
+            {"minus", regular_dispatch(RegularKind::Unary, OP_NEG)},
+            {"std_normal_qf", regular_dispatch(RegularKind::Unary, OP_INV_PHI)},
+            {"trigamma", regular_dispatch(RegularKind::Unary, OP_TRIGAMMA)},
+            {"exp", regular_dispatch(RegularKind::Unary, OP_EXPV)},
+            {"log", regular_dispatch(RegularKind::Unary, OP_LOGV)},
+            {"inv_logit", regular_dispatch(RegularKind::Unary, OP_INV_LOGIT)},
+            {"logit", regular_dispatch(RegularKind::Unary, OP_LOGIT)},
+            {"sqrt", regular_dispatch(RegularKind::Unary, OP_SQRT)},
+            {"square", regular_dispatch(RegularKind::Unary, OP_SQUARE)},
+            {"log1m", regular_dispatch(RegularKind::Unary, OP_LOG1M)},
+            {"softmax", regular_dispatch(RegularKind::Unary, OP_SOFTMAX)},
+            {"tanh", regular_dispatch(RegularKind::Unary, OP_TANHV)},
+            {"cumulative_sum", regular_dispatch(RegularKind::Unary, OP_CUMSUM)},
+            {"log_softmax",
+             regular_dispatch(RegularKind::Unary, OP_LOG_SOFTMAX)},
+        };
+    const auto builtin = kBuiltins.find(e.name);
+    if (builtin != kBuiltins.end()) return builtin->second;
+    // Keep the scalar-RNG vocabulary in the shared classifier used by the
+    // graph, interpreter, and runtime-region compiler. The selected family is
+    // still carried into the handler, so dispatch performs this lookup once.
+    if (const ScalarRng* rng = scalar_rng_family(e.name))
+      return rng_dispatch(*rng);
+    if (ends_with(e.name, "_lpdf") || ends_with(e.name, "_lpmf") ||
+        ends_with(e.name, "_cdf") || ends_with(e.name, "_ccdf") ||
+        ends_with(e.name, "_lcdf") || ends_with(e.name, "_lccdf"))
+      return {BuiltinFamily::Density};
+    if (bound_transform_name(e.name)) return {BuiltinFamily::BoundTransform};
+    return {};
+  }
 
   const DataMap& data;
   std::shared_ptr<ShapeInterner> shape_pool;
@@ -347,6 +758,9 @@ struct Lowering {
   std::set<std::string> effectful_visiting;
   std::set<std::string> int_locals;  // SInt locals in log_prob (data-only)
   int udf_depth = 0;
+  // Names the reduce_sum rewrite binds its lowered slice under, kept
+  // distinct so nested calls do not share one.
+  int reduce_sum_slices = 0;
   // int_env as bind_data left it, before either section's locals and loop
   // variables were folded in; the write_array lowering starts from this.
   std::map<std::string, long> int_env_data;
@@ -490,7 +904,8 @@ struct Lowering {
   }
 
   Val constant(double v) {
-    Val out{const_slot(v), false, SlotInfo{0, 0, true}};
+    Val out{const_slot(v), false, SlotInfo{0, 0, true},
+            ExpressionLayout::scalar()};
     DataMap::Entry en;
     en.r = {v};
     observe(out, std::move(en));
@@ -778,7 +1193,8 @@ struct Lowering {
         if ((e.name == "rows" || e.name == "cols" || e.name == "size" ||
              e.name == "num_elements" || e.name == "FnLength") &&
             e.args.size() == 1 && e.args[0].kind != mir::Expr::Var) {
-          const Val v = lower_expr(e.args[0]);
+          CallArguments actuals(*this, e);
+          const Val v = actuals.at(0).value();
           const int64_t len = g.slots[v.slot].len;
           if (is_array(v.si)) {
             const ArrayShape& sh = array_shape(v.si);
@@ -972,6 +1388,203 @@ struct Lowering {
            g.slots[v.slot].len == 1;
   }
 
+  static ExpressionLayout owning_layout(const SlotInfo& si) {
+    return si.kind == ViewKind::Flat && si.shape == 0
+               ? ExpressionLayout::scalar()
+               : ExpressionLayout::direct();
+  }
+
+  Val with_layout(Val value, ExpressionLayout layout) const {
+    value.layout = layout;
+    return value;
+  }
+
+  ExpressionLayout contiguous_layout(const Val& source, int64_t offset,
+                                     const std::string& what) const {
+    if (offset < 0)
+      throw CompileError("stanli compile: negative layout offset for " + what);
+    const ExpressionLayout result =
+        expression_layout::contiguous(source.layout, offset);
+    if (source.layout.kind == ExpressionLayout::Kind::Direct && !result.known())
+      throw CompileError("stanli compile: layout offset overflows for " + what);
+    return result;
+  }
+
+  ExpressionLayout elementwise_layout(std::initializer_list<Val> inputs,
+                                      bool packet_supported = true) const {
+    if (inputs.size() == 0) return ExpressionLayout::unknown();
+    bool all_scalar = true;
+    bool all_known = true;
+    bool all_packet_access = true;
+    for (const Val& input : inputs) all_scalar = all_scalar && is_scalar(input);
+    for (const Val& input : inputs) {
+      if (is_scalar(input)) continue;
+      all_known = all_known && input.layout.known();
+      all_packet_access = all_packet_access && input.layout.packet_access();
+    }
+    return expression_layout::elementwise(all_scalar, packet_supported,
+                                          all_known, all_packet_access);
+  }
+
+  enum class ReductionGrouping : uint8_t { Unknown, Packet, Scalar, Phased };
+
+  // The active scalar type is an independent reason for scalar traversal:
+  // Matrix<var> has no packet reducer even when its source layout is direct.
+  // Otherwise the source layout describes the Eigen evaluator that Stan Math
+  // reduced before graph materialization.
+  ReductionGrouping reduction_grouping(const Val& value, bool active) const {
+    if (active) return ReductionGrouping::Scalar;
+    switch (value.layout.kind) {
+      case ExpressionLayout::Kind::Unknown:
+        return ReductionGrouping::Unknown;
+      case ExpressionLayout::Kind::Scalar:
+        return ReductionGrouping::Scalar;
+      case ExpressionLayout::Kind::Packet:
+        return ReductionGrouping::Packet;
+      case ExpressionLayout::Kind::Direct:
+        return value.layout.element_offset == 0 ? ReductionGrouping::Packet
+                                                : ReductionGrouping::Phased;
+    }
+    return ReductionGrouping::Unknown;
+  }
+
+  std::vector<int> reduction_phase_idata(const Val& value,
+                                         ReductionGrouping grouping,
+                                         const std::string& what) {
+    if (grouping != ReductionGrouping::Phased) return {};
+    return {checked_immediate(value.layout.element_offset, what + " offset")};
+  }
+
+  // Reducing a slot is valid only when its logical view spans exactly the
+  // container the MIR overload named. The layout controls grouping; these
+  // checks only prevent a partial or padded slot from being mistaken for a
+  // complete vector, matrix, or one-dimensional array.
+  bool extrema_storage(mir::ExtremaSurface surface, const Val& value) {
+    const int64_t len = g.slots[value.slot].len;
+    switch (surface) {
+      case mir::ExtremaSurface::RealVector:
+        return is_vector(value.si) || is_row_vector(value.si);
+      case mir::ExtremaSurface::RealMatrix:
+        return is_matrix(value.si) &&
+               checked_product({value.si.rows, value.si.cols},
+                               "min/max matrix shape") == len;
+      case mir::ExtremaSurface::RealArray:
+      case mir::ExtremaSurface::IntArray: {
+        if (!is_array(value.si)) return false;
+        const ArrayShape& shape = array_shape(value.si);
+        return shape.leaf == ViewKind::Flat && shape.dims.size() == 1 &&
+               shape.dims[0] == len;
+      }
+      default:
+        return false;
+    }
+  }
+
+  IntRange prove_runtime_int_extrema(const mir::Expr& e, const Val& value,
+                                     int64_t len) {
+    if (!in_write_array)
+      fail("runtime integer min/max is supported only in generated quantities",
+           e.raw);
+    // Stan Math raises for an empty integer container; the forward graph
+    // kernel cannot reproduce that exception at execution time.
+    if (len == 0)
+      fail("min/max over an empty int array stays on WaInterp", e.raw);
+    if (value.si.param_free)
+      fail("min/max needs a runtime-produced int array", e.raw);
+    const auto initialized = int_initialized_prefix.find(value.slot);
+    if (initialized == int_initialized_prefix.end() ||
+        initialized->second != len)
+      fail("min/max int array is not definitely initialized", e.raw);
+    const auto known = int_ranges.find(value.slot);
+    if (known == int_ranges.end())
+      fail("min/max int array has unproved integral slot values", e.raw);
+    return known->second;
+  }
+
+  std::optional<IntRange> int_operand_range(const mir::Expr& e,
+                                            const Val& value) const {
+    if (e.kind == mir::Expr::LitInt &&
+        e.lit_i >= std::numeric_limits<int32_t>::min() &&
+        e.lit_i <= std::numeric_limits<int32_t>::max())
+      return IntRange{static_cast<int32_t>(e.lit_i),
+                      static_cast<int32_t>(e.lit_i)};
+    const auto known = int_ranges.find(value.slot);
+    if (known == int_ranges.end()) return std::nullopt;
+    return known->second;
+  }
+
+  Val lower_extrema_reduction(const mir::Expr& e, CallArguments& actuals,
+                              const mir::ExtremaCall& call) {
+    actuals.require_arity(1);
+    Val value = actuals.at(0).value();
+    const int64_t len = g.slots[value.slot].len;
+    if (!extrema_storage(call.surface, value) || len < 0)
+      fail("min/max argument is not the whole declared container", e.raw);
+
+    const bool int_array = call.surface == mir::ExtremaSurface::IntArray;
+    const bool active = value.autodiff && !in_write_array;
+    const ReductionGrouping grouping = int_array
+                                           ? ReductionGrouping::Scalar
+                                           : reduction_grouping(value, active);
+    if (grouping == ReductionGrouping::Unknown)
+      fail("min/max expression grouping is not native", e.raw);
+    const bool scalar = grouping == ReductionGrouping::Scalar;
+    const bool phased = grouping == ReductionGrouping::Phased;
+    const IntRange range =
+        int_array ? prove_runtime_int_extrema(e, value, len) : IntRange{};
+    Val result = with_layout(
+        emit_value(OP_EXTREMA_VEC, {value}, 1, view_of(e.type_),
+                   reduction_phase_idata(value, grouping, "min/max")),
+        ExpressionLayout::scalar());
+    if (in_write_array || int_array) result.autodiff = false;
+    // Bit 0 selects max. Bits 1 and 2 are an exclusive grouping selector:
+    // scalar coefficient order and phased packet order respectively.
+    g.ops.back().variant =
+        static_cast<uint8_t>((call.kind == mir::ExtremaKind::Max ? 1u : 0u) |
+                             (scalar ? 2u : 0u) | (phased ? 4u : 0u));
+    if (int_array) {
+      result.si.param_free = false;
+      set_int_range(result, range.lo, range.hi);
+    }
+    return result;
+  }
+
+  Val lower_extrema_pair(const mir::Expr& e, CallArguments& actuals,
+                         mir::ExtremaKind kind) {
+    actuals.require_arity(2);
+    Val x = actuals.at(0).value();
+    Val y = actuals.at(1).value();
+    if (!is_scalar(x) || !is_scalar(y))
+      fail("min/max scalar overload needs two scalar int arguments", e.raw);
+    const bool maximum = kind == mir::ExtremaKind::Max;
+    Val result = with_layout(
+        emit_value(maximum ? OP_FMAX : OP_FMIN, {x, y}, 1, view_of("UInt")),
+        ExpressionLayout::scalar());
+    result.autodiff = false;
+    result.si.param_free = false;
+    const std::optional<IntRange> a = int_operand_range(e.args[0], x);
+    const std::optional<IntRange> b = int_operand_range(e.args[1], y);
+    if (a && b) {
+      set_int_range(result,
+                    maximum ? std::max(a->lo, b->lo) : std::min(a->lo, b->lo),
+                    maximum ? std::max(a->hi, b->hi) : std::min(a->hi, b->hi));
+    } else {
+      set_int_initialized(result);
+    }
+    return result;
+  }
+
+  bool runtime_int_extrema_candidate(const mir::Expr& e) const {
+    const mir::ExtremaCall call = mir::extrema_call(e);
+    if (call.surface == mir::ExtremaSurface::IntArray) {
+      if (e.args[0].kind != mir::Expr::Var) return false;
+      const auto value = scope.find(e.args[0].name);
+      return value != scope.end() && !value->second.si.param_free;
+    }
+    return call.surface == mir::ExtremaSurface::IntPair &&
+           (runtime_int_value(e.args[0]) || runtime_int_value(e.args[1]));
+  }
+
   struct LogicalDims {
     int64_t rows;
     int64_t cols;
@@ -1002,10 +1615,10 @@ struct Lowering {
     fail(what + ": dims is unsupported for a scalar value");
   }
 
-  Val lower_dims(const mir::Expr& e) {
+  Val lower_dims(const mir::Expr& e, CallArguments& actuals) {
     if (e.args.size() != 1) fail("dims arity", e.raw);
     const std::vector<int64_t> dims =
-        logical_shape(lower_expr(e.args[0]), "dims");
+        logical_shape(actuals.at(0).value(), "dims");
     std::vector<double> vals(dims.begin(), dims.end());
     const int slot = add_slot((int64_t)vals.size(), false);
     out.fills.emplace_back(slot, vals);
@@ -1368,7 +1981,7 @@ struct Lowering {
     validate_view(si, (int64_t)vals.size(), "data value " + name);
     const int s = add_slot((int64_t)vals.size(), false);
     out.fills.emplace_back(s, vals);
-    Val v{s, false, si};
+    Val v{s, false, si, owning_layout(si)};
     scope[name] = v;
     observe(v, *en);
     return s;
@@ -1387,7 +2000,8 @@ struct Lowering {
       fail("unsized local read before its first assignment: " + name);
     SlotInfo si = dl->second.si;
     si.param_free = true;
-    Val value{add_slot(dl->second.len, false), dl->second.autodiff, si};
+    Val value{add_slot(dl->second.len, false), dl->second.autodiff, si,
+              owning_layout(si)};
     const double initial =
         dl->second.int_array
             ? static_cast<double>(std::numeric_limits<int>::min())
@@ -1485,6 +2099,7 @@ struct Lowering {
               emit_value(OP_DYNAMIC_SLICE, {base, index}, width, si,
                          {checked_immediate(count, "runtime index extent")});
           value.si.param_free = false;
+          value.layout = owning_layout(value.si);
           return value;
         }
         bool all_single = true;
@@ -1519,8 +2134,10 @@ struct Lowering {
             for (int i : rows) gather.push_back((int)(j * base.si.rows) + i);
           SlotInfo si = matrix_view((int64_t)rows.size(), base.si.cols,
                                     base.si.param_free);
-          return emit_value(OP_GATHER, {base},
-                            (int64_t)rows.size() * base.si.cols, si, gather);
+          return with_layout(
+              emit_value(OP_GATHER, {base}, (int64_t)rows.size() * base.si.cols,
+                         si, gather),
+              ExpressionLayout::scalar());
         }
         // A range over the outermost array dimension is contiguous because
         // graph storage keeps each whole outer element together. Preserve
@@ -1541,9 +2158,12 @@ struct Lowering {
           const std::vector<int64_t> suffix(sh.dims.begin() + 1, sh.dims.end());
           const int64_t width = checked_product(suffix, "array element");
           const int64_t len = checked_product(out_dims, "array range");
-          return emit_value(OP_SLICE, {base}, len,
-                            array_view(std::move(out_dims), sh.leaf),
-                            {(int)(hi >= lo ? (lo - 1) * width : 0)});
+          const int64_t offset = hi >= lo ? (lo - 1) * width : 0;
+          SlotInfo si = array_view(std::move(out_dims), sh.leaf);
+          return with_layout(
+              emit_value(OP_SLICE, {base}, len, si,
+                         {checked_immediate(offset, "array range offset")}),
+              owning_layout(si));
         }
         // Between subrange read on a 1-D value: v[a:b] is contiguous.
         // hi < lo is empty, not negative-length.
@@ -1552,8 +2172,11 @@ struct Lowering {
           const int64_t hi = eval_int(e.args[1].args[1]);
           check_range(lo, hi, g.slots[base.slot].len, "range", e.raw);
           const int64_t len = hi >= lo ? hi - lo + 1 : 0;
-          return emit_value(OP_SLICE, {base}, len, view_of(e.type_),
-                            {(int)(len ? lo - 1 : 0)});
+          const int64_t offset = len ? lo - 1 : 0;
+          return with_layout(
+              emit_value(OP_SLICE, {base}, len, view_of(e.type_),
+                         {checked_immediate(offset, "range offset")}),
+              contiguous_layout(base, offset, "range"));
         }
         // A data gather on a one-dimensional scalar array keeps an exact
         // one-dimensional Array view. More structural forms need strides
@@ -1573,9 +2196,10 @@ struct Lowering {
               fail("array gather out of bounds", e.raw);
             idata.push_back(x - 1);
           }
-          return emit_value(OP_GATHER, {base}, (int64_t)idata.size(),
-                            array_view({(int64_t)idata.size()}, ViewKind::Flat),
-                            idata);
+          SlotInfo si = array_view({(int64_t)idata.size()}, ViewKind::Flat);
+          return with_layout(
+              emit_value(OP_GATHER, {base}, (int64_t)idata.size(), si, idata),
+              owning_layout(si));
         }
         // Gather by a data int array: v[idx].
         if (e.args.size() == 2 && e.args[1].name == "IndexMulti") {
@@ -1591,8 +2215,10 @@ struct Lowering {
             check_index(x, g.slots[base.slot].len, "gather index", e.raw);
             idata.push_back(x - 1);
           }
-          return emit_value(OP_GATHER, {base}, (int64_t)idata.size(),
-                            view_of(e.type_), idata);
+          return with_layout(
+              emit_value(OP_GATHER, {base}, (int64_t)idata.size(),
+                         view_of(e.type_), idata),
+              ExpressionLayout::scalar());
         }
         // Matrix row/column slices use the explicit logical view; physical
         // storage remains column-major even when either extent is zero.
@@ -1600,16 +2226,22 @@ struct Lowering {
             e.args[1].name == "IndexSingle" && e.args[2].name == "IndexAll") {
           const int64_t i = eval_int(e.args[1].args[0]);
           check_index(i, base.si.rows, "matrix row", e.raw);
-          return emit_value(OP_SLICE_STRIDED, {base}, base.si.cols,
-                            view_of(e.type_),
-                            {(int)(i - 1), (int)base.si.rows});
+          return with_layout(
+              emit_value(
+                  OP_SLICE_STRIDED, {base}, base.si.cols, view_of(e.type_),
+                  {checked_immediate(i - 1, "matrix row offset"),
+                   checked_immediate(base.si.rows, "matrix row stride")}),
+              ExpressionLayout::scalar());
         }
         if (e.args.size() == 3 && is_matrix(base.si) &&
             e.args[1].name == "IndexAll" && e.args[2].name == "IndexSingle") {
           const int64_t j = eval_int(e.args[2].args[0]);
           check_index(j, base.si.cols, "matrix column", e.raw);
-          return emit_value(OP_SLICE, {base}, base.si.rows, view_of(e.type_),
-                            {(int)((j - 1) * base.si.rows)});
+          const int64_t offset = (j - 1) * base.si.rows;
+          return with_layout(
+              emit_value(OP_SLICE, {base}, base.si.rows, view_of(e.type_),
+                         {checked_immediate(offset, "matrix column offset")}),
+              contiguous_layout(base, offset, "matrix column"));
         }
         // Column of a canonical graph-order 2-D array (array[N, S] real):
         // each outer element is contiguous, so successive rows sit S apart.
@@ -1619,8 +2251,12 @@ struct Lowering {
           const int64_t k = eval_int(e.args[2].args[0]) - 1;
           const int64_t N = (*bdims)[0], S = (*bdims)[1];
           if (k < 0 || k >= S) fail("array column out of bounds", e.raw);
-          return emit_value(OP_SLICE_STRIDED, {base}, N,
-                            array_view({N}, ViewKind::Flat), {(int)k, (int)S});
+          return with_layout(
+              emit_value(OP_SLICE_STRIDED, {base}, N,
+                         array_view({N}, ViewKind::Flat),
+                         {checked_immediate(k, "array column offset"),
+                          checked_immediate(S, "array column stride")}),
+              ExpressionLayout::scalar());
         }
         // Row range of the same layout: A[i, lo:hi] is contiguous.
         if (e.args.size() == 3 && is_array(base.si) && bdims &&
@@ -1639,8 +2275,15 @@ struct Lowering {
           SlotInfo si = array_shape(base.si).leaf == ViewKind::Flat
                             ? array_view({len}, ViewKind::Flat)
                             : view_of(e.type_);
-          return emit_value(OP_SLICE, {base}, len, si,
-                            {(int)(len ? (i - 1) * S + lo - 1 : 0)});
+          const int64_t offset = len ? (i - 1) * S + lo - 1 : 0;
+          const ExpressionLayout layout =
+              array_shape(base.si).leaf == ViewKind::Flat
+                  ? owning_layout(si)
+                  : ExpressionLayout::direct(len ? lo - 1 : 0);
+          return with_layout(
+              emit_value(OP_SLICE, {base}, len, si,
+                         {checked_immediate(offset, "array row range offset")}),
+              layout);
         }
         // A whole vector leaf selected from array[N] vector[S]. The explicit
         // trailing All survives O1 for this spelling and addresses the same
@@ -1653,8 +2296,12 @@ struct Lowering {
           const int64_t i = eval_int(e.args[1].args[0]);
           const int64_t count = (*bdims)[0], width = (*bdims)[1];
           check_index(i, count, "array index", e.raw);
-          return emit_value(OP_SLICE, {base}, width, view_of(e.type_),
-                            {(int)((i - 1) * width)});
+          const int64_t offset = (i - 1) * width;
+          SlotInfo si = view_of(e.type_);
+          return with_layout(
+              emit_value(OP_SLICE, {base}, width, si,
+                         {checked_immediate(offset, "array vector offset")}),
+              owning_layout(si));
         }
         // Row-range column read M[a:b, j] (contiguous within the column).
         if (e.args.size() == 3 && is_matrix(base.si) &&
@@ -1666,8 +2313,12 @@ struct Lowering {
           check_index(j, base.si.cols, "matrix column", e.raw);
           check_range(lo, hi, base.si.rows, "matrix row range", e.raw);
           const int64_t len = hi >= lo ? hi - lo + 1 : 0;
-          return emit_value(OP_SLICE, {base}, len, view_of(e.type_),
-                            {(int)(len ? (j - 1) * base.si.rows + lo - 1 : 0)});
+          const int64_t offset = len ? (j - 1) * base.si.rows + lo - 1 : 0;
+          return with_layout(
+              emit_value(
+                  OP_SLICE, {base}, len, view_of(e.type_),
+                  {checked_immediate(offset, "matrix row range offset")}),
+              contiguous_layout(base, offset, "matrix row range"));
         }
         // Any two-axis matrix selection the slices above leave is the
         // Cartesian selection M[rows, cols], not a pairwise zip. Preserve
@@ -1697,9 +2348,11 @@ struct Lowering {
           if (e.type_ == "UMatrix")
             si = matrix_view((int64_t)rows.size(), (int64_t)cols.size(),
                              base.si.param_free);
-          return emit_value(OP_GATHER, {base},
-                            (int64_t)rows.size() * (int64_t)cols.size(), si,
-                            gather);
+          return with_layout(
+              emit_value(OP_GATHER, {base},
+                         (int64_t)rows.size() * (int64_t)cols.size(), si,
+                         gather),
+              ExpressionLayout::scalar());
         }
         // Params/locals with recorded dims, laid out by flat_addr above.
         // Matrix views are col-major and never take this array-major path.
@@ -1715,26 +2368,105 @@ struct Lowering {
           }
           const Addr a = flat_addr(D, mat, ix);
           if (a.stride != 1)
-            return emit_value(OP_SLICE_STRIDED, {base}, a.len,
-                              indexed_view(base.si, n_idx, a.len, e.type_),
-                              {(int)a.off, (int)a.stride});
+            return with_layout(
+                emit_value(OP_SLICE_STRIDED, {base}, a.len,
+                           indexed_view(base.si, n_idx, a.len, e.type_),
+                           {checked_immediate(a.off, "indexed offset"),
+                            checked_immediate(a.stride, "indexed stride")}),
+                ExpressionLayout::scalar());
           if (a.len == 1)
-            return emit_value(OP_INDEX, {base}, 1,
-                              indexed_view(base.si, n_idx, 1, e.type_),
-                              {(int)a.off});
+            return with_layout(
+                emit_value(OP_INDEX, {base}, 1,
+                           indexed_view(base.si, n_idx, 1, e.type_),
+                           {checked_immediate(a.off, "indexed offset")}),
+                ExpressionLayout::scalar());
           // One whole matrix out of the array keeps its shape, so a later
           // index on it can take the column-major paths above.
           SlotInfo si = indexed_view(base.si, n_idx, a.len, e.type_);
-          return emit_value(OP_SLICE, {base}, a.len, si, {(int)a.off});
+          return with_layout(
+              emit_value(OP_SLICE, {base}, a.len, si,
+                         {checked_immediate(a.off, "indexed offset")}),
+              owning_layout(si));
+        }
+        // A full array-index prefix pins one vector/row_vector leaf element;
+        // exactly one trailing range/all index then reads inside that leaf.
+        // The prefix is not all-single-index in stanc's own sense (the trailing
+        // index is a range), so this falls outside the block above even
+        // though every array position is fixed. Graph storage keeps the
+        // pinned leaf contiguous, so this is one contiguous read from its
+        // start once flat_addr locates it.
+        if (bdims && (array_shape(base.si).leaf == ViewKind::Vector ||
+                      array_shape(base.si).leaf == ViewKind::RowVector)) {
+          const size_t n_arr = bdims->size() - 1;
+          const mir::Expr& last = e.args.back();
+          bool prefix_single =
+              e.args.size() == n_arr + 2 &&
+              (last.name == "IndexBetween" || last.name == "IndexAll");
+          for (size_t d = 0; prefix_single && d < n_arr; ++d)
+            if (e.args[1 + d].name != "IndexSingle") prefix_single = false;
+          if (prefix_single) {
+            std::vector<int64_t> ix;
+            ix.reserve(n_arr);
+            for (size_t d = 0; d < n_arr; ++d) {
+              const int64_t one = eval_int(e.args[1 + d].args[0]);
+              check_index(one, (*bdims)[d], "array index", e.raw);
+              ix.push_back(one - 1);
+            }
+            const Addr a = flat_addr(*bdims, false, ix);
+            int64_t lo = 1, hi = a.len;
+            if (last.name == "IndexBetween") {
+              lo = eval_int(last.args[0]);
+              hi = eval_int(last.args[1]);
+              check_range(lo, hi, a.len, "array leaf range", e.raw);
+            }
+            const int64_t len = hi >= lo ? hi - lo + 1 : 0;
+            SlotInfo si = view_of(e.type_);
+            const int64_t offset = len ? a.off + lo - 1 : a.off;
+            const ExpressionLayout layout =
+                last.name == "IndexBetween"
+                    ? ExpressionLayout::direct(len ? lo - 1 : 0)
+                    : owning_layout(si);
+            return with_layout(
+                emit_value(
+                    OP_SLICE, {base}, len, si,
+                    {checked_immediate(offset, "array vector slice offset")}),
+                layout);
+          }
+        }
+        // A single outer-array range kept in full, with fixed row/column
+        // indices into every element's matrix: array[N] matrix[R, C][:, i,
+        // j]. Graph storage keeps each matrix contiguous and array-major, so
+        // this is a strided read of one scalar out of every element.
+        if (e.args.size() == 4 && is_array(base.si) && bdims &&
+            bdims->size() == 3 &&
+            array_shape(base.si).leaf == ViewKind::Matrix &&
+            e.args[1].name == "IndexAll" && e.args[2].name == "IndexSingle" &&
+            e.args[3].name == "IndexSingle") {
+          const int64_t N = (*bdims)[0], R = (*bdims)[1], C = (*bdims)[2];
+          const int64_t ri = eval_int(e.args[2].args[0]);
+          const int64_t cj = eval_int(e.args[3].args[0]);
+          check_index(ri, R, "matrix row", e.raw);
+          check_index(cj, C, "matrix column", e.raw);
+          const int64_t off = (cj - 1) * R + (ri - 1);
+          SlotInfo si = array_view({N}, ViewKind::Flat, base.si.param_free);
+          return with_layout(
+              emit_value(
+                  OP_SLICE_STRIDED, {base}, N, si,
+                  {checked_immediate(off, "matrix array cell offset"),
+                   checked_immediate(R * C, "matrix array cell stride")}),
+              owning_layout(si));
         }
         // Row of a column-major data matrix / 2-D array: strided slice.
         if (all_single && e.args.size() == 2 && is_matrix(base.si) &&
             e.type_ != "UReal" && e.type_ != "UInt") {
           const int64_t t = eval_int(e.args[1].args[0]);
           check_index(t, base.si.rows, "matrix row", e.raw);
-          return emit_value(OP_SLICE_STRIDED, {base}, base.si.cols,
-                            view_of(e.type_),
-                            {(int)(t - 1), (int)base.si.rows});
+          return with_layout(
+              emit_value(
+                  OP_SLICE_STRIDED, {base}, base.si.cols, view_of(e.type_),
+                  {checked_immediate(t - 1, "matrix row offset"),
+                   checked_immediate(base.si.rows, "matrix row stride")}),
+              ExpressionLayout::scalar());
         }
         // Data-only slicing with no native path (e.g. one matrix out of a
         // data array of matrices) evaluates at compile time.
@@ -1763,7 +2495,10 @@ struct Lowering {
           desc += " type=" + e.type_;
           fail(desc, e.raw);
         }
-        return emit_value(OP_INDEX, {base}, 1, view_of(e.type_), {(int)flat});
+        return with_layout(
+            emit_value(OP_INDEX, {base}, 1, view_of(e.type_),
+                       {checked_immediate(flat, "index offset")}),
+            ExpressionLayout::scalar());
       }
       case mir::Expr::LitInt: {
         Val v = constant(static_cast<double>(e.lit_i));
@@ -1830,6 +2565,10 @@ struct Lowering {
     // inliner's zero-length sentinel and the region's assignment sized it.
     std::vector<Range> out_views;
     bool has_target = false;  // the region contributed to the target
+    // The region compiled a reject(): it has an observable effect even when
+    // every data live-out is empty, so an emitter must not treat it as
+    // having nothing to produce.
+    bool has_reject = false;
   };
 
   // Does `s` increment the target anywhere?
@@ -1976,6 +2715,7 @@ struct Lowering {
                     Range* expr_out, std::shared_ptr<IslandProg>* prog_out) {
     auto prog = std::make_shared<IslandProg>();
     ProgramCompiler c{*prog, fun_defs};
+    c.in_write_array = in_write_array;
     // Non-returning statement calls may print or reject. A register program
     // would replay them during reverse mode, so ProgramCompiler refuses them
     // until necessity islands have an execute-once effect path.
@@ -2116,9 +2856,15 @@ struct Lowering {
     // and every one of them is zero-width: the data made the values empty,
     // as `matrix[0, 0]` from a dimension table does, so there is nothing
     // for the program to carry out. Finding no live-out at all is the
-    // mistake this catches -- a region that lost what it was to produce.
+    // mistake this catches -- a region that lost what it was to produce --
+    // unless the region's entire purpose was a conditional reject(): that
+    // has no data output by design, its value being the exception it may
+    // throw.
+    reg->has_reject = std::any_of(
+        prog->code.begin(), prog->code.end(),
+        [](const Program::Instr& i) { return i.code == Program::REJECT; });
     if (prog->out_regs.empty() && !(e && expr_out->len == 0) &&
-        (s == nullptr || reg->out_names.empty()))
+        (s == nullptr || reg->out_names.empty()) && !reg->has_reject)
       fail("runtime-control region produces nothing", s ? s->raw : e->raw);
     // A region with a runtime branch keeps the var replay -- reversing
     // control flow needs the structured form the flat program has already
@@ -2228,8 +2974,9 @@ struct Lowering {
     // Nothing to carry out and no target to accumulate: every live-out is
     // zero-width, so the region has no observable effect and its values
     // keep the empty shape they already have outside. A `target +=` would
-    // have put its own register here, so this cannot drop one.
-    if (prog->out_regs.empty()) return;
+    // have put its own register here, so this cannot drop one -- and a
+    // reject() has no live-out by design, so it cannot either.
+    if (prog->out_regs.empty() && !reg.has_reject) return;
     std::vector<int> out_slots;
     emit_island(prog, reg, out_lens, &out_slots);
     // Later statements read the island's results, not the old values.
@@ -2312,11 +3059,20 @@ struct Lowering {
     return {o, autodiff, out_si};
   }
 
+  void check_fixed_input_count(size_t n, uint16_t opcode) {
+    constexpr size_t kMaxInputs = sizeof(Op::in) / sizeof(Op::in[0]);
+    if (n > kMaxInputs)
+      fail("opcode " + std::to_string(opcode) + " has " + std::to_string(n) +
+               " inputs, but Op::in holds only " + std::to_string(kMaxInputs),
+           "");
+  }
+
   // Low-level emission for dynamic slot lists and graph scaffolding whose
   // output dependency is explicit at the call site.
   Val emit_raw(uint16_t opcode, std::vector<int> ins, int64_t out_len,
                SlotInfo out_si, std::vector<int> idata = {}, int out2 = -1,
                bool autodiff = false) {
+    check_fixed_input_count(ins.size(), opcode);
     Op op;
     op.opcode = opcode;
     op.out2 = out2;
@@ -2331,6 +3087,7 @@ struct Lowering {
   Val emit_value(uint16_t opcode, std::initializer_list<Val> ins,
                  int64_t out_len, SlotInfo out_si = {},
                  std::vector<int> idata = {}, int out2 = -1) {
+    check_fixed_input_count(ins.size(), opcode);
     Op op;
     op.opcode = opcode;
     op.out2 = out2;
@@ -2357,9 +3114,24 @@ struct Lowering {
     if (e.kind == mir::Expr::FunApp &&
         e.fn_lib == mir::Expr::Lib::UserDefined && fun_effectful(e.name))
       return true;
+    // reduce_sum reaches its partial-sum function through a Var, so the
+    // UserDefined test above cannot see a print or reject in that body.
+    if (mir::is_reduce_sum(e) && reduce_sum_effectful(e)) return true;
     for (const auto& a : e.args)
       if (expr_effectful(a)) return true;
     return false;
+  }
+
+  bool reduce_sum_effectful(const mir::Expr& e) {
+    if (e.args.empty() || e.args[0].kind != mir::Expr::Var) return true;
+    bool propto = false;
+    const mir::FunDef* f = mir::resolve_reduce_sum_partial(
+        fun_defs, mir::reduce_sum_partial_name(e.args[0].name, &propto),
+        mir::reduce_sum_partial_views(e));
+    // A functor this cannot resolve is refused at lowering. Until it gets
+    // there, assume the worst rather than fold away a call whose body has
+    // never been examined.
+    return f == nullptr || fun_effectful(f->name);
   }
 
   bool stmt_effectful(const mir::Stmt& s) {
@@ -2782,14 +3554,15 @@ struct Lowering {
         graph_order(en, e.type_ == "UMatrix", nested_matrix);
     const int s = add_slot((int64_t)vals.size(), false);
     out.fills.emplace_back(s, vals);
-    Val v{s, false, si};
+    Val v{s, false, si, owning_layout(si)};
     observe(v, std::move(en));
     return v;
   }
 
   // Integer argument of a density/pmf: values must be known at compile
   // time (int data, loop variables, or compile-time expressions).
-  std::vector<int> int_arg_values(const mir::Expr& oc) {
+  std::vector<int> int_arg_values(LoweredArgument& actual) {
+    const mir::Expr& oc = actual.expr();
     if (oc.kind == mir::Expr::Var) {
       DataMap::Entry* en = td.find(oc.name);
       if (en && en->is_int && !en->i.empty()) return en->i;
@@ -2825,22 +3598,6 @@ struct Lowering {
     return si;
   }
 
-  // Two-argument log_sum_exp / log_diff_exp. Stan vectorizes these over
-  // every container shape, so they are elementwise binaries with scalar
-  // broadcast, not reductions -- `log_diff_exp(vector[N], real)` is N
-  // values, not one. mixture.cpp's kernels already dispatch on length
-  // (each argument len 1 or len N, out len N); emitting them at width 1
-  // was what truncated the result, which the assignment then rejected.
-  Val lower_binary_mix(uint16_t opcode, const mir::Expr& e) {
-    Val a = lower_expr(e.args[0]);
-    Val b = lower_expr(e.args[1]);
-    // shape_of rejects two containers whose views disagree; what is left
-    // is one width, or one width and a broadcast scalar.
-    SlotInfo si = shape_of(a, b);
-    const int64_t n = std::max(g.slots[a.slot].len, g.slots[b.slot].len);
-    return emit_value(opcode, {a, b}, n, si);
-  }
-
   // Two-argument scalar math with one int argument
   // (STANLI_SCALAR_BINARY_INT_FIRST_LIST and its SECOND twin): elementwise
   // with scalar broadcast like the all-real binaries, but shape_of does not
@@ -2849,9 +3606,12 @@ struct Lowering {
   // array[,] int)` is an array -- so the result takes the real side's view
   // when it has one and the int side's when the real side is a scalar,
   // which is what the signature list says in every case.
-  Val lower_binary_int(uint16_t opcode, bool int_first, const mir::Expr& e) {
-    Val a = lower_expr(e.args[0]);
-    Val b = lower_expr(e.args[1]);
+  Val lower_binary_int(uint16_t opcode, bool int_first,
+                       CallArguments& actuals) {
+    actuals.require_arity(2);
+    const mir::Expr& e = actuals.call_expr();
+    Val a = actuals.at(0).value();
+    Val b = actuals.at(1).value();
     const Val& re = int_first ? b : a;
     const Val& iv = int_first ? a : b;
     const int64_t lr = g.slots[re.slot].len, li = g.slots[iv.slot].len;
@@ -2874,7 +3634,9 @@ struct Lowering {
           idata = {(int)s.dims[s.dims.size() - 2], (int)s.dims.back()};
       }
     }
-    return emit_value(opcode, {a, b}, std::max(lr, li), si, std::move(idata));
+    return with_layout(
+        emit_value(opcode, {a, b}, std::max(lr, li), si, std::move(idata)),
+        elementwise_layout({a, b}));
   }
 
   // Stan's bound transforms, callable as ordinary functions rather than
@@ -2892,7 +3654,8 @@ struct Lowering {
   // library pairs it either with scalar bounds or with bounds of exactly
   // its own type, and none of them widens a scalar first argument against a
   // container bound.
-  std::optional<Val> lower_bound_transform(const mir::Expr& e) {
+  std::optional<Val> lower_bound_transform(const mir::Expr& e,
+                                           CallArguments& actuals) {
     struct Transform {
       const char* stem;
       uint16_t opcode;
@@ -2915,11 +3678,13 @@ struct Lowering {
       tr = &t;
       direction = tail;
     }
-    if (tr == nullptr || e.args.size() != tr->arity) return std::nullopt;
+    if (tr == nullptr) return std::nullopt;
 
+    actuals.require_arity(tr->arity);
     std::vector<Val> a;
-    a.reserve(e.args.size());
-    for (const mir::Expr& arg : e.args) a.push_back(lower_expr(arg));
+    a.reserve(actuals.size());
+    for (size_t i = 0; i < actuals.size(); ++i)
+      a.push_back(actuals.at(i).value());
     const int64_t n = g.slots[a[0].slot].len;
     SlotInfo si = a[0].si;
     std::vector<int> ins;
@@ -2943,6 +3708,7 @@ struct Lowering {
     // adjoint stays zero, which is exactly the no-lp overload's gradient.
     const int jac = add_slot(1, /*is_param=*/false);
     Val v = emit_raw(tr->opcode, ins, n, si, {}, jac, autodiff);
+    v.layout = owning_layout(si);
     if (direction == "jacobian" && !in_write_array) target_terms.push_back(jac);
     return v;
   }
@@ -2957,10 +3723,12 @@ struct Lowering {
     // wide as the argument; `ub - lb` on two scalars is one value.
     const auto elt = [&](uint16_t op, const Val& x, const Val& y) {
       const int64_t w = std::max(g.slots[x.slot].len, g.slots[y.slot].len);
-      return emit_value(op, {x, y}, w, w == n ? si : SlotInfo{});
+      return with_layout(emit_value(op, {x, y}, w, w == n ? si : SlotInfo{}),
+                         elementwise_layout({x, y}));
     };
     const auto un = [&](uint16_t op, const Val& x) {
-      return emit_value(op, {x}, g.slots[x.slot].len, x.si);
+      return with_layout(emit_value(op, {x}, g.slots[x.slot].len, x.si),
+                         elementwise_layout({x}));
     };
     switch (opcode) {
       case OP_CONSTRAIN_LOWER:  // lb_free: log(y - lb)
@@ -3021,42 +3789,41 @@ struct Lowering {
   // in the caller's scope, bound under the parameter names in a shadowed
   // scope, and the body lowers like any other statements (loops unroll,
   // data-only conditions resolve). Return throws the result value out.
-  Val lower_call_udf(const mir::Expr& e) {
+  Val lower_call_udf(const mir::Expr& e,
+                     const std::function<void()>& before_body = {}) {
     auto it = fun_defs.find(e.name);
     if (it == fun_defs.end()) fail("unknown function " + e.name, e.raw);
     const mir::FunDef& f = *it->second;
-    if (e.args.size() != f.arg_names.size()) fail(e.name + ": arity mismatch");
+    CallArguments actuals(*this, e);
+    actuals.require_arity(f.arg_names.size());
     struct Binding {
       bool is_int = false;
       long iv = 0;
       Val v{-1, false, {}};
       std::optional<DataMap::Entry> data;
+      bool formal_data_only = false;
     };
-    std::vector<Binding> binds(e.args.size());
-    for (size_t i = 0; i < e.args.size(); ++i) {
-      const mir::Expr& a = e.args[i];
+    std::vector<Binding> binds(actuals.size());
+    for (size_t i = 0; i < actuals.size(); ++i) {
+      LoweredArgument& actual = actuals.at(i);
+      const mir::Expr& a = actual.expr();
+      binds[i].formal_data_only =
+          i < f.arg_data_only.size() && f.arg_data_only[i];
       if (a.data_only && a.type_ == "UInt") {
         binds[i].is_int = true;
-        binds[i].iv = eval_int(a);
+        binds[i].iv = actual.require_constant_int("integer argument");
       } else {
-        binds[i].v = lower_expr(a);
-      }
-      if (!binds[i].is_int && binds[i].v.slot >= 0) {
-        if (const DataMap::Entry* en = observation(binds[i].v))
+        binds[i].v = actual.value();
+        if (const DataMap::Entry* en = actual.observation())
           binds[i].data = *en;
       }
-      if (!binds[i].data) {
-        if (auto evaluated = try_eval_pure(a)) {
-          binds[i].data = std::move(*evaluated);
-          if (!binds[i].is_int && binds[i].v.slot >= 0)
-            observe(binds[i].v, *binds[i].data);
-        }
-      }
-      const bool formal_data = i < f.arg_data_only.size() && f.arg_data_only[i];
-      if (!in_write_array && formal_data && !binds[i].is_int &&
+      if (!in_write_array && binds[i].formal_data_only && !binds[i].is_int &&
           (binds[i].v.autodiff || !binds[i].v.si.param_free))
         fail(e.name + ": data-only argument depends on a parameter", e.raw);
     }
+    // Higher-order calls may validate after evaluating all actual arguments
+    // but before entering the user body (reduce_sum's grainsize check).
+    if (before_body) before_body();
     if (++udf_depth > 64) {
       --udf_depth;
       fail("UDF recursion too deep in " + e.name);
@@ -3125,18 +3892,18 @@ struct Lowering {
     ret.autodiff = e.unsized.leaf != mir::UnsizedLeaf::Int && udf_autodiff_ctx;
     restore();
     if (!returned) fail(e.name + ": no return value on the executed path");
+    ret.layout = owning_layout(ret.si);
     return ret;
   }
 
-  std::optional<Val> lower_multi_normal_rng(const mir::Expr& e) {
-    if (e.name != "multi_normal_rng") return std::nullopt;
+  Val lower_multi_normal_rng(const mir::Expr& e, CallArguments& actuals) {
     if (!in_write_array)
       fail("multi_normal_rng is supported only in generated quantities", e.raw);
     if (e.args.size() != 2 || e.type_ != "UVector" ||
         e.unsized.leaf != mir::UnsizedLeaf::Vector || e.unsized.depth != 0)
       fail("multi_normal_rng: expected one vector result", e.raw);
-    const mir::Expr& location_expr = e.args[0];
-    const mir::Expr& covariance_expr = e.args[1];
+    const mir::Expr& location_expr = actuals.at(0).expr();
+    const mir::Expr& covariance_expr = actuals.at(1).expr();
     if (location_expr.type_ != "UVector" ||
         location_expr.unsized.leaf != mir::UnsizedLeaf::Vector ||
         location_expr.unsized.depth != 0)
@@ -3146,8 +3913,8 @@ struct Lowering {
         covariance_expr.unsized.depth != 0)
       fail("multi_normal_rng: expected one covariance matrix", e.raw);
 
-    Val location = lower_expr(location_expr);
-    Val covariance = lower_expr(covariance_expr);
+    Val location = actuals.at(0).value();
+    Val covariance = actuals.at(1).value();
     if (!is_vector(location.si))
       fail("multi_normal_rng: location is not a logical vector", e.raw);
     if (!is_matrix(covariance.si))
@@ -3158,30 +3925,59 @@ struct Lowering {
         g.slots[covariance.slot].len != checked_product({k, k}, "covariance"))
       fail("multi_normal_rng: covariance shape must match the location", e.raw);
 
-    Val draw = emit_value(OP_RNG, {location, covariance}, k, view_of(e.type_),
-                          {static_cast<int>(k)});
+    Val draw = with_layout(emit_value(OP_RNG, {location, covariance}, k,
+                                      view_of(e.type_), {static_cast<int>(k)}),
+                           ExpressionLayout::direct());
     g.ops.back().variant = kMultiNormalRngVariant;
     draw.si.param_free = false;
     draw.autodiff = false;
     return draw;
   }
 
-  std::optional<Val> lower_categorical_rng(const mir::Expr& e) {
-    if (e.name != "categorical_rng") return std::nullopt;
+  Val lower_dirichlet_rng(const mir::Expr& e, CallArguments& actuals) {
+    if (!in_write_array)
+      fail("dirichlet_rng is supported only in generated quantities", e.raw);
+    if (e.args.size() != 1 || e.type_ != "UVector" ||
+        e.unsized.leaf != mir::UnsizedLeaf::Vector || e.unsized.depth != 0)
+      fail("dirichlet_rng: expected one vector result", e.raw);
+    const mir::Expr& alpha_expr = actuals.at(0).expr();
+    if (alpha_expr.type_ != "UVector" ||
+        alpha_expr.unsized.leaf != mir::UnsizedLeaf::Vector ||
+        alpha_expr.unsized.depth != 0)
+      fail("dirichlet_rng: expected one concentration vector", e.raw);
+
+    Val alpha = actuals.at(0).value();
+    if (!is_vector(alpha.si))
+      fail("dirichlet_rng: argument is not a logical vector", e.raw);
+    const int64_t k = g.slots[alpha.slot].len;
+    if (k <= 0 || k > std::numeric_limits<int>::max())
+      fail("dirichlet_rng: concentration vector must have a positive length",
+           e.raw);
+
+    Val draw = with_layout(emit_value(OP_RNG, {alpha}, k, view_of(e.type_)),
+                           ExpressionLayout::direct());
+    g.ops.back().variant = kDirichletRngVariant;
+    draw.si.param_free = false;
+    draw.autodiff = false;
+    return draw;
+  }
+
+  Val lower_categorical_rng(const mir::Expr& e, CallArguments& actuals) {
     if (!in_write_array)
       fail("categorical_rng is supported only in generated quantities", e.raw);
     if (e.args.size() != 1 || e.type_ != "UInt" ||
         e.unsized.leaf != mir::UnsizedLeaf::Int || e.unsized.depth != 0)
       fail("categorical_rng: expected one scalar int result", e.raw);
-    const mir::Expr& probabilities = e.args[0];
+    const mir::Expr& probabilities = actuals.at(0).expr();
     if (probabilities.type_ != "UVector" || probabilities.unsized.depth != 0 ||
         probabilities.unsized.leaf != mir::UnsizedLeaf::Vector)
       fail("categorical_rng: expected one probability-vector argument", e.raw);
 
-    Val argument = lower_expr(probabilities);
+    Val argument = actuals.at(0).value();
     if (!is_vector(argument.si))
       fail("categorical_rng: argument is not a logical vector", e.raw);
-    Val draw = emit_value(OP_RNG, {argument}, 1, view_of(e.type_));
+    Val draw = with_layout(emit_value(OP_RNG, {argument}, 1, view_of(e.type_)),
+                           ExpressionLayout::scalar());
     g.ops.back().variant = kCategoricalRngVariant;
     // A successful call returns a Stan int, but deliberately do not widen
     // this tranche into runtime-sum range reasoning. Survey only needs the
@@ -3192,22 +3988,12 @@ struct Lowering {
     return draw;
   }
 
-  std::optional<Val> lower_scalar_rng(const mir::Expr& e) {
-    static const std::map<std::string, ScalarRng> kFamilies = {
-        {"poisson_log_rng", ScalarRng::PoissonLog},
-        {"uniform_rng", ScalarRng::Uniform},
-        {"bernoulli_rng", ScalarRng::Bernoulli},
-        {"normal_rng", ScalarRng::Normal},
-        {"lognormal_rng", ScalarRng::Lognormal},
-        {"binomial_rng", ScalarRng::Binomial},
-    };
-    const auto found = kFamilies.find(e.name);
-    if (found == kFamilies.end()) return std::nullopt;
+  Val lower_scalar_rng(const mir::Expr& e, CallArguments& actuals,
+                       ScalarRng family) {
     if (!in_write_array)
       fail(e.name + " is supported only in generated quantities", e.raw);
-    const ScalarRng family = found->second;
     const size_t arity = scalar_rng_arity(family);
-    if (e.args.size() != arity || e.unsized.depth != 0)
+    if (actuals.size() != arity || e.unsized.depth != 0)
       fail(e.name + ": expected scalar result and " + std::to_string(arity) +
                " scalar argument(s)",
            e.raw);
@@ -3216,25 +4002,30 @@ struct Lowering {
                                              : mir::UnsizedLeaf::Real;
     if (e.unsized.leaf != result_leaf)
       fail(e.name + ": result type does not match RNG family", e.raw);
-    // Unlike the other scalar families, binomial's first argument is a
-    // population count. Valid stanc MIR always marks it UInt; fail closed on
-    // malformed hand-authored MIR rather than silently truncating a real in
-    // the runtime helper's graph-storage conversion.
-    if (family == ScalarRng::Binomial &&
-        e.args[0].unsized.leaf != mir::UnsizedLeaf::Int)
-      fail("binomial_rng: first argument must be int", e.raw);
+    // Unlike the other scalar families, binomial's (and beta_binomial's)
+    // first argument is a population count. Valid stanc MIR always marks it
+    // UInt; fail closed on malformed hand-authored MIR rather than silently
+    // truncating a real in the runtime helper's graph-storage conversion.
+    if ((family == ScalarRng::Binomial || family == ScalarRng::BetaBinomial) &&
+        actuals.at(0).expr().unsized.leaf != mir::UnsizedLeaf::Int)
+      fail(e.name + ": first argument must be int", e.raw);
     std::vector<Val> args;
     args.reserve(arity);
-    for (const mir::Expr& arg : e.args) {
+    for (size_t i = 0; i < actuals.size(); ++i) {
+      const mir::Expr& arg = actuals.at(i).expr();
       if (arg.unsized.depth != 0)
         fail(e.name + ": container arguments stay on WaInterp", e.raw);
-      args.push_back(lower_expr(arg));
+      args.push_back(actuals.at(i).value());
       if (!is_scalar(args.back()))
         fail(e.name + ": container arguments stay on WaInterp", e.raw);
     }
-    Val draw = arity == 1 ? emit_value(OP_RNG, {args[0]}, 1, view_of(e.type_))
-                          : emit_value(OP_RNG, {args[0], args[1]}, 1,
-                                       view_of(e.type_));
+    Val draw = with_layout(
+        arity == 1 ? emit_value(OP_RNG, {args[0]}, 1, view_of(e.type_))
+        : arity == 2
+            ? emit_value(OP_RNG, {args[0], args[1]}, 1, view_of(e.type_))
+            : emit_value(OP_RNG, {args[0], args[1], args[2]}, 1,
+                         view_of(e.type_)),
+        ExpressionLayout::scalar());
     g.ops.back().variant = static_cast<uint8_t>(family);
     // An effect is never a graph constant, even when all distribution
     // parameters are. This also keeps downstream compile-time demands from
@@ -3268,7 +4059,8 @@ struct Lowering {
   }
 
   bool runtime_int_binding(const mir::Expr& e) {
-    return expr_effectful(e) || runtime_int_sum_candidate(e);
+    return expr_effectful(e) || runtime_int_sum_candidate(e) ||
+           runtime_int_extrema_candidate(e);
   }
 
   bool runtime_int_value(const mir::Expr& e) const {
@@ -3287,50 +4079,7 @@ struct Lowering {
     return false;
   }
 
-  static bool prod_transpose_of(const mir::Expr& e, mir::Expr::Kind kind) {
-    return e.kind == mir::Expr::FunApp && e.fn_lib == mir::Expr::Lib::StanLib &&
-           e.args.size() == 1 &&
-           (e.name == "Transpose__" || e.name == "transpose") &&
-           e.args[0].kind == kind;
-  }
-
-  bool prod_literal_length(const mir::Expr& e) const {
-    if (e.kind == mir::Expr::LitInt) return true;
-    return e.kind == mir::Expr::Var && int_env.count(e.name) != 0;
-  }
-
-  bool prod_minus_operand(const mir::Expr& e) const {
-    // Promotion is transparent in the reader, so a promoted scalar literal
-    // still has its LitInt/LitReal kind here.
-    if (e.unsized.depth == 0 &&
-        (e.kind == mir::Expr::LitInt || e.kind == mir::Expr::LitReal))
-      return true;
-    if (e.kind == mir::Expr::FunApp && e.fn_lib == mir::Expr::Lib::StanLib &&
-        e.name == "rep_vector" && e.args.size() == 2 &&
-        (e.args[0].kind == mir::Expr::LitInt ||
-         e.args[0].kind == mir::Expr::LitReal) &&
-        prod_literal_length(e.args[1]))
-      return true;
-    const bool vector_leaf =
-        e.unsized.depth == 0 && (e.unsized.leaf == mir::UnsizedLeaf::Vector ||
-                                 e.unsized.leaf == mir::UnsizedLeaf::RowVector);
-    if (!vector_leaf) return false;
-    if (e.kind == mir::Expr::Var) return true;
-    if (e.kind == mir::Expr::Indexed) return mir::is_matrix_row_value(e);
-    if (prod_transpose_of(e, mir::Expr::Var)) return true;
-    return mir::is_matrix_row_value(e);
-  }
-
-  bool prod_native_surface(const mir::Expr& e) const {
-    if (e.kind == mir::Expr::Var || prod_transpose_of(e, mir::Expr::Var))
-      return true;
-    if (e.kind != mir::Expr::FunApp || e.fn_lib != mir::Expr::Lib::StanLib ||
-        e.args.size() != 2 || e.name != "Minus__")
-      return false;
-    return prod_minus_operand(e.args[0]) && prod_minus_operand(e.args[1]);
-  }
-
-  Val lower_runtime_int_sum(const mir::Expr& e) {
+  Val lower_runtime_int_sum(const mir::Expr& e, CallArguments& actuals) {
     if (!in_write_array)
       fail("runtime integer sum is supported only in generated quantities",
            e.raw);
@@ -3340,7 +4089,8 @@ struct Lowering {
           "and a scalar int result",
           e.raw);
 
-    Val a = lower_expr(e.args[0]);
+    actuals.require_arity(1);
+    Val a = actuals.at(0).value();
     if (!is_array(a.si))
       fail("runtime integer sum argument is not an array", e.raw);
     const ArrayShape& shape = array_shape(a.si);
@@ -3373,7 +4123,8 @@ struct Lowering {
                 static_cast<uint64_t>(range.hi))
       fail("runtime integer sum may overflow int32 in a partial sum", e.raw);
 
-    Val result = emit_value(OP_SUM_VEC, {a}, 1, view_of("UInt"));
+    Val result = with_layout(emit_value(OP_SUM_VEC, {a}, 1, view_of("UInt")),
+                             ExpressionLayout::scalar());
     result.autodiff = false;
     // A range is only a static proof; the source itself was required to be
     // runtime-produced.  Keeping this result non-constant prevents later
@@ -3390,9 +4141,10 @@ struct Lowering {
   // runtime callback at all (and is exercised by stanc3's mother model).
   // Nonempty calls deliberately keep falling through to the unsupported
   // function diagnostic.
-  std::optional<Val> lower_empty_map_rect(const mir::Expr& e) {
+  std::optional<Val> lower_empty_map_rect(const mir::Expr& e,
+                                          CallArguments& actuals) {
     if (e.name != "map_rect") return std::nullopt;
-    if (e.args.size() != 5)
+    if (actuals.size() != 5)
       fail(
           "map_rect: expected function, shared parameters, job parameters, "
           "real data, and integer data",
@@ -3402,11 +4154,12 @@ struct Lowering {
     // before map_rect can take its empty-job return.  Plain zero-length
     // locals have no materialized slot, so their declared view is enough.
     SlotInfo shared_si;
-    if (e.args[1].kind == mir::Expr::Var) {
-      auto declared = decls.find(e.args[1].name);
+    const mir::Expr& shared_expr = actuals.at(1).expr();
+    if (shared_expr.kind == mir::Expr::Var) {
+      auto declared = decls.find(shared_expr.name);
       if (declared != decls.end()) shared_si = declared->second.si;
     }
-    if (!is_vector(shared_si)) shared_si = lower_expr(e.args[1]).si;
+    if (!is_vector(shared_si)) shared_si = actuals.at(1).value().si;
     if (!is_vector(shared_si))
       fail("map_rect: shared parameters are not a vector", e.raw);
 
@@ -3415,11 +4168,12 @@ struct Lowering {
     // map_rect does not read it on this branch, so consult decls before
     // asking lower_expr for a slot (mother's `tmp2` has exactly this form).
     SlotInfo job_si;
-    if (e.args[2].kind == mir::Expr::Var) {
-      auto declared = decls.find(e.args[2].name);
+    const mir::Expr& job_expr = actuals.at(2).expr();
+    if (job_expr.kind == mir::Expr::Var) {
+      auto declared = decls.find(job_expr.name);
       if (declared != decls.end()) job_si = declared->second.si;
     }
-    if (!is_array(job_si)) job_si = lower_expr(e.args[2]).si;
+    if (!is_array(job_si)) job_si = actuals.at(2).value().si;
     if (!is_array(job_si)) return std::nullopt;
     const ArrayShape& job_shape = array_shape(job_si);
     const size_t job_outer =
@@ -3428,8 +4182,8 @@ struct Lowering {
         job_shape.dims.front() != 0)
       return std::nullopt;
 
-    Val real_data = lower_expr(e.args[3]);
-    Val int_data = lower_expr(e.args[4]);
+    Val real_data = actuals.at(3).value();
+    Val int_data = actuals.at(4).value();
     if (!is_array(real_data.si) || !is_array(int_data.si))
       fail("map_rect: job data arguments are not arrays", e.raw);
     const ArrayShape& real_shape = array_shape(real_data.si);
@@ -3447,12 +4201,234 @@ struct Lowering {
     si.param_free = true;
     const int slot = add_slot(0, false);
     out.fills.emplace_back(slot, std::vector<double>{});
-    return Val{slot, false, si};
+    return Val{slot, false, si, owning_layout(si)};
+  }
+
+  mir::Expr slice_bound_literal(int64_t value, const std::string& raw) {
+    if (value > std::numeric_limits<int32_t>::max())
+      fail("reduce_sum: slice bound exceeds the Stan integer range", raw);
+    mir::Expr literal;
+    literal.kind = mir::Expr::LitInt;
+    literal.lit_i = static_cast<long>(value);
+    literal.lit = static_cast<double>(value);
+    literal.type_ = "UInt";
+    literal.unsized = {0, mir::UnsizedLeaf::Int};
+    literal.data_only = true;
+    literal.raw = raw;
+    return literal;
+  }
+
+  // reduce_sum(f, sliced, grainsize, shared...) sums f over the terms of a
+  // partition of `sliced`, and its contract is that the partition is
+  // unobservable: the terms must sum to the same value however the slice is
+  // cut. Stan Math without STAN_THREADS takes that freedom to its limit and
+  // makes exactly one call over the whole slice, returning zero for an empty
+  // one (prim/functor/reduce_sum.hpp). stanli has no threading, so it lowers
+  // to that same single call. That is not an approximation to be reconciled
+  // later: it agrees with default CmdStan term for term, and it is also the
+  // fastest shape available here, because cutting the slice would shorten
+  // the callee's vectorized densities and buy nothing back.
+  //
+  // Written out, the call is an ordinary user-function call, so this rewrites
+  // it to f(sliced, 1, size(sliced), shared...) and hands that to the
+  // inliner, which already owns argument binding, propto threading, and the
+  // data-only formal rules.
+  Val lower_reduce_sum(const mir::Expr& e, CallArguments& actuals) {
+    if (actuals.size() < 3)
+      fail(
+          "reduce_sum: expected a partial-sum function, a sliced argument, "
+          "and a grainsize",
+          e.raw);
+    const mir::Expr& partial_expr = actuals.at(0).expr();
+    if (partial_expr.kind != mir::Expr::Var)
+      fail("reduce_sum: the partial-sum argument is not a function name",
+           e.raw);
+    if (e.unsized.depth != 0 || e.unsized.leaf != mir::UnsizedLeaf::Real)
+      fail("reduce_sum: result is not a real", e.raw);
+
+    Val slice = actuals.at(1).value();
+    if (!is_array(slice.si))
+      fail("reduce_sum: the sliced argument is not an array", e.raw);
+    // Grainsize does not choose a partition here, but evaluating it and
+    // checking positivity are still observable. Do not swallow a failed
+    // compile-time probe or execute effectful expressions while lowering.
+    // Keep pure data integer operations on the interpreter path: operations
+    // such as divide(int, int) need not have a runtime graph kernel. Failed
+    // folding still lowers (or refuses) the expression; it never drops it.
+    const auto folded_grainsize = actuals.at(2).try_fold();
+    const Val grainsize =
+        folded_grainsize ? *folded_grainsize : actuals.at(2).value();
+    const mir::Expr& grainsize_expr = actuals.at(2).expr();
+    if (grainsize_expr.unsized.depth != 0 ||
+        grainsize_expr.unsized.leaf != mir::UnsizedLeaf::Int ||
+        !is_scalar(grainsize))
+      fail("reduce_sum: grainsize is not an integer scalar", e.raw);
+    const auto check_grainsize = [&] {
+      auto spec = std::make_shared<BoundCheckSpec>();
+      spec->name = "reduce_sum grainsize";
+      spec->bound_is_scalar = true;
+      spec->shapes_match = true;
+      (void)emit_value(OP_CHECK_LOWER, {grainsize, constant(1.0)}, 1);
+      g.ops.back().udata = spec.get();
+      g.udata_pool.push_back(std::move(spec));
+    };
+    const int64_t n = array_shape(slice.si).dims.front();
+    if (n == 0) {
+      // C++ evaluates shared arguments before reduce_sum can return zero.
+      // Only the partial-sum body is skipped for an empty slice.
+      for (size_t i = 3; i < actuals.size(); ++i) (void)actuals.at(i).value();
+      check_grainsize();
+      return constant(0.0);
+    }
+
+    bool propto = false;
+    const std::string base =
+        mir::reduce_sum_partial_name(partial_expr.name, &propto);
+    const std::vector<mir::UnsizedView> views =
+        mir::reduce_sum_partial_views(e);
+    const mir::FunDef* f =
+        mir::resolve_reduce_sum_partial(fun_defs, base, views);
+    if (f == nullptr)
+      fail("reduce_sum: unknown partial-sum function " + base, e.raw);
+    if (f->arg_views.size() != views.size())
+      fail("reduce_sum: " + base + " takes " +
+               std::to_string(f->arg_views.size()) +
+               " arguments, but reduce_sum calls it with " +
+               std::to_string(views.size()),
+           e.raw);
+    if (f->arg_views[1].depth != 0 ||
+        f->arg_views[1].leaf != mir::UnsizedLeaf::Int ||
+        f->arg_views[2].depth != 0 ||
+        f->arg_views[2].leaf != mir::UnsizedLeaf::Int)
+      fail(
+          "reduce_sum: " + base + " must take the two slice bounds as integers",
+          e.raw);
+
+    // Bind the lowered slice under a name no Stan identifier can collide
+    // with, so the rewritten call can name it instead of lowering the slice
+    // expression a second time. resolve_overloads borrows Stan's syntax for
+    // the same purpose.
+    const std::string bound =
+        "(reduce_sum slice " + std::to_string(reduce_sum_slices++) + ")";
+    scope[bound] = slice;
+    decls[bound] = DeclView{g.slots[slice.slot].len, slice.autodiff, slice.si,
+                            false, false};
+
+    mir::Expr call;
+    call.kind = mir::Expr::FunApp;
+    call.fn_lib = mir::Expr::Lib::UserDefined;
+    call.name = f->name;
+    // lower_call_udf reads this exactly as CmdStan reads the generated
+    // functor's propto__ argument: an `_lupdf` functor inherits the caller's
+    // normalization, an `_lpdf` one forces the normalized density.
+    call.fn_propto = propto;
+    call.type_ = e.type_;
+    call.unsized = e.unsized;
+    call.data_only = e.data_only;
+    call.raw = e.raw;
+    call.args.reserve(views.size());
+    mir::Expr sliced;
+    sliced.kind = mir::Expr::Var;
+    sliced.name = bound;
+    const mir::Expr& slice_expr = actuals.at(1).expr();
+    sliced.type_ = slice_expr.type_;
+    sliced.unsized = slice_expr.unsized;
+    sliced.data_only = slice_expr.data_only;
+    sliced.raw = slice_expr.raw;
+    call.args.push_back(std::move(sliced));
+    call.args.push_back(slice_bound_literal(1, e.raw));
+    call.args.push_back(slice_bound_literal(n, e.raw));
+    for (size_t i = 3; i < actuals.size(); ++i)
+      call.args.push_back(actuals.at(i).expr());
+
+    Val result{-1, false, {}};
+    try {
+      result = lower_call_udf(call, check_grainsize);
+    } catch (...) {
+      scope.erase(bound);
+      decls.erase(bound);
+      throw;
+    }
+    scope.erase(bound);
+    decls.erase(bound);
+    return result;
+  }
+
+  Val lower_append_array(const mir::Expr& e, CallArguments& actuals) {
+    actuals.require_arity(2);
+    Val a = actuals.at(0).value();
+    Val b = actuals.at(1).value();
+    if (!is_array(a.si) || !is_array(b.si))
+      fail("append_array: arguments must be arrays", e.raw);
+    const ArrayShape& ash = array_shape(a.si);
+    const ArrayShape& bsh = array_shape(b.si);
+    if (ash.dims.empty() || bsh.dims.empty() ||
+        ash.dims.size() != bsh.dims.size() || ash.leaf != bsh.leaf)
+      fail("append_array: element shapes must match", e.raw);
+    const int64_t a_outer = ash.dims[0], b_outer = bsh.dims[0];
+    // stan-math checks element geometry only when both sides contain an
+    // element. An empty side contributes no value whose shape could
+    // disagree, and the nonempty side supplies the result's suffix.
+    if (a_outer != 0 && b_outer != 0 &&
+        !std::equal(ash.dims.begin() + 1, ash.dims.end(), bsh.dims.begin() + 1,
+                    bsh.dims.end()))
+      fail("append_array: element shapes must match", e.raw);
+    if (a_outer > std::numeric_limits<int64_t>::max() - b_outer)
+      fail("append_array: outer extent overflows", e.raw);
+    const int64_t alen = g.slots[a.slot].len;
+    const int64_t blen = g.slots[b.slot].len;
+    if (alen > std::numeric_limits<int64_t>::max() - blen)
+      fail("append_array: storage length overflows", e.raw);
+    std::vector<int64_t> dims =
+        a_outer == 0 && b_outer != 0 ? bsh.dims : ash.dims;
+    dims[0] = a_outer + b_outer;
+    const int64_t suffix_count =
+        checked_product(std::vector<int64_t>(dims.begin() + 1, dims.end()),
+                        "append_array element shape");
+    SlotInfo si = array_view(std::move(dims), ash.leaf);
+    Val joined = with_layout(emit_value(OP_CONCAT2, {a, b}, alen + blen, si),
+                             owning_layout(si));
+
+    // Preserve exact data values for compile-time integer loops and index
+    // expressions. Integer arrays are always data-only in Stan, but this
+    // also keeps real data arrays available to the ordinary const folder.
+    const DataMap::Entry* ao = observation(a);
+    const DataMap::Entry* bo = observation(b);
+    if (ao && bo && ao->is_int == bo->is_int) {
+      DataMap::Entry en;
+      en.is_int = ao->is_int;
+      en.r.reserve((size_t)(alen + blen));
+      // DataMap is first-index-fast, unlike the graph's outer-major array
+      // storage. Concatenation along dimension zero therefore interleaves
+      // the two outer-axis blocks once for every suffix coordinate.
+      const int64_t observation_lanes =
+          a_outer + b_outer == 0 ? 0 : suffix_count;
+      for (int64_t lane = 0; lane < observation_lanes; ++lane) {
+        const auto ab = ao->r.begin() + lane * a_outer;
+        const auto bb = bo->r.begin() + lane * b_outer;
+        en.r.insert(en.r.end(), ab, ab + a_outer);
+        en.r.insert(en.r.end(), bb, bb + b_outer);
+      }
+      if (en.is_int) {
+        en.i.reserve((size_t)(alen + blen));
+        for (int64_t lane = 0; lane < observation_lanes; ++lane) {
+          const auto ab = ao->i.begin() + lane * a_outer;
+          const auto bb = bo->i.begin() + lane * b_outer;
+          en.i.insert(en.i.end(), ab, ab + a_outer);
+          en.i.insert(en.i.end(), bb, bb + b_outer);
+        }
+        set_int_initialized(joined);
+        if (!en.i.empty()) {
+          const auto bounds = std::minmax_element(en.i.begin(), en.i.end());
+          set_int_range(joined, *bounds.first, *bounds.second);
+        }
+      }
+      observe(joined, std::move(en));
+    }
+    return joined;
   }
 
   Val lower_funapp(const mir::Expr& e) {
-    if (e.fn_lib == mir::Expr::Lib::StanLib && e.name == "dims")
-      return lower_dims(e);
     if (e.fn_lib == mir::Expr::Lib::UserDefined) {
       if (auto v = fold_const(e)) return *v;
       return lower_call_udf(e);
@@ -3468,7 +4444,7 @@ struct Lowering {
       if (parts.empty()) {
         SlotInfo empty;
         empty.param_free = true;
-        acc = Val{add_slot(0, false), false, empty};
+        acc = Val{add_slot(0, false), false, empty, owning_layout(empty)};
         out.fills.emplace_back(acc.slot, std::vector<double>{});
       } else {
         acc = parts[0];
@@ -3539,103 +4515,82 @@ struct Lowering {
           observe(acc, std::move(*evaluated));
         }
       }
+      acc.layout = owning_layout(acc.si);
       return acc;
     }
     if (e.fn_lib != mir::Expr::Lib::StanLib) {
       if (auto v = fold_const(e)) return *v;
       fail("unsupported function kind for " + e.name, e.raw);
     }
-    if (auto v = lower_empty_map_rect(e)) return *v;
-    // The stan-library names split into disjoint groups; each helper owns
-    // one and declines the rest.
-    if (auto v = lower_multi_normal_rng(e)) return *v;
-    if (auto v = lower_categorical_rng(e)) return *v;
-    if (auto v = lower_scalar_rng(e)) return *v;
-    if (auto v = lower_density_fn(e)) return *v;
-    if (auto v = lower_bound_transform(e)) return *v;
-    if (auto v = lower_eltwise_fn(e)) return *v;
-    if (e.name == "append_array" && e.args.size() == 2) {
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
-      if (!is_array(a.si) || !is_array(b.si))
-        fail("append_array: arguments must be arrays", e.raw);
-      const ArrayShape& ash = array_shape(a.si);
-      const ArrayShape& bsh = array_shape(b.si);
-      if (ash.dims.empty() || bsh.dims.empty() ||
-          ash.dims.size() != bsh.dims.size() || ash.leaf != bsh.leaf)
-        fail("append_array: element shapes must match", e.raw);
-      const int64_t a_outer = ash.dims[0], b_outer = bsh.dims[0];
-      // stan-math checks element geometry only when both sides contain an
-      // element. An empty side contributes no value whose shape could
-      // disagree, and the nonempty side supplies the result's suffix.
-      if (a_outer != 0 && b_outer != 0 &&
-          !std::equal(ash.dims.begin() + 1, ash.dims.end(),
-                      bsh.dims.begin() + 1, bsh.dims.end()))
-        fail("append_array: element shapes must match", e.raw);
-      if (a_outer > std::numeric_limits<int64_t>::max() - b_outer)
-        fail("append_array: outer extent overflows", e.raw);
-      const int64_t alen = g.slots[a.slot].len;
-      const int64_t blen = g.slots[b.slot].len;
-      if (alen > std::numeric_limits<int64_t>::max() - blen)
-        fail("append_array: storage length overflows", e.raw);
-      std::vector<int64_t> dims =
-          a_outer == 0 && b_outer != 0 ? bsh.dims : ash.dims;
-      dims[0] = a_outer + b_outer;
-      const int64_t suffix_count =
-          checked_product(std::vector<int64_t>(dims.begin() + 1, dims.end()),
-                          "append_array element shape");
-      SlotInfo si = array_view(std::move(dims), ash.leaf);
-      Val joined = emit_value(OP_CONCAT2, {a, b}, alen + blen, si);
-
-      // Preserve exact data values for compile-time integer loops and index
-      // expressions. Integer arrays are always data-only in Stan, but this
-      // also keeps real data arrays available to the ordinary const folder.
-      const DataMap::Entry* ao = observation(a);
-      const DataMap::Entry* bo = observation(b);
-      if (ao && bo && ao->is_int == bo->is_int) {
-        DataMap::Entry en;
-        en.is_int = ao->is_int;
-        en.r.reserve((size_t)(alen + blen));
-        // DataMap is first-index-fast, unlike the graph's outer-major array
-        // storage. Concatenation along dimension zero therefore interleaves
-        // the two outer-axis blocks once for every suffix coordinate.
-        const int64_t observation_lanes =
-            a_outer + b_outer == 0 ? 0 : suffix_count;
-        for (int64_t lane = 0; lane < observation_lanes; ++lane) {
-          const auto ab = ao->r.begin() + lane * a_outer;
-          const auto bb = bo->r.begin() + lane * b_outer;
-          en.r.insert(en.r.end(), ab, ab + a_outer);
-          en.r.insert(en.r.end(), bb, bb + b_outer);
-        }
-        if (en.is_int) {
-          en.i.reserve((size_t)(alen + blen));
-          for (int64_t lane = 0; lane < observation_lanes; ++lane) {
-            const auto ab = ao->i.begin() + lane * a_outer;
-            const auto bb = bo->i.begin() + lane * b_outer;
-            en.i.insert(en.i.end(), ab, ab + a_outer);
-            en.i.insert(en.i.end(), bb, bb + b_outer);
-          }
-          set_int_initialized(joined);
-          if (!en.i.empty()) {
-            const auto bounds = std::minmax_element(en.i.begin(), en.i.end());
-            set_int_range(joined, *bounds.first, *bounds.second);
-          }
-        }
-        observe(joined, std::move(en));
-      }
-      return joined;
+    // Nullary math constants stanc's optimizer will not fold because their
+    // value is non-finite (or, for machine_precision, platform-specific).
+    // They are plain constant slots here, same as the interpreter returns.
+    if (e.args.empty()) {
+      if (e.name == "not_a_number")
+        return constant(std::numeric_limits<double>::quiet_NaN());
+      if (e.name == "positive_infinity")
+        return constant(std::numeric_limits<double>::infinity());
+      if (e.name == "negative_infinity")
+        return constant(-std::numeric_limits<double>::infinity());
+      if (e.name == "machine_precision")
+        return constant(std::numeric_limits<double>::epsilon());
     }
-    if (auto v = lower_matrix_fn(e)) return *v;
-    if (auto v = lower_algebra_fn(e)) return *v;
-    if (auto v = lower_ode_fn(e)) return *v;
+    // Construct the lazy argument state exactly once. Resolver and handlers
+    // inspect source metadata freely; values are still acquired only when the
+    // selected handler asks for them. Nullary constants above need no call
+    // state at all.
+    CallArguments actuals(*this, e);
+    if (e.name == "dims") return lower_dims(e, actuals);
+    const BuiltinDispatch dispatch = resolve_builtin(e);
+
+    // One family decision replaces the former chain of optional handlers.
+    // A handler can still decline a malformed/unsupported overload so the
+    // common constant fallback and diagnostic below remain unchanged.
+    switch (dispatch.family) {
+      case BuiltinFamily::MapRect:
+        if (auto v = lower_empty_map_rect(e, actuals)) return *v;
+        break;
+      case BuiltinFamily::ReduceSum:
+        return lower_reduce_sum(e, actuals);
+      case BuiltinFamily::MultiNormalRng:
+        return lower_multi_normal_rng(e, actuals);
+      case BuiltinFamily::DirichletRng:
+        return lower_dirichlet_rng(e, actuals);
+      case BuiltinFamily::CategoricalRng:
+        return lower_categorical_rng(e, actuals);
+      case BuiltinFamily::ScalarRng:
+        return lower_scalar_rng(e, actuals, *dispatch.scalar_rng);
+      case BuiltinFamily::Density:
+        if (auto v = lower_density_fn(e, actuals)) return *v;
+        break;
+      case BuiltinFamily::BoundTransform:
+        if (auto v = lower_bound_transform(e, actuals)) return *v;
+        break;
+      case BuiltinFamily::Elementwise:
+        if (auto v = lower_eltwise_fn(
+                e, actuals, dispatch.regular ? &*dispatch.regular : nullptr))
+          return *v;
+        break;
+      case BuiltinFamily::Matrix:
+        if (auto v = lower_matrix_fn(e, actuals)) return *v;
+        break;
+      case BuiltinFamily::Algebra:
+        return lower_algebra_fn(e, actuals);
+      case BuiltinFamily::Ode:
+        if (auto v = lower_ode_fn(e, actuals)) return *v;
+        break;
+      case BuiltinFamily::AppendArray:
+        if (e.args.size() == 2) return lower_append_array(e, actuals);
+        break;
+      case BuiltinFamily::ShapeQuery:
+        break;
+    }
     // A shape query in a REAL-valued expression. eval_int already answers
     // rows/cols/size from the slot or the data map, but only where an
     // integer was expected; brms's mo() helper writes
     // `rows(scale) * sum(scale[1:i])`, where the same call sits in the
     // middle of arithmetic and reached the failure below instead.
-    if ((e.name == "rows" || e.name == "cols" || e.name == "size" ||
-         e.name == "num_elements") &&
-        e.args.size() == 1) {
+    if (dispatch.family == BuiltinFamily::ShapeQuery && e.args.size() == 1) {
       try {
         return constant((double)eval_int(e));
       } catch (const CompileError&) {
@@ -3662,7 +4617,8 @@ struct Lowering {
         (!scalar_outcome && !array_outcome) || !is_vector(arg.si))
       fail(e.name + ": MIR type does not match lowered values", e.raw);
     if (!e.args[0].data_only || !outcome.si.param_free ||
-        (udf_depth == 0 && e.args[1].data_only == arg.autodiff))
+        (udf_depth == 0 &&
+         arg.autodiff != (!in_write_array && !e.args[1].data_only)))
       fail(e.name + ": MIR adlevel contradicts lowered dependencies", e.raw);
     auto spec = std::make_shared<CategoricalSpec>();
     spec->logit = logit;
@@ -3672,13 +4628,15 @@ struct Lowering {
     // be graph-constant and still make Stan retain a propto summand.
     spec->arg_autodiff = arg.autodiff;
     spec->propto = propto(e);
-    Val checked = emit_value(OP_CATEGORICAL, {outcome, arg}, 1, {});
+    Val checked = with_layout(emit_value(OP_CATEGORICAL, {outcome, arg}, 1, {}),
+                              ExpressionLayout::scalar());
     g.ops.back().udata = spec.get();
     g.udata_pool.push_back(std::move(spec));
     return checked;
   }
 
-  std::optional<Val> lower_density_fn(const mir::Expr& e) {
+  std::optional<Val> lower_density_fn(const mir::Expr& e,
+                                      CallArguments& actuals) {
     // Leading integer arguments become idata; the rest become real slots.
     // Layouts: one integer group = raw values; two groups =
     // [len, vals..., len, vals...]; glm = [y..., rows, cols].
@@ -3832,12 +4790,12 @@ struct Lowering {
     auto density = kDensities.find(e.name);
     if (density != kDensities.end()) {
       const DensitySpec& spec = density->second;
-      if ((int)e.args.size() != spec.arity) {
+      if ((int)actuals.size() != spec.arity) {
         // The compact cases below used to decline a bad arity and let the
         // common unsupported-function diagnostic report it.
         if (spec.shape != DensityShape::Plain || spec.activity_mask >= 0)
           return std::nullopt;
-        fail(e.name + ": expected " + std::to_string(spec.arity) + " args");
+        actuals.require_arity((size_t)spec.arity);
       }
       std::vector<int> idata;
       // Whether argument 0 was written as a bare `int` rather than an
@@ -3846,20 +4804,21 @@ struct Lowering {
       // arguments' size, a scalar broadcasts.
       bool scalar_outcome = false;
       if (spec.integer_args == 1) {
-        idata = int_arg_values(e.args[0]);
-        scalar_outcome = e.args[0].type_ == "UInt" && idata.size() == 1;
+        idata = int_arg_values(actuals.at(0));
+        scalar_outcome =
+            actuals.at(0).expr().type_ == "UInt" && idata.size() == 1;
       } else if (spec.integer_args == 2) {
         // Group length -1 marks a language-level scalar (broadcast in
         // stan-math); a length-1 array stays a vector, as CmdStan would
         // instantiate it.
-        auto put = [&](const mir::Expr& a) {
-          auto vals = int_arg_values(a);
-          const bool scalar = a.type_ == "UInt" && vals.size() == 1;
+        auto put = [&](LoweredArgument& actual) {
+          auto vals = int_arg_values(actual);
+          const bool scalar = actual.expr().type_ == "UInt" && vals.size() == 1;
           idata.push_back(scalar ? -1 : (int)vals.size());
           idata.insert(idata.end(), vals.begin(), vals.end());
         };
-        put(e.args[0]);
-        put(e.args[1]);
+        put(actuals.at(0));
+        put(actuals.at(1));
       }
       std::vector<int> ins;
       SlotInfo shapes[6]{};
@@ -3868,12 +4827,12 @@ struct Lowering {
       uint8_t variant =
           spec.activity_mask < 0 ? 0 : (uint8_t)spec.activity_mask;
       for (size_t i = spec.integer_args; i < e.args.size(); ++i) {
-        const Val arg = lower_expr(e.args[i]);
+        const Val arg = actuals.at(i).value();
         shapes[i - spec.integer_args] = arg.si;
         ins.push_back(arg.slot);
         result_si.param_free = result_si.param_free && arg.si.param_free;
         result_autodiff = result_autodiff || arg.autodiff;
-        if (spec.activity_mask < 0 && !e.args[i].data_only)
+        if (spec.activity_mask < 0 && !actuals.at(i).expr().data_only)
           variant |= (uint8_t)(1u << (i - spec.integer_args));
       }
       // A scalar outcome against vectorized real arguments: replicate it to
@@ -4011,6 +4970,7 @@ struct Lowering {
       }
       Val dv =
           emit_raw(spec.opcode, ins, 1, result_si, idata, -1, result_autodiff);
+      dv.layout = ExpressionLayout::scalar();
       // GLM ops used to be the one density shape that got no variant at
       // all, so their kernels hardcoded propto=false and poisson_log_glm's
       // lp landed sum(log(y!)) -- 10.45 on a six-row test -- away from
@@ -4027,13 +4987,13 @@ struct Lowering {
     }
 
     if (e.name == "categorical_logit_lpmf" && e.args.size() == 2) {
-      const Val outcome = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
+      const Val outcome = actuals.at(0).value();
+      Val b = actuals.at(1).value();
       return emit_categorical(e, outcome, b, true);
     }
     if (e.name == "categorical_lpmf" && e.args.size() == 2) {
-      const Val outcome = lower_expr(e.args[0]);
-      Val th = lower_expr(e.args[1]);
+      const Val outcome = actuals.at(0).value();
+      Val th = actuals.at(1).value();
       return emit_categorical(e, outcome, th, false);
     }
 
@@ -4048,11 +5008,11 @@ struct Lowering {
     // The three GLMs whose argument shapes the recorder cannot express.
     // idata is the outcome (two groups for binomial) then rows, cols.
     if (e.name == "binomial_logit_glm_lpmf" && e.args.size() == 5) {
-      std::vector<int> idata = int_arg_values(e.args[0]);
-      std::vector<int> NN = int_arg_values(e.args[1]);
-      Val X = lower_expr(e.args[2]);
-      Val alpha = lower_expr(e.args[3]);
-      Val beta = lower_expr(e.args[4]);
+      std::vector<int> idata = int_arg_values(actuals.at(0));
+      std::vector<int> NN = int_arg_values(actuals.at(1));
+      Val X = actuals.at(2).value();
+      Val alpha = actuals.at(3).value();
+      Val beta = actuals.at(4).value();
       if (!is_matrix(X.si)) fail("binomial_logit_glm needs a matrix", e.raw);
       // Both int groups are one value per row, so a scalar broadcasts.
       // By value, as the lane_outcome expansion above is: assign() may
@@ -4070,18 +5030,19 @@ struct Lowering {
       idata.insert(idata.end(), NN.begin(), NN.end());
       idata.push_back((int)rows);
       idata.push_back((int)X.si.cols);
-      Val v = emit_value(OP_BINOMIAL_LOGIT_GLM_LPMF, {X, alpha, beta}, 1, {},
-                         idata);
+      Val v = with_layout(emit_value(OP_BINOMIAL_LOGIT_GLM_LPMF,
+                                     {X, alpha, beta}, 1, {}, idata),
+                          ExpressionLayout::scalar());
       g.ops.back().variant = (uint8_t)((propto(e) ? 0x80u : 0u) | 0x7u);
       return v;
     }
     if ((e.name == "categorical_logit_glm_lpmf" ||
          e.name == "ordered_logistic_glm_lpmf") &&
         e.args.size() == 4) {
-      std::vector<int> idata = int_arg_values(e.args[0]);
-      Val X = lower_expr(e.args[1]);
-      Val a2 = lower_expr(e.args[2]);
-      Val a3 = lower_expr(e.args[3]);
+      std::vector<int> idata = int_arg_values(actuals.at(0));
+      Val X = actuals.at(1).value();
+      Val a2 = actuals.at(2).value();
+      Val a3 = actuals.at(3).value();
       if (!is_matrix(X.si)) fail(e.name + " needs a matrix", e.raw);
       if ((int64_t)idata.size() == 1) {
         // By value, as the lane_outcome expansion is: assign() may
@@ -4095,28 +5056,30 @@ struct Lowering {
       // categorical: (y, x, alpha, beta). ordered: (y, x, beta, cuts).
       // Both pass their two real arguments in order, so the kernel reads
       // in[1] and in[2] and knows from its Kind what they mean.
-      Val v = emit_value(e.name == "categorical_logit_glm_lpmf"
-                             ? OP_CATEGORICAL_LOGIT_GLM_LPMF
-                             : OP_ORDERED_LOGISTIC_GLM_LPMF,
-                         {X, a2, a3}, 1, {}, idata);
+      Val v = with_layout(emit_value(e.name == "categorical_logit_glm_lpmf"
+                                         ? OP_CATEGORICAL_LOGIT_GLM_LPMF
+                                         : OP_ORDERED_LOGISTIC_GLM_LPMF,
+                                     {X, a2, a3}, 1, {}, idata),
+                          ExpressionLayout::scalar());
       g.ops.back().variant = (uint8_t)((propto(e) ? 0x80u : 0u) | 0x7u);
       return v;
     }
 
     if (e.name == "normal_id_glm_lpdf" && e.args.size() == 5) {
-      Val y = lower_expr(e.args[0]);
-      Val X = lower_expr(e.args[1]);
-      if (!is_matrix(X.si) || !X.si.param_free)
-        fail("normal_id_glm: X must be a data matrix", e.raw);
-      Val alpha = lower_expr(e.args[2]);
-      Val beta = lower_expr(e.args[3]);
-      Val sigma = lower_expr(e.args[4]);
+      Val y = actuals.at(0).value();
+      Val X = actuals.at(1).value();
+      if (!is_matrix(X.si)) fail("normal_id_glm: X must be a matrix", e.raw);
+      Val alpha = actuals.at(2).value();
+      Val beta = actuals.at(3).value();
+      Val sigma = actuals.at(4).value();
       uint8_t variant = 0;
       for (int i = 0; i < 5; ++i)
-        if (!e.args[i].data_only) variant |= (uint8_t)(1u << i);
+        if (!actuals.at(i).expr().data_only) variant |= (uint8_t)(1u << i);
       if (propto(e)) variant |= 0x80u;
-      Val v = emit_value(OP_NORMAL_ID_GLM_LPDF, {y, X, alpha, beta, sigma}, 1,
-                         {}, {(int)X.si.rows, (int)X.si.cols});
+      Val v = with_layout(
+          emit_value(OP_NORMAL_ID_GLM_LPDF, {y, X, alpha, beta, sigma}, 1, {},
+                     {(int)X.si.rows, (int)X.si.cols}),
+          ExpressionLayout::scalar());
       g.ops.back().variant = variant;
       return v;
     }
@@ -4124,34 +5087,9 @@ struct Lowering {
   }
 
   // Elementwise math, reductions, and dot products.
-  std::optional<Val> lower_eltwise_fn(const mir::Expr& e) {
-    // Elementwise binaries.
-    static const std::map<std::string, uint16_t> kBin = {
-        {"Plus__", OP_ADD},
-        {"Minus__", OP_SUB},
-        {"Divide__", OP_DIV},
-        {"EltTimes__", OP_MUL},
-        {"EltDivide__", OP_DIV},
-        {"Pow__", OP_POW},
-        {"pow", OP_POW},
-        // The named spellings of the same operators. `divide` is the one
-        // that is not simply the operator renamed: `rv / A` is a solve,
-        // but stan::math::divide only ever divides by a scalar or divides
-        // a scalar elementwise, so it is OP_DIV on every one of its
-        // overloads (deps/math/stan/math/prim/fun/divide.hpp).
-        {"add", OP_ADD},
-        {"subtract", OP_SUB},
-        {"divide", OP_DIV},
-        {"elt_multiply", OP_MUL},
-        {"elt_divide", OP_DIV},
-// Generated from STANLI_SCALAR_BINARY_LIST (optable.hpp), which also made
-// the opcode and the kernel. multiply_log is the pre-optimizer spelling of
-// lmultiply, so it rides the same opcode.
-#define STANLI_BINARY_TABLE(code, name, fn) {#name, code},
-        STANLI_SCALAR_BINARY_LIST(STANLI_BINARY_TABLE)
-#undef STANLI_BINARY_TABLE
-            {"multiply_log", OP_LMULTIPLY},
-    };
+  std::optional<Val> lower_eltwise_fn(const mir::Expr& e,
+                                      CallArguments& actuals,
+                                      const RegularSpec* regular) {
     // Once a generated int RNG has become a runtime scalar slot, named
     // integer division is no longer foldable. OP_DIV is real division and
     // would return 3.5 for divide(7, 2), while Stan truncates to 3. Refuse it
@@ -4198,8 +5136,9 @@ struct Lowering {
       const uint16_t opcode = named_solve != nullptr
                                   ? named_solve->opcode
                                   : (left ? OP_MDIVIDE_LEFT : OP_MDIVIDE_RIGHT);
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
+      actuals.require_arity(2);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
       const Val& divisor = left ? a : b;
       const Val& dividend = left ? b : a;
       // rows <= 0 is a matrix view whose shape the lowering never resolved;
@@ -4230,14 +5169,15 @@ struct Lowering {
       g.ops.back().variant = (uint8_t)((v.autodiff ? 1u : 0u) | (dm ? 0u : 2u) |
                                        (divisor.autodiff ? 4u : 0u) |
                                        (dividend.autodiff ? 8u : 0u));
-      return v;
+      return with_layout(v, owning_layout(dividend.si));
     }
     // multiply is the named spelling of `*`, including its linear algebra:
     // the branches below pick matvec, GEMM, outer and inner products off
     // the operand views and the result type, which the alias shares.
     if (e.name == "Times__" || (e.name == "multiply" && e.args.size() == 2)) {
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
+      actuals.require_arity(2);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
       // Scalar on either side is an elementwise scale, whatever shape the
       // other operand carries.
       const bool a_scalar = is_scalar(a);
@@ -4247,7 +5187,8 @@ struct Lowering {
         SlotInfo si = shaped.si;
         si.param_free = a.si.param_free && b.si.param_free;
         const int64_t n = a_scalar ? g.slots[b.slot].len : g.slots[a.slot].len;
-        return emit_value(OP_MUL, {a, b}, n, si);
+        return with_layout(emit_value(OP_MUL, {a, b}, n, si),
+                           elementwise_layout({a, b}));
       }
       if (is_matrix(a.si)) {
         if (a.si.param_free && is_vector(b.si)) {
@@ -4255,8 +5196,10 @@ struct Lowering {
           // accumulation order is matched to the var path).
           if (g.slots[b.slot].len != a.si.cols)
             fail(e.name + ": inner dimension mismatch", e.raw);
-          return emit_value(OP_MATVEC, {a, b}, a.si.rows, view_of("UVector"),
-                            {(int)a.si.rows, (int)a.si.cols});
+          return with_layout(
+              emit_value(OP_MATVEC, {a, b}, a.si.rows, view_of("UVector"),
+                         {(int)a.si.rows, (int)a.si.cols}),
+              owning_layout(view_of("UVector")));
         }
         // General product; a vector operand is one column.
         const int64_t cb = is_matrix(b.si) ? b.si.cols : 1;
@@ -4273,38 +5216,44 @@ struct Lowering {
                 : (cb == 1 ? view_of("UVector") : matrix_view(a.si.rows, cb));
         Val v = emit_value(OP_GEMM, {a, b}, a.si.rows * cb, si,
                            {(int)a.si.rows, (int)a.si.cols, (int)cb});
-        return v;
+        return with_layout(v, owning_layout(si));
       }
       // vector * row_vector with a matrix result is an outer product.
       if (is_vector(a.si) && is_row_vector(b.si) && e.type_ == "UMatrix") {
         const int64_t nr = g.slots[a.slot].len, nc = g.slots[b.slot].len;
         SlotInfo si = matrix_view(nr, nc);
-        return emit_value(OP_GEMM, {a, b}, nr * nc, si, {(int)nr, 1, (int)nc});
+        return with_layout(
+            emit_value(OP_GEMM, {a, b}, nr * nc, si, {(int)nr, 1, (int)nc}),
+            owning_layout(si));
       }
       if (is_row_vector(a.si) && is_matrix(b.si)) {
         const int64_t k = g.slots[a.slot].len;
         if (k != b.si.rows) fail(e.name + ": inner dimension mismatch", e.raw);
-        return emit_value(OP_GEMM, {a, b}, b.si.cols, view_of("URowVector"),
-                          {1, (int)k, (int)b.si.cols});
+        return with_layout(
+            emit_value(OP_GEMM, {a, b}, b.si.cols, view_of("URowVector"),
+                       {1, (int)k, (int)b.si.cols}),
+            owning_layout(view_of("URowVector")));
       }
       // row_vector * vector with scalar result type is an inner product.
       if (is_row_vector(a.si) && is_vector(b.si) &&
           (e.type_ == "UReal" || e.type_ == "UInt")) {
         if (g.slots[a.slot].len != g.slots[b.slot].len)
           fail(e.name + ": inner dimension mismatch", e.raw);
-        return emit_value(OP_DOT, {a, b}, 1);
+        return with_layout(emit_value(OP_DOT, {a, b}, 1),
+                           ExpressionLayout::scalar());
       }
       if (a.si.kind != ViewKind::Flat || b.si.kind != ViewKind::Flat)
         fail(e.name + ": unsupported container product", e.raw);
       const int64_t len = std::max(g.slots[a.slot].len, g.slots[b.slot].len);
-      return emit_value(OP_MUL, {a, b}, len);
+      return with_layout(emit_value(OP_MUL, {a, b}, len),
+                         elementwise_layout({a, b}));
     }
     // fma from --O1 partial evaluation (`c + a*b`) or written explicitly:
     // fused (std::fma), elementwise with scalar broadcast on any argument.
     if (e.name == "fma" && e.args.size() == 3) {
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
-      Val c = lower_expr(e.args[2]);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
+      Val c = actuals.at(2).value();
       const int64_t la = g.slots[a.slot].len, lb = g.slots[b.slot].len,
                     lc = g.slots[c.slot].len;
       const int64_t n = std::max(la, std::max(lb, lc));
@@ -4314,12 +5263,13 @@ struct Lowering {
       SlotInfo si = shape_of(a, b);
       if (is_scalar(a) && is_scalar(b)) si = shape_of(a, c);
       si.param_free = a.si.param_free && b.si.param_free && c.si.param_free;
-      return emit_value(OP_FMA, {a, b, c}, n, si);
+      return with_layout(emit_value(OP_FMA, {a, b, c}, n, si),
+                         elementwise_layout({a, b, c}));
     }
-    auto bit = kBin.find(e.name);
-    if (bit != kBin.end()) {
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
+    if (regular != nullptr && regular->kind == RegularKind::Binary) {
+      actuals.require_arity(2);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
       const int64_t la = g.slots[a.slot].len, lb = g.slots[b.slot].len;
       const bool as = is_scalar(a), bs = is_scalar(b);
       if (!as && !bs && !same_view(a.si, la, b.si, lb))
@@ -4328,60 +5278,24 @@ struct Lowering {
       // has one; losing it would make a later Times__ miss the matvec.
       SlotInfo si = shape_of(a, b);
       const int64_t n = as ? lb : (bs ? la : la);
-      return emit_value(bit->second, {a, b}, n, si);
+      return with_layout(emit_value(regular->opcode, {a, b}, n, si),
+                         elementwise_layout({a, b}));
     }
 
-    // The same surface with one int argument, from the two int lists in
-    // optable.hpp. The flag is which position holds the int, which is the
-    // only thing that varies across the nine.
-    static const std::map<std::string, std::pair<uint16_t, bool>> kBinInt = {
-#define STANLI_BINARY_INT_TABLE(code, name, fn) {#name, {code, true}},
-        STANLI_SCALAR_BINARY_INT_FIRST_LIST(STANLI_BINARY_INT_TABLE)
-#undef STANLI_BINARY_INT_TABLE
-#define STANLI_BINARY_INT_TABLE(code, name, fn) {#name, {code, false}},
-            STANLI_SCALAR_BINARY_INT_SECOND_LIST(STANLI_BINARY_INT_TABLE)
-#undef STANLI_BINARY_INT_TABLE
-    };
-    auto iit = kBinInt.find(e.name);
-    if (iit != kBinInt.end() && e.args.size() == 2)
-      return lower_binary_int(iit->second.first, iit->second.second, e);
+    if (regular != nullptr && (regular->kind == RegularKind::BinaryIntFirst ||
+                               regular->kind == RegularKind::BinaryIntSecond)) {
+      return lower_binary_int(regular->opcode,
+                              regular->kind == RegularKind::BinaryIntFirst,
+                              actuals);
+    }
 
-    // Elementwise unaries + reductions.
-    static const std::map<std::string, uint16_t> kUn = {
-// Generated from STANLI_SCALAR_UNARY_LIST (optable.hpp), which also made
-// the opcode and the kernel.
-#define STANLI_UNARY_TABLE(code, name, value, delta, topology) {#name, code},
-        STANLI_SCALAR_UNARY_LIST(STANLI_UNARY_TABLE)
-#undef STANLI_UNARY_TABLE
-            {"PMinus__", OP_NEG},
-        // minus is the named spelling of the unary operator, so it is the
-        // same negation over the same shapes.
-        {"minus", OP_NEG},
-        // stanc3's Lower_expr.ml maps std_normal_qf onto stan::math::inv_Phi;
-        // one opcode keeps the two spellings from drifting apart.
-        {"std_normal_qf", OP_INV_PHI},
-        // trigamma is the one unary whose derivative has no closed form to
-        // put in the shared list: Math differentiates AS121's recurrence
-        // through its own tape, so the kernel does too (scalar_unary_ad.cpp).
-        {"trigamma", OP_TRIGAMMA},
-        {"exp", OP_EXPV},
-        {"log", OP_LOGV},
-        {"inv_logit", OP_INV_LOGIT},
-        {"sqrt", OP_SQRT},
-        {"square", OP_SQUARE},
-        {"log1m", OP_LOG1M},
-        {"softmax", OP_SOFTMAX},
-        {"tanh", OP_TANHV},
-        {"cumulative_sum", OP_CUMSUM},
-        {"log_softmax", OP_LOG_SOFTMAX},
-    };
-    auto uit = kUn.find(e.name);
-    if (uit != kUn.end()) {
-      Val a = lower_expr(e.args[0]);
+    if (regular != nullptr && regular->kind == RegularKind::Unary) {
+      actuals.require_arity(1);
+      Val a = actuals.at(0).value();
       SlotInfo si = a.si;
       // Shape-preserving unaries keep rows/cols (softmax/cumulative_sum
       // are vector-only, so they never carry one).
-      if (uit->second != OP_SOFTMAX && uit->second != OP_CUMSUM) {
+      if (regular->opcode != OP_SOFTMAX && regular->opcode != OP_CUMSUM) {
         if (e.type_ == "UMatrix" && !is_matrix(si))
           fail(e.name + ": matrix result has unknown logical extents", e.raw);
         stamp_kind(&si, e.type_);
@@ -4389,37 +5303,41 @@ struct Lowering {
         si = view_of(e.type_);
       }
       si.param_free = a.si.param_free;
-      return emit_value(uit->second, {a}, g.slots[a.slot].len, si);
+      const bool packet_supported = regular->opcode != OP_SOFTMAX &&
+                                    regular->opcode != OP_LOG_SOFTMAX &&
+                                    regular->opcode != OP_CUMSUM;
+      // These functions return freshly allocated Eigen containers. Their
+      // result starts at lane zero independently of the input's provenance;
+      // the other unary operations are elementwise evaluator expressions.
+      const ExpressionLayout layout =
+          packet_supported ? elementwise_layout({a}) : owning_layout(si);
+      return with_layout(
+          emit_value(regular->opcode, {a}, g.slots[a.slot].len, si), layout);
     }
     // plus, and its operator spelling, are the identity on every shape.
-    if (e.name == "PPlus__" || (e.name == "plus" && e.args.size() == 1))
-      return lower_expr(e.args[0]);
-    if (e.name == "logit") {
-      Val a = lower_expr(e.args[0]);
-      return emit_value(OP_LOGIT, {a}, g.slots[a.slot].len, a.si);
+    if (e.name == "PPlus__" || (e.name == "plus" && e.args.size() == 1)) {
+      actuals.require_arity(1);
+      return actuals.at(0).value();
     }
     if (e.name == "min" || e.name == "max") {
       // Preserve the construction-time path for well-formed data-only
       // extrema, including the scalar two-argument overload.  Dynamic
-      // lowering is deliberately much narrower.
+      // lowering now uses the lowered argument's layout rather than
+      // re-deriving its provenance from MIR syntax.
       if (e.args.size() == 1 || e.args.size() == 2)
         if (auto v = fold_const(e)) return *v;
-      const mir::ExtremaKind kind = mir::extrema_kind(e);
-      if (udf_depth != 0 || kind == mir::ExtremaKind::Legacy)
+      const mir::ExtremaCall call = mir::extrema_call(e);
+      if (call.kind == mir::ExtremaKind::Legacy)
         fail("min/max expression surface stays on WaInterp", e.raw);
-      Val a = lower_expr(e.args[0]);
-      if ((!is_vector(a.si) && !is_row_vector(a.si)) || g.slots[a.slot].len < 0)
-        fail("min/max needs one vector or row-vector argument", e.raw);
-      Val result = emit_value(OP_EXTREMA_VEC, {a}, 1);
-      if (in_write_array) result.autodiff = false;
-      g.ops.back().variant =
-          static_cast<uint8_t>((kind == mir::ExtremaKind::Max ? 1u : 0u) |
-                               (result.autodiff ? 2u : 0u));
-      return result;
+      return call.surface == mir::ExtremaSurface::IntPair
+                 ? lower_extrema_pair(e, actuals, call.kind)
+                 : lower_extrema_reduction(e, actuals, call);
     }
     if (e.name == "mean") {
-      Val a = lower_expr(e.args[0]);
-      return emit_value(OP_MEAN, {a}, 1);
+      actuals.require_arity(1);
+      Val a = actuals.at(0).value();
+      return with_layout(emit_value(OP_MEAN, {a}, 1),
+                         ExpressionLayout::scalar());
     }
     if (e.name == "prod") {
       // Preserve the pre-existing construction-time behavior for data-only
@@ -4428,55 +5346,103 @@ struct Lowering {
       if (e.args.size() != 1 || e.type_ != "UReal" ||
           e.unsized.leaf != mir::UnsizedLeaf::Real || e.unsized.depth != 0)
         fail("prod needs exactly one scalar-real result", e.raw);
-      const mir::Expr& arg = e.args[0];
-      const bool vector_arg = arg.type_ == "UVector" &&
-                              arg.unsized.leaf == mir::UnsizedLeaf::Vector &&
-                              arg.unsized.depth == 0;
-      const bool row_vector_arg =
-          arg.type_ == "URowVector" &&
-          arg.unsized.leaf == mir::UnsizedLeaf::RowVector &&
-          arg.unsized.depth == 0;
-      if (!vector_arg && !row_vector_arg)
-        fail("prod needs one vector or row-vector argument", e.raw);
-      if (udf_depth != 0 || !prod_native_surface(arg))
-        fail("prod expression surface stays on WaInterp", e.raw);
-      Val a = lower_expr(arg);
+      actuals.require_arity(1);
+      Val a = actuals.at(0).value();
       if ((!is_vector(a.si) && !is_row_vector(a.si)) ||
           g.slots[a.slot].len <= 0)
         fail("prod needs a nonempty vector or row-vector argument", e.raw);
-      const mir::ProdGrouping grouping = mir::prod_grouping(arg);
-      if (grouping == mir::ProdGrouping::Legacy)
+      const bool active = a.autodiff && !in_write_array;
+      const ReductionGrouping grouping = reduction_grouping(a, active);
+      if (grouping == ReductionGrouping::Unknown)
         fail("prod expression grouping is not native", e.raw);
-      Val result = emit_value(OP_PROD_VEC, {a}, 1);
+      Val result =
+          with_layout(emit_value(OP_PROD_VEC, {a}, 1, {},
+                                 reduction_phase_idata(a, grouping, "prod")),
+                      ExpressionLayout::scalar());
+      // The active bit already selects scalar Matrix<var> traversal. Keep
+      // the explicit scalar bit for inactive strided/gathered values so the
+      // established active-vector variant remains 2.
+      const bool scalar = grouping == ReductionGrouping::Scalar && !active;
+      const bool phased = grouping == ReductionGrouping::Phased;
       g.ops.back().variant = static_cast<uint8_t>(
-          (grouping == mir::ProdGrouping::Scalar ? 1u : 0u) |
-          (result.autodiff ? 2u : 0u));
+          (scalar ? 1u : 0u) | (active ? 2u : 0u) | (phased ? 4u : 0u));
       return result;
     }
     if (e.name == "sd" || e.name == "variance") {
-      if (e.args.size() != 1)
-        fail(e.name + ": reduction needs exactly one argument", e.raw);
-      Val a = lower_expr(e.args[0]);
+      actuals.require_arity(1);
+      Val a = actuals.at(0).value();
       if (g.slots[a.slot].len <= 0)
         fail(e.name + ": input must have a positive size", e.raw);
-      return emit_value(e.name == "sd" ? OP_SD : OP_VARIANCE, {a}, 1);
+      return with_layout(
+          emit_value(e.name == "sd" ? OP_SD : OP_VARIANCE, {a}, 1),
+          ExpressionLayout::scalar());
     }
     if (e.name == "rep_vector" || e.name == "rep_row_vector") {
-      Val a = lower_expr(e.args[0]);
-      const long n = eval_int(e.args[1]);
-      return emit_value(OP_REP_VEC, {a}, n, view_of(e.type_));
+      actuals.require_arity(2);
+      Val a = actuals.at(0).value();
+      const long n = actuals.at(1).require_constant_int("rep_vector extent");
+      return with_layout(emit_value(OP_REP_VEC, {a}, n, view_of(e.type_)),
+                         owning_layout(view_of(e.type_)));
+    }
+    if (e.name == "rep_array" && e.args.size() >= 2 && e.args.size() <= 4) {
+      // The element keeps its shape; rep_array prepends up to three outer
+      // dimensions and tiles the element buffer once per outer cell. That
+      // is a gather that walks 0..w-1 repeatedly.
+      actuals.require_arity(2, 4);
+      Val a = actuals.at(0).value();
+      const int64_t w = g.slots[a.slot].len;
+      std::vector<int64_t> dims;
+      for (size_t k = 1; k < e.args.size(); ++k)
+        dims.push_back(actuals.at(k).require_constant_int("rep_array extent"));
+      const int64_t copies = checked_container_size(dims, e.name);
+      ViewKind leaf = ViewKind::Flat;
+      if (is_matrix(a.si)) {
+        dims.push_back(a.si.rows);
+        dims.push_back(a.si.cols);
+        leaf = ViewKind::Matrix;
+      } else if (is_vector(a.si)) {
+        dims.push_back(w);
+        leaf = ViewKind::Vector;
+      } else if (is_row_vector(a.si)) {
+        dims.push_back(w);
+        leaf = ViewKind::RowVector;
+      } else if (is_array(a.si)) {
+        const ArrayShape& sh = array_shape(a.si);
+        dims.insert(dims.end(), sh.dims.begin(), sh.dims.end());
+        leaf = sh.leaf;
+      }
+      const int64_t size = checked_container_size({copies, w}, e.name);
+      std::vector<int> gather;
+      gather.reserve((size_t)size);
+      for (int64_t k = 0; k < size; ++k)
+        gather.push_back(checked_immediate(k % w, "rep_array gather offset"));
+      const SlotInfo result_si = array_view(dims, leaf, a.si.param_free);
+      return with_layout(emit_value(OP_GATHER, {a}, size, result_si, gather),
+                         owning_layout(result_si));
+    }
+    if ((e.name == "zeros_vector" || e.name == "zeros_row_vector" ||
+         e.name == "ones_vector" || e.name == "ones_row_vector") &&
+        e.args.size() == 1) {
+      // A broadcast of the constant fill, exactly as rep_vector lowers.
+      actuals.require_arity(1);
+      const long n = actuals.at(0).require_constant_int("vector extent");
+      const double fill = e.name.rfind("ones", 0) == 0 ? 1.0 : 0.0;
+      (void)checked_container_size({n}, e.name);
+      const SlotInfo result_si = view_of(e.type_);
+      return with_layout(emit_value(OP_REP_VEC, {constant(fill)}, n, result_si),
+                         owning_layout(result_si));
     }
     if (e.name == "log_sum_exp" || e.name == "sum") {
-      // One argument is the reduction; two is the elementwise form below.
-      if (e.name == "log_sum_exp" && e.args.size() == 2)
-        return lower_binary_mix(OP_LSE2, e);
+      // The two-argument log_sum_exp overload is resolved through the
+      // regular binary registry before reaching this reduction path.
       const bool int_surface =
           e.name == "sum" &&
           (e.type_ == "UInt" || e.unsized.leaf == mir::UnsizedLeaf::Int ||
            (!e.args.empty() &&
             e.args[0].unsized.leaf == mir::UnsizedLeaf::Int));
       if (int_surface && in_write_array) {
-        if (runtime_int_sum_candidate(e)) return lower_runtime_int_sum(e);
+        if (runtime_int_sum_candidate(e))
+          return lower_runtime_int_sum(e, actuals);
         if (!is_int_sum_surface(e))
           fail(
               "runtime integer sum needs one one-dimensional int-array "
@@ -4488,67 +5454,82 @@ struct Lowering {
       }
       if (e.args.size() != 1)
         fail(e.name + ": reduction needs exactly one argument", e.raw);
-      Val a = lower_expr(e.args[0]);
-      return emit_value(e.name == "sum" ? OP_SUM_VEC : OP_LOG_SUM_EXP, {a}, 1);
+      actuals.require_arity(1);
+      Val a = actuals.at(0).value();
+      return with_layout(
+          emit_value(e.name == "sum" ? OP_SUM_VEC : OP_LOG_SUM_EXP, {a}, 1),
+          ExpressionLayout::scalar());
     }
-    if (e.name == "log_diff_exp" && e.args.size() == 2)
-      return lower_binary_mix(OP_LOG_DIFF_EXP, e);
     if (e.name == "log_mix" && e.args.size() == 3) {
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
-      Val c = lower_expr(e.args[2]);
-      return emit_value(OP_LOG_MIX, {a, b, c}, 1);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
+      Val c = actuals.at(2).value();
+      return with_layout(emit_value(OP_LOG_MIX, {a, b, c}, 1),
+                         ExpressionLayout::scalar());
     }
     if (e.name == "dot_product") {
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
-      return emit_value(OP_DOT, {a, b}, 1);
+      actuals.require_arity(2);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
+      return with_layout(emit_value(OP_DOT, {a, b}, 1),
+                         ExpressionLayout::scalar());
     }
 
     if (e.name == "dot_self") {
-      Val a = lower_expr(e.args[0]);
-      return emit_value(OP_DOT, {a, a}, 1);
+      actuals.require_arity(1);
+      Val a = actuals.at(0).value();
+      return with_layout(emit_value(OP_DOT, {a, a}, 1),
+                         ExpressionLayout::scalar());
     }
 
     if ((e.name == "columns_dot_product" || e.name == "rows_dot_product" ||
          e.name == "columns_dot_self" || e.name == "rows_dot_self") &&
         (e.args.size() == 1 || e.args.size() == 2)) {
-      Val a = lower_expr(e.args[0]);
-      Val b = e.args.size() == 2 ? lower_expr(e.args[1]) : a;
+      actuals.require_arity(1, 2);
+      Val a = actuals.at(0).value();
+      Val b = actuals.size() == 2 ? actuals.at(1).value() : a;
       if (!is_matrix(a.si) || !is_matrix(b.si) || a.si.rows != b.si.rows ||
           a.si.cols != b.si.cols)
         fail(e.name + ": arguments must be matrices of the same size", e.raw);
       SlotInfo product_si =
           matrix_view(a.si.rows, a.si.cols, a.si.param_free && b.si.param_free);
-      Val product = emit_value(OP_MUL, {a, b}, g.slots[a.slot].len, product_si);
+      Val product = with_layout(
+          emit_value(OP_MUL, {a, b}, g.slots[a.slot].len, product_si),
+          elementwise_layout({a, b}));
       const bool by_columns = e.name.rfind("columns_", 0) == 0;
       const int64_t ones_len = by_columns ? a.si.rows : a.si.cols;
       const int ones_slot = add_slot(ones_len, false);
       out.fills.emplace_back(ones_slot, std::vector<double>(ones_len, 1.0));
       SlotInfo ones_si = view_of(by_columns ? "URowVector" : "UVector");
       ones_si.param_free = true;
-      Val ones{ones_slot, false, ones_si};
+      Val ones{ones_slot, false, ones_si, owning_layout(ones_si)};
       if (by_columns)
-        return emit_value(OP_GEMM, {ones, product}, a.si.cols,
-                          view_of("URowVector"),
-                          {1, (int)a.si.rows, (int)a.si.cols});
-      return emit_value(OP_GEMM, {product, ones}, a.si.rows, view_of("UVector"),
-                        {(int)a.si.rows, (int)a.si.cols, 1});
+        return with_layout(emit_value(OP_GEMM, {ones, product}, a.si.cols,
+                                      view_of("URowVector"),
+                                      {1, (int)a.si.rows, (int)a.si.cols}),
+                           owning_layout(view_of("URowVector")));
+      return with_layout(
+          emit_value(OP_GEMM, {product, ones}, a.si.rows, view_of("UVector"),
+                     {(int)a.si.rows, (int)a.si.cols, 1}),
+          owning_layout(view_of("UVector")));
     }
 
     if (e.name == "csr_matrix_times_vector" && e.args.size() == 6) {
-      const int64_t rows = eval_int(e.args[0]);
-      const int64_t cols = eval_int(e.args[1]);
+      actuals.require_arity(6);
+      const int64_t rows = actuals.at(0).require_constant_int("csr rows");
+      const int64_t cols = actuals.at(1).require_constant_int("csr columns");
       if (rows <= 0 || cols <= 0)
         fail(e.name + ": row and column counts must be positive", e.raw);
-      Val weights = lower_expr(e.args[2]);
-      Val vector = lower_expr(e.args[5]);
+      Val weights = actuals.at(2).value();
+      Val vector = actuals.at(5).value();
       if (!is_vector(weights.si) || !is_vector(vector.si))
         fail(e.name + ": w and b must be vectors", e.raw);
       if (g.slots[vector.slot].len != cols)
         fail(e.name + ": column count does not match vector size", e.raw);
-      const std::vector<int> columns = const_ints(e.args[3]);
-      const std::vector<int> starts = const_ints(e.args[4]);
+      const std::vector<int> columns =
+          actuals.at(3).require_constant_ints("csr columns");
+      const std::vector<int> starts =
+          actuals.at(4).require_constant_ints("csr row starts");
       const int64_t nnz = g.slots[weights.slot].len;
       if ((int64_t)columns.size() != nnz)
         fail(e.name + ": w and v sizes differ", e.raw);
@@ -4570,23 +5551,31 @@ struct Lowering {
           row_sum = constant(0.0);
         } else {
           const int64_t len = end - begin;
-          Val row_weights = emit_value(OP_SLICE, {weights}, len,
-                                       view_of("UVector"), {(int)begin});
+          Val row_weights = with_layout(
+              emit_value(OP_SLICE, {weights}, len, view_of("UVector"),
+                         {checked_immediate(begin, "csr weight offset")}),
+              contiguous_layout(weights, begin, "csr weights"));
           std::vector<int> gather;
           gather.reserve((size_t)len);
           for (int64_t k = begin; k < end; ++k)
             gather.push_back(columns[(size_t)k] - 1);
           Val row_vector =
               emit_value(OP_GATHER, {vector}, len, view_of("UVector"), gather);
-          Val products = emit_value(OP_MUL, {row_weights, row_vector}, len,
-                                    view_of("UVector"));
-          row_sum = emit_value(OP_SUM_VEC, {products}, 1);
+          Val products =
+              with_layout(emit_value(OP_MUL, {row_weights, row_vector}, len,
+                                     view_of("UVector")),
+                          elementwise_layout({row_weights, row_vector}));
+          row_sum = with_layout(emit_value(OP_SUM_VEC, {products}, 1),
+                                ExpressionLayout::scalar());
         }
-        result = row == 0 ? row_sum
-                          : emit_value(OP_CONCAT2, {result, row_sum}, row + 1,
-                                       view_of("UVector"));
+        result = row == 0
+                     ? row_sum
+                     : with_layout(emit_value(OP_CONCAT2, {result, row_sum},
+                                              row + 1, view_of("UVector")),
+                                   owning_layout(view_of("UVector")));
       }
       result.si = view_of("UVector");
+      result.layout = owning_layout(result.si);
       return result;
     }
 
@@ -4597,153 +5586,182 @@ struct Lowering {
     // thing the difference could change -- element order -- is the same
     // on both sides because a length is all either view carries.
     if (e.name == "squared_distance" && e.args.size() == 2) {
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
       const int64_t la = g.slots[a.slot].len, lb = g.slots[b.slot].len;
       if (la != lb) fail(e.name + ": arguments must match in size", e.raw);
       SlotInfo si;
       si.param_free = a.si.param_free && b.si.param_free;
       if (la > 1) si.kind = ViewKind::Vector;
-      Val d = emit_value(OP_SUB, {a, b}, la, si);
-      return emit_value(OP_DOT, {d, d}, 1);
+      Val d = with_layout(emit_value(OP_SUB, {a, b}, la, si),
+                          elementwise_layout({a, b}));
+      return with_layout(emit_value(OP_DOT, {d, d}, 1),
+                         ExpressionLayout::scalar());
     }
     return std::nullopt;
   }
 
   // Matrix shape and algebra: transposes, reshapes, factorizations,
   // slices, and concatenations.
-  std::optional<Val> lower_matrix_fn(const mir::Expr& e) {
+  std::optional<Val> lower_matrix_fn(const mir::Expr& e,
+                                     CallArguments& actuals) {
     if ((e.name == "Transpose__" || e.name == "transpose") &&
         e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       // Vector <-> row_vector transpose is a type change, not a layout one.
       if (!is_matrix(a.si)) {
         stamp_kind(&a.si, e.type_);
         return a;
       }
       SlotInfo si = matrix_view(a.si.cols, a.si.rows, a.si.param_free);
-      return emit_value(OP_TRANSPOSE, {a}, g.slots[a.slot].len, si,
-                        {(int)a.si.rows, (int)a.si.cols});
+      return with_layout(emit_value(OP_TRANSPOSE, {a}, g.slots[a.slot].len, si,
+                                    {(int)a.si.rows, (int)a.si.cols}),
+                         ExpressionLayout::unknown());
     }
     if (e.name == "tcrossprod" && e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail("tcrossprod: needs a matrix", e.raw);
       SlotInfo transpose_si =
           matrix_view(a.si.cols, a.si.rows, a.si.param_free);
-      Val transpose =
+      Val transpose = with_layout(
           emit_value(OP_TRANSPOSE, {a}, g.slots[a.slot].len, transpose_si,
-                     {(int)a.si.rows, (int)a.si.cols});
+                     {(int)a.si.rows, (int)a.si.cols}),
+          a.layout);
       SlotInfo si = matrix_view(a.si.rows, a.si.rows, a.si.param_free);
-      return emit_value(OP_GEMM, {a, transpose}, a.si.rows * a.si.rows, si,
-                        {(int)a.si.rows, (int)a.si.cols, (int)a.si.rows});
+      return with_layout(
+          emit_value(OP_GEMM, {a, transpose}, a.si.rows * a.si.rows, si,
+                     {(int)a.si.rows, (int)a.si.cols, (int)a.si.rows}),
+          owning_layout(si));
     }
     if (e.name == "crossprod" && e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail("crossprod: needs a matrix", e.raw);
       SlotInfo si = matrix_view(a.si.cols, a.si.cols, a.si.param_free);
       Val v = emit_value(OP_CROSSPROD, {a}, a.si.cols * a.si.cols, si,
                          {checked_immediate(a.si.rows, "crossprod rows"),
                           checked_immediate(a.si.cols, "crossprod cols")});
       g.ops.back().variant = v.autodiff ? 1u : 0u;
-      return v;
+      return with_layout(v, owning_layout(si));
     }
     if ((e.name == "diag_pre_multiply" || e.name == "diag_post_multiply") &&
         e.args.size() == 2) {
       // diag_pre_multiply(v, M) = diag_matrix(v) * M (and the mirror);
       // the explicit zeros contribute exactly nothing to each sum.
       const bool pre = e.name.find("_pre_") != std::string::npos;
-      Val v = lower_expr(e.args[pre ? 0 : 1]);
-      Val m = lower_expr(e.args[pre ? 1 : 0]);
+      Val v = actuals.at(pre ? 0 : 1).value();
+      Val m = actuals.at(pre ? 1 : 0).value();
       const int64_t n = g.slots[v.slot].len;
       SlotInfo dsi = matrix_view(n, n, v.si.param_free);
-      Val d = emit_value(OP_DIAG_MATRIX, {v}, n * n, dsi);
+      Val d = with_layout(emit_value(OP_DIAG_MATRIX, {v}, n * n, dsi),
+                          owning_layout(dsi));
       Val a = pre ? d : m, b = pre ? m : d;
       SlotInfo si = matrix_view(a.si.rows, b.si.cols);
-      return emit_value(OP_GEMM, {a, b}, si.rows * si.cols, si,
-                        {(int)a.si.rows, (int)a.si.cols, (int)b.si.cols});
+      return with_layout(
+          emit_value(OP_GEMM, {a, b}, si.rows * si.cols, si,
+                     {(int)a.si.rows, (int)a.si.cols, (int)b.si.cols}),
+          owning_layout(si));
     }
     if (e.name == "multiply_lower_tri_self_transpose" && e.args.size() == 1) {
-      Val L = lower_expr(e.args[0]);
+      // Not L * L': stan-math drops L's upper triangle first, and only a
+      // cholesky_factor_* value already has zeros there. A TRANSPOSE/GEMM
+      // pair would read the dropped entries and disagree on every result
+      // touching one.
+      Val L = actuals.at(0).value();
       if (!is_matrix(L.si)) fail("multiply_lower_tri: needs a matrix", e.raw);
-      SlotInfo tsi = matrix_view(L.si.cols, L.si.rows);
-      Val Lt = emit_value(OP_TRANSPOSE, {L}, g.slots[L.slot].len, tsi,
-                          {(int)L.si.rows, (int)L.si.cols});
-      SlotInfo si = matrix_view(L.si.rows, L.si.rows);
-      return emit_value(OP_GEMM, {L, Lt}, si.rows * si.cols, si,
-                        {(int)L.si.rows, (int)L.si.cols, (int)L.si.rows});
+      SlotInfo si = matrix_view(L.si.rows, L.si.rows, L.si.param_free);
+      Val v = with_layout(
+          emit_value(OP_MULT_LOWER_TRI_SELF_TRANSPOSE, {L},
+                     L.si.rows * L.si.rows, si,
+                     {checked_immediate(L.si.rows, "multiply_lower_tri rows"),
+                      checked_immediate(L.si.cols, "multiply_lower_tri cols")}),
+          owning_layout(si));
+      g.ops.back().variant = v.autodiff ? 1u : 0u;
+      return v;
     }
     if (e.name == "to_matrix" && (e.args.size() == 1 || e.args.size() == 3)) {
       // Col-major storage makes reshaping a relabelling. One argument on an
       // array[N] vector[S] value yields the N x S matrix stan-math builds
       // from it, which is the transpose of our array-major flat order.
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       SlotInfo si;
       si.param_free = a.si.param_free;
       if (e.args.size() == 3) {
-        const int64_t rows = eval_int(e.args[1]);
-        const int64_t cols = eval_int(e.args[2]);
+        const int64_t rows =
+            actuals.at(1).require_constant_int("to_matrix rows");
+        const int64_t cols =
+            actuals.at(2).require_constant_int("to_matrix cols");
         if (checked_product({rows, cols}, "to_matrix") != g.slots[a.slot].len)
           fail("to_matrix: requested shape does not match source length",
                e.raw);
         si = matrix_view(rows, cols, a.si.param_free);
-        return Val{a.slot, a.autodiff, si};
+        return Val{a.slot, a.autodiff, si, owning_layout(si)};
       }
-      if (is_matrix(a.si)) return Val{a.slot, a.autodiff, a.si};
-      if (is_vector(a.si))
-        return Val{a.slot, a.autodiff,
-                   matrix_view(g.slots[a.slot].len, 1, a.si.param_free)};
-      if (is_row_vector(a.si))
-        return Val{a.slot, a.autodiff,
-                   matrix_view(1, g.slots[a.slot].len, a.si.param_free)};
+      if (is_matrix(a.si)) return Val{a.slot, a.autodiff, a.si, a.layout};
+      if (is_vector(a.si)) {
+        const SlotInfo result_si =
+            matrix_view(g.slots[a.slot].len, 1, a.si.param_free);
+        return Val{a.slot, a.autodiff, result_si, owning_layout(result_si)};
+      }
+      if (is_row_vector(a.si)) {
+        const SlotInfo result_si =
+            matrix_view(1, g.slots[a.slot].len, a.si.param_free);
+        return Val{a.slot, a.autodiff, result_si, owning_layout(result_si)};
+      }
       std::vector<int64_t> dims;
       if (is_array(a.si)) dims = array_shape(a.si).dims;
       if (dims.size() != 2) fail("to_matrix: unknown source shape", e.raw);
+      if (dims[0] == 0) dims[1] = 0;
       // array-major (row-major) source -> col-major matrix of the same
       // logical shape: transpose the storage.
       si = matrix_view(dims[0], dims[1], a.si.param_free);
-      return emit_value(OP_TRANSPOSE, {a}, g.slots[a.slot].len, si,
-                        {(int)dims[1], (int)dims[0]});
+      return with_layout(emit_value(OP_TRANSPOSE, {a}, g.slots[a.slot].len, si,
+                                    {(int)dims[1], (int)dims[0]}),
+                         owning_layout(si));
     }
     if ((e.name == "to_vector" || e.name == "to_row_vector") &&
         e.args.size() == 1) {
       // Col-major flattening is the identity on our storage.
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       SlotInfo si = view_of(e.type_);
       si.param_free = a.si.param_free;
-      return Val{a.slot, a.autodiff, si};
+      return Val{a.slot, a.autodiff, si, owning_layout(si)};
     }
     if (e.name == "to_array_1d" && e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       SlotInfo si =
           array_view({g.slots[a.slot].len}, ViewKind::Flat, a.si.param_free);
-      return Val{a.slot, a.autodiff, si};
+      return Val{a.slot, a.autodiff, si, owning_layout(si)};
     }
     if (e.name == "rep_matrix") {
       SlotInfo si;
       if (e.args.size() == 3) {
-        Val x = lower_expr(e.args[0]);  // scalar fill
-        const long R = eval_int(e.args[1]), C = eval_int(e.args[2]);
+        Val x = actuals.at(0).value();  // scalar fill
+        const long R = actuals.at(1).require_constant_int("rep_matrix rows");
+        const long C = actuals.at(2).require_constant_int("rep_matrix cols");
         si = matrix_view(R, C);
-        return emit_value(OP_REP_MAT, {x}, R * C, si, {(int)R, (int)C, 0});
+        return with_layout(
+            emit_value(OP_REP_MAT, {x}, R * C, si, {(int)R, (int)C, 0}),
+            owning_layout(si));
       }
       if (e.args.size() == 2) {
-        Val v = lower_expr(e.args[0]);
-        const long n = eval_int(e.args[1]);
-        const bool rowvec = e.args[0].type_ == "URowVector";
+        Val v = actuals.at(0).value();
+        const long n = actuals.at(1).require_constant_int("rep_matrix extent");
+        const bool rowvec = actuals.at(0).expr().type_ == "URowVector";
         const long R = rowvec ? n : g.slots[v.slot].len;
         const long C = rowvec ? g.slots[v.slot].len : n;
         si = matrix_view(R, C);
-        return emit_value(OP_REP_MAT, {v}, R * C, si,
-                          {(int)R, (int)C, rowvec ? 2 : 1});
+        return with_layout(emit_value(OP_REP_MAT, {v}, R * C, si,
+                                      {(int)R, (int)C, rowvec ? 2 : 1}),
+                           owning_layout(si));
       }
       fail("rep_matrix arity", e.raw);
     }
     if (e.name == "gp_exp_quad_cov" && e.args.size() == 3) {
-      Val x = lower_expr(e.args[0]);
-      Val alpha = lower_expr(e.args[1]);
-      Val rho = lower_expr(e.args[2]);
-      if (!x.si.param_free)
-        fail("gp_exp_quad_cov: parameter inputs unsupported", e.raw);
+      Val x = actuals.at(0).value();
+      Val alpha = actuals.at(1).value();
+      Val rho = actuals.at(2).value();
+      // x may be data or a parameter: gp_cov_bwd rebuilds the points from
+      // the promoted input, so a parameter x gets its adjoints too.
       // x is array[N] real (D == 1) or array[N] vector[D], stored
       // array-major, so D falls out of the declared dims.
       int64_t D = 1;
@@ -4751,36 +5769,41 @@ struct Lowering {
         D = array_shape(x.si).dims[1];
       const int64_t N = g.slots[x.slot].len / D;
       SlotInfo si = matrix_view(N, N);
-      return emit_value(OP_GP_EXP_QUAD_COV, {x, alpha, rho}, N * N, si,
-                        {(int)N, (int)D});
+      return with_layout(emit_value(OP_GP_EXP_QUAD_COV, {x, alpha, rho}, N * N,
+                                    si, {(int)N, (int)D}),
+                         owning_layout(si));
     }
     if (e.name == "diag_matrix" && e.args.size() == 1) {
-      Val v = lower_expr(e.args[0]);
+      Val v = actuals.at(0).value();
       const int64_t n = g.slots[v.slot].len;
       SlotInfo si = matrix_view(n, n);
-      return emit_value(OP_DIAG_MATRIX, {v}, n * n, si);
+      return with_layout(emit_value(OP_DIAG_MATRIX, {v}, n * n, si),
+                         owning_layout(si));
     }
     if (e.name == "cholesky_decompose" && e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail("cholesky_decompose needs a matrix", e.raw);
       if (a.si.rows != a.si.cols)
         fail("cholesky_decompose needs a square matrix", e.raw);
       SlotInfo si = a.si;
       si.param_free = a.si.param_free;
-      return emit_value(OP_CHOLESKY, {a}, g.slots[a.slot].len, si,
-                        {(int)a.si.rows});
+      return with_layout(emit_value(OP_CHOLESKY, {a}, g.slots[a.slot].len, si,
+                                    {(int)a.si.rows}),
+                         owning_layout(si));
     }
     if (e.name == "matrix_exp" && e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail("matrix_exp: needs a matrix", e.raw);
       if (a.si.rows != a.si.cols)
         fail("matrix_exp: needs a square matrix", e.raw);
-      return emit_value(OP_MATRIX_EXP, {a}, g.slots[a.slot].len, a.si,
-                        {checked_immediate(a.si.rows, "matrix_exp extent")});
+      return with_layout(
+          emit_value(OP_MATRIX_EXP, {a}, g.slots[a.slot].len, a.si,
+                     {checked_immediate(a.si.rows, "matrix_exp extent")}),
+          owning_layout(a.si));
     }
     if ((e.name == "inverse" || e.name == "inverse_spd") &&
         e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail(e.name + ": needs a matrix", e.raw);
       if (a.si.rows != a.si.cols)
         fail(e.name + ": needs a square matrix", e.raw);
@@ -4788,44 +5811,51 @@ struct Lowering {
                          g.slots[a.slot].len, a.si,
                          {checked_immediate(a.si.rows, e.name + " extent")});
       if (e.name == "inverse_spd") g.ops.back().variant = v.autodiff ? 1u : 0u;
-      return v;
+      return with_layout(v, owning_layout(a.si));
     }
     if (e.name == "log_determinant" && e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail("log_determinant: needs a matrix", e.raw);
       if (a.si.rows != a.si.cols)
         fail("log_determinant: needs a square matrix", e.raw);
-      return emit_value(
-          OP_LOG_DETERMINANT, {a}, 1, {},
-          {checked_immediate(a.si.rows, "log_determinant extent")});
+      return with_layout(
+          emit_value(OP_LOG_DETERMINANT, {a}, 1, {},
+                     {checked_immediate(a.si.rows, "log_determinant extent")}),
+          ExpressionLayout::scalar());
     }
 
     if ((e.name == "eigenvalues_sym" || e.name == "eigenvectors_sym") &&
         e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail(e.name + ": needs a matrix", e.raw);
       if (a.si.rows != a.si.cols)
         fail(e.name + ": needs a square matrix", e.raw);
       const int64_t n = a.si.rows;
       if (e.name == "eigenvalues_sym")
-        return emit_value(OP_EIGENVALUES_SYM, {a}, n, view_of(e.type_),
-                          {(int)n});
+        return with_layout(
+            emit_value(OP_EIGENVALUES_SYM, {a}, n, view_of(e.type_), {(int)n}),
+            owning_layout(view_of(e.type_)));
       SlotInfo si = matrix_view(n, n);
-      return emit_value(OP_EIGENVECTORS_SYM, {a}, n * n, si, {(int)n});
+      return with_layout(
+          emit_value(OP_EIGENVECTORS_SYM, {a}, n * n, si, {(int)n}),
+          owning_layout(si));
     }
     if (e.name == "quad_form_diag" && e.args.size() == 2) {
       // quad_form_diag(M, v) = diag(v) * M * diag(v).
-      Val m = lower_expr(e.args[0]);
-      Val v = lower_expr(e.args[1]);
+      Val m = actuals.at(0).value();
+      Val v = actuals.at(1).value();
       if (!is_matrix(m.si)) fail("quad_form_diag: needs a matrix", e.raw);
       const int64_t n = g.slots[v.slot].len;
       SlotInfo dsi = matrix_view(n, n, v.si.param_free);
-      Val d = emit_value(OP_DIAG_MATRIX, {v}, n * n, dsi);
+      Val d = with_layout(emit_value(OP_DIAG_MATRIX, {v}, n * n, dsi),
+                          owning_layout(dsi));
       SlotInfo si = matrix_view(n, n);
-      Val left =
-          emit_value(OP_GEMM, {d, m}, n * n, si, {(int)n, (int)n, (int)n});
-      return emit_value(OP_GEMM, {left, d}, n * n, si,
-                        {(int)n, (int)n, (int)n});
+      Val left = with_layout(
+          emit_value(OP_GEMM, {d, m}, n * n, si, {(int)n, (int)n, (int)n}),
+          owning_layout(si));
+      return with_layout(
+          emit_value(OP_GEMM, {left, d}, n * n, si, {(int)n, (int)n, (int)n}),
+          owning_layout(si));
     }
 
     if (e.name == "quad_form_sym" && e.args.size() == 2) {
@@ -4834,8 +5864,8 @@ struct Lowering {
       // GEMMs because stan-math's own association is part of the answer:
       // the kernel makes the same calls CmdStan does, including the
       // symmetry check on A, which throws when A is only nearly symmetric.
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
       if (!is_matrix(a.si)) fail("quad_form_sym: needs a matrix", e.raw);
       if (a.si.rows != a.si.cols)
         fail("quad_form_sym: needs a square matrix", e.raw);
@@ -4860,12 +5890,13 @@ struct Lowering {
       // solves make, and for the same reason.
       g.ops.back().variant =
           (uint8_t)((b_matrix ? 0u : 1u) | (v.autodiff ? 2u : 0u));
-      return v;
+      return with_layout(
+          v, b_matrix ? owning_layout(si) : ExpressionLayout::scalar());
     }
 
     if (e.name == "quad_form" && e.args.size() == 2) {
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
       if (!is_matrix(a.si)) fail("quad_form: needs a matrix", e.raw);
       if (a.si.rows != a.si.cols)
         fail("quad_form: needs a square matrix", e.raw);
@@ -4885,12 +5916,13 @@ struct Lowering {
                           checked_immediate(m, "quad_form extent")});
       g.ops.back().variant =
           (uint8_t)((b_matrix ? 0u : 1u) | (v.autodiff ? 2u : 0u));
-      return v;
+      return with_layout(
+          v, b_matrix ? owning_layout(si) : ExpressionLayout::scalar());
     }
 
     if (e.name == "add_diag" && e.args.size() == 2) {
-      Val a = lower_expr(e.args[0]);
-      Val d = lower_expr(e.args[1]);
+      Val a = actuals.at(0).value();
+      Val d = actuals.at(1).value();
       if (!is_matrix(a.si)) fail("add_diag: needs a matrix", e.raw);
       const bool scalar = is_scalar(d);
       const int64_t n = std::min(a.si.rows, a.si.cols);
@@ -4902,13 +5934,13 @@ struct Lowering {
                          {checked_immediate(a.si.rows, "add_diag rows"),
                           checked_immediate(a.si.cols, "add_diag cols")});
       g.ops.back().variant = scalar ? 1u : 0u;
-      return v;
+      return with_layout(v, owning_layout(a.si));
     }
 
     if ((e.name == "append_row" || e.name == "append_col") &&
         e.args.size() == 2) {
-      Val a = lower_expr(e.args[0]);
-      Val b = lower_expr(e.args[1]);
+      Val a = actuals.at(0).value();
+      Val b = actuals.at(1).value();
       const int64_t la = g.slots[a.slot].len, lb = g.slots[b.slot].len;
       const LogicalDims da = logical_dims(a.si, la, e.name);
       const LogicalDims db = logical_dims(b.si, lb, e.name);
@@ -4918,13 +5950,15 @@ struct Lowering {
         const SlotInfo si = view_for_dims(e.type_, out_dims);
         // Every supported value is column-major under this logical view;
         // adding columns is therefore always a contiguous concatenation.
-        return emit_value(OP_CONCAT2, {a, b}, la + lb, si);
+        return with_layout(emit_value(OP_CONCAT2, {a, b}, la + lb, si),
+                           owning_layout(si));
       }
       if (da.cols != db.cols) fail("append_row column mismatch", e.raw);
       const LogicalDims out_dims{da.rows + db.rows, da.cols};
       const SlotInfo si = view_for_dims(e.type_, out_dims);
       if (out_dims.cols == 1)
-        return emit_value(OP_CONCAT2, {a, b}, la + lb, si);
+        return with_layout(emit_value(OP_CONCAT2, {a, b}, la + lb, si),
+                           owning_layout(si));
 
       // Adding rows interleaves the two column-major operands one column at
       // a time. The same gather handles row-vectors and mixed matrix+row.
@@ -4937,54 +5971,126 @@ struct Lowering {
         for (int64_t i = 0; i < db.rows; ++i)
           idx.push_back((int)(la + j * db.rows + i));
       }
-      return emit_value(OP_GATHER, {cat}, la + lb, si, idx);
+      return with_layout(emit_value(OP_GATHER, {cat}, la + lb, si, idx),
+                         owning_layout(si));
     }
     if (e.name == "segment" && e.args.size() == 3) {
-      Val a = lower_expr(e.args[0]);
-      const long from = eval_int(e.args[1]);
-      const long cnt = eval_int(e.args[2]);
-      return emit_value(OP_SLICE, {a}, cnt, view_of(e.type_),
-                        {(int)(from - 1)});
+      Val a = actuals.at(0).value();
+      const long from = actuals.at(1).require_constant_int("segment start");
+      const long cnt = actuals.at(2).require_constant_int("segment count");
+      const int64_t offset = from - 1;
+      const int immediate = checked_immediate(offset, "segment offset");
+      return with_layout(
+          emit_value(OP_SLICE, {a}, cnt, view_of(e.type_), {immediate}),
+          contiguous_layout(a, offset, "segment"));
     }
     if (e.name == "sub_col" && e.args.size() == 4) {
       // sub_col(M, i, j, n) = M[i .. i+n-1, j]: contiguous in col-major.
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail("sub_col on a slot without matrix shape");
-      const long i = eval_int(e.args[1]);
-      const long j = eval_int(e.args[2]);
-      const long n = eval_int(e.args[3]);
-      return emit_value(OP_SLICE, {a}, n, view_of(e.type_),
-                        {(int)((j - 1) * a.si.rows + i - 1)});
+      const long i = actuals.at(1).require_constant_int("sub_col row");
+      const long j = actuals.at(2).require_constant_int("sub_col column");
+      const long n = actuals.at(3).require_constant_int("sub_col count");
+      const int64_t offset = (j - 1) * a.si.rows + i - 1;
+      const int immediate = checked_immediate(offset, "sub_col offset");
+      return with_layout(
+          emit_value(OP_SLICE, {a}, n, view_of(e.type_), {immediate}),
+          contiguous_layout(a, offset, "sub_col"));
+    }
+    if (e.name == "block" && e.args.size() == 5) {
+      // block(M, i, j, nr, nc) = M[i .. i+nr-1, j .. j+nc-1]. Each result
+      // column is contiguous in col-major storage, but consecutive result
+      // columns sit M.rows apart, so a 2-D window needs a gather rather
+      // than the single slice sub_col gets.
+      Val a = actuals.at(0).value();
+      if (!is_matrix(a.si)) fail("block on a slot without matrix shape");
+      const long i = actuals.at(1).require_constant_int("block row");
+      const long j = actuals.at(2).require_constant_int("block column");
+      const long nr = actuals.at(3).require_constant_int("block rows");
+      const long nc = actuals.at(4).require_constant_int("block columns");
+      check_block_shape(a.si.rows, a.si.cols, i, j, nr, nc);
+      std::vector<int> gather;
+      gather.reserve((size_t)(nr * nc));
+      for (long c = 0; c < nc; ++c)
+        for (long k = 0; k < nr; ++k)
+          gather.push_back(checked_immediate(
+              (j - 1 + c) * a.si.rows + (i - 1 + k), "block gather offset"));
+      return with_layout(
+          emit_value(OP_GATHER, {a}, nr * nc, matrix_view(nr, nc), gather),
+          ExpressionLayout::scalar());
     }
     if (e.name == "col" && e.args.size() == 2) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail("col on a slot without matrix shape");
-      const long j = eval_int(e.args[1]);
-      return emit_value(OP_SLICE, {a}, a.si.rows, view_of(e.type_),
-                        {(int)((j - 1) * a.si.rows)});
+      const long j = actuals.at(1).require_constant_int("col index");
+      const int64_t offset = (j - 1) * a.si.rows;
+      const int immediate = checked_immediate(offset, "col offset");
+      return with_layout(
+          emit_value(OP_SLICE, {a}, a.si.rows, view_of(e.type_), {immediate}),
+          contiguous_layout(a, offset, "col"));
     }
     if (e.name == "diagonal" && e.args.size() == 1) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail("diagonal on a slot without matrix shape");
       // Eigen's diagonal steps one row and one column at a time, which in
       // column-major storage is rows + 1 apart, and stops at the shorter
       // side.
       const int64_t n = std::min(a.si.rows, a.si.cols);
-      return emit_value(OP_SLICE_STRIDED, {a}, n, view_of(e.type_),
-                        {0, (int)(a.si.rows + 1)});
+      return with_layout(
+          emit_value(OP_SLICE_STRIDED, {a}, n, view_of(e.type_),
+                     {0, checked_immediate(a.si.rows + 1, "diagonal stride")}),
+          ExpressionLayout::scalar());
     }
     if (e.name == "row" && e.args.size() == 2) {
-      Val a = lower_expr(e.args[0]);
+      Val a = actuals.at(0).value();
       if (!is_matrix(a.si)) fail("row on a slot without matrix shape");
-      const long i = eval_int(e.args[1]);
-      return emit_value(OP_SLICE_STRIDED, {a}, a.si.cols, view_of(e.type_),
-                        {(int)(i - 1), (int)a.si.rows});
+      const long i = actuals.at(1).require_constant_int("row index");
+      const int64_t offset = i - 1;
+      return with_layout(
+          emit_value(OP_SLICE_STRIDED, {a}, a.si.cols, view_of(e.type_),
+                     {checked_immediate(offset, "row offset"),
+                      checked_immediate(a.si.rows, "row stride")}),
+          ExpressionLayout::scalar());
     }
     if ((e.name == "head" || e.name == "tail") && e.args.size() == 2) {
-      Val a = lower_expr(e.args[0]);
-      const long n = eval_int(e.args[1]);
+      Val a = actuals.at(0).value();
+      const long n = actuals.at(1).require_constant_int("head/tail count");
       const long off = e.name == "head" ? 0 : g.slots[a.slot].len - n;
-      return emit_value(OP_SLICE, {a}, n, view_of(e.type_), {(int)off});
+      const int immediate = checked_immediate(off, e.name + " offset");
+      return with_layout(
+          emit_value(OP_SLICE, {a}, n, view_of(e.type_), {immediate}),
+          contiguous_layout(a, off, e.name));
+    }
+    if (e.name == "reverse" && e.args.size() == 1) {
+      Val a = actuals.at(0).value();
+      const int64_t len = g.slots[a.slot].len;
+      std::vector<int> gather;
+      gather.reserve((size_t)len);
+      if (is_array(a.si)) {
+        // Graph arrays keep each outer element contiguous. Reverse those
+        // complete chunks so an array of vectors/matrices retains the order
+        // inside every element.
+        const ArrayShape& shape = array_shape(a.si);
+        if (shape.dims.empty()) fail("reverse: array has no dimensions", e.raw);
+        const int64_t outer = shape.dims.front();
+        const std::vector<int64_t> suffix(shape.dims.begin() + 1,
+                                          shape.dims.end());
+        const int64_t width = checked_product(suffix, "reverse array element");
+        if (checked_product(shape.dims, "reverse array") != len)
+          fail("reverse: array shape does not match storage", e.raw);
+        for (int64_t i = outer; i-- > 0;)
+          for (int64_t k = 0; k < width; ++k)
+            gather.push_back(
+                checked_immediate(i * width + k, "reverse gather offset"));
+      } else {
+        if (!is_vector(a.si) && !is_row_vector(a.si))
+          fail("reverse: argument is not a vector, row-vector, or array",
+               e.raw);
+        for (int64_t i = len; i-- > 0;)
+          gather.push_back(checked_immediate(i, "reverse gather offset"));
+      }
+      return with_layout(emit_value(OP_GATHER, {a}, len, a.si, gather),
+                         ExpressionLayout::scalar());
     }
     return std::nullopt;
   }
@@ -4997,16 +6103,19 @@ struct Lowering {
   // Stan Math intentionally returns value_type_t<y>, so only y participates
   // in autodiff.  Keep x as a graph input for values while stamping the op's
   // activity and result scalar type from y alone.
-  std::optional<Val> lower_algebra_fn(const mir::Expr& e) {
-    if (e.name != "algebra_solver") return std::nullopt;
-    if (e.args.size() != 5 && e.args.size() != 8)
+  Val lower_algebra_fn(const mir::Expr& e, CallArguments& actuals) {
+    if (actuals.size() != 5 && actuals.size() != 8)
       fail("algebra_solver: expected 5 or 8 arguments", e.raw);
     if (e.unsized.leaf != mir::UnsizedLeaf::Vector || e.unsized.depth != 0)
       fail("algebra_solver: result must be a vector", e.raw);
 
-    auto fit = fun_defs.find(e.args[0].name);
+    // Argument zero is a callback name, not a value acquisition. It must stay
+    // source-level so the callback can be retained in AlgebraSpec.
+    const mir::Expr& system_expr = actuals.at(0).expr();
+    auto fit = fun_defs.find(system_expr.name);
     if (fit == fun_defs.end())
-      fail("algebra_solver: unknown algebraic system " + e.args[0].name, e.raw);
+      fail("algebra_solver: unknown algebraic system " + system_expr.name,
+           e.raw);
     const mir::FunDef& f = *fit->second;
     if (f.arg_views.size() != 4 || f.arg_names.size() != 4 ||
         f.arg_types.size() != 4 || f.arg_views[0].depth != 0 ||
@@ -5024,17 +6133,24 @@ struct Lowering {
 
     auto spec = std::make_shared<AlgebraSpec>();
     spec->adopt(fun_defs);
-    spec->system_name = e.args[0].name;
-    spec->x_r = const_values(e.args[3]);
-    spec->x_i = const_ints(e.args[4]);
-    if (e.args.size() == 8) {
-      spec->relative_tolerance = const_values(e.args[5]).at(0);
-      spec->function_tolerance = const_values(e.args[6]).at(0);
-      spec->max_num_steps = (int64_t)eval_int(e.args[7]);
+    spec->system_name = system_expr.name;
+    spec->x_r = actuals.at(3).require_constant_reals("algebra_solver x_r");
+    spec->x_i = actuals.at(4).require_constant_ints("algebra_solver x_i");
+    if (actuals.size() == 8) {
+      spec->relative_tolerance =
+          actuals.at(5)
+              .require_constant_reals("algebra_solver relative tolerance")
+              .at(0);
+      spec->function_tolerance =
+          actuals.at(6)
+              .require_constant_reals("algebra_solver function tolerance")
+              .at(0);
+      spec->max_num_steps =
+          actuals.at(7).require_constant_int("algebra_solver maximum steps");
     }
 
-    Val x = lower_expr(e.args[1]);
-    Val y = lower_expr(e.args[2]);
+    Val x = actuals.at(1).value();
+    Val y = actuals.at(2).value();
     if (!is_vector(x.si) || !is_vector(y.si))
       fail("algebra_solver: initial guess and parameters must be vectors",
            e.raw);
@@ -5130,7 +6246,8 @@ struct Lowering {
   // packed in order, data reals packed in order, integers as compile-time
   // constants -- so the kernel and the register machine are unchanged;
   // only the packing at this end is new.
-  std::optional<Val> lower_ode_variadic(const mir::Expr& e) {
+  std::optional<Val> lower_ode_variadic(const mir::Expr& e,
+                                        CallArguments& actuals) {
     static const std::vector<std::pair<const char*, OdeSpec::Solver>> kSolvers =
         {{"ode_bdf", OdeSpec::BDF},
          {"ode_adams", OdeSpec::ADAMS},
@@ -5148,22 +6265,29 @@ struct Lowering {
     if (sit == kSolvers.end()) return std::nullopt;
 
     const size_t fixed = with_tol ? 7 : 4;
-    if (e.args.size() < fixed) fail(e.name + ": unexpected arity", e.raw);
+    if (actuals.size() < fixed) fail(e.name + ": unexpected arity", e.raw);
     auto spec = std::make_shared<OdeSpec>();
-    if (fun_defs.find(e.args[0].name) == fun_defs.end())
-      fail(e.name + ": unknown right-hand side " + e.args[0].name, e.raw);
+    // Argument zero is the callback name retained in OdeSpec, not a lowered
+    // value. The remaining fixed arguments are acquired in the historical
+    // order below because constant probing can be observable through errors.
+    const mir::Expr& rhs_expr = actuals.at(0).expr();
+    if (fun_defs.find(rhs_expr.name) == fun_defs.end())
+      fail(e.name + ": unknown right-hand side " + rhs_expr.name, e.raw);
     spec->adopt(fun_defs);
-    spec->rhs_name = e.args[0].name;
+    spec->rhs_name = rhs_expr.name;
     spec->solver = sit->second;
     spec->stiff =
         spec->solver == OdeSpec::BDF || spec->solver == OdeSpec::ADAMS;
     stamp_ode_defaults(*spec);
-    spec->t0 = const_values(e.args[2]).at(0);
-    spec->ts = const_values(e.args[3]);
+    spec->t0 = actuals.at(2).require_constant_reals("ODE initial time").at(0);
+    spec->ts = actuals.at(3).require_constant_reals("ODE output times");
     if (with_tol) {
-      spec->rtol = const_values(e.args[4]).at(0);
-      spec->atol = const_values(e.args[5]).at(0);
-      spec->max_steps = (long)const_values(e.args[6]).at(0);
+      spec->rtol =
+          actuals.at(4).require_constant_reals("ODE relative tolerance").at(0);
+      spec->atol =
+          actuals.at(5).require_constant_reals("ODE absolute tolerance").at(0);
+      spec->max_steps =
+          (long)actuals.at(6).require_constant_reals("ODE maximum steps").at(0);
     }
 
     // Classify and pack. Data arguments fold into the spec here and never
@@ -5172,20 +6296,22 @@ struct Lowering {
     // compile_rhs_args assigns their register sub-ranges in.
     std::vector<RhsArg> rargs;
     std::vector<Val> param_parts;
-    for (size_t k = fixed; k < e.args.size(); ++k) {
-      const mir::Expr& a = e.args[k];
+    for (size_t k = fixed; k < actuals.size(); ++k) {
+      LoweredArgument& actual = actuals.at(k);
+      const mir::Expr& a = actual.expr();
       RhsArg ra;
       const bool is_int = a.unsized.leaf == mir::UnsizedLeaf::Int;
       if (is_int && a.data_only) {
         ra.is_int = true;
-        ra.ints = const_ints(a);
+        ra.ints = actual.require_constant_ints("ODE integer argument");
       } else if (a.data_only) {
         // One evaluation, held in a local. Calling const_values(a) twice
         // and taking begin() from one temporary and end() from the other
         // is an invalid range, and it does not fail loudly: it appended
         // hundreds of garbage doubles to x_r and surfaced much later as
         // "ode parameters and data[927] is nan".
-        const std::vector<double> vals = const_values(a);
+        const std::vector<double>& vals =
+            actual.require_constant_reals("ODE data argument");
         ra.len = (int)vals.size();
         spec->x_r.insert(spec->x_r.end(), vals.begin(), vals.end());
       } else {
@@ -5193,7 +6319,7 @@ struct Lowering {
           fail(e.name + ": integer argument " + std::to_string(k - fixed + 1) +
                    " is not data",
                e.raw);
-        const Val v = lower_expr(a);
+        const Val v = actual.value();
         ra.is_param = true;
         ra.len = (int)g.slots[v.slot].len;
         param_parts.push_back(v);
@@ -5201,7 +6327,7 @@ struct Lowering {
       rargs.push_back(std::move(ra));
     }
 
-    Val z0 = lower_expr(e.args[1]);
+    Val z0 = actuals.at(1).value();
     const int64_t S = g.slots[z0.slot].len;
     const int64_t N = (int64_t)spec->ts.size();
 
@@ -5229,8 +6355,8 @@ struct Lowering {
   }
 
   // The integrate_ode_* family.
-  std::optional<Val> lower_ode_fn(const mir::Expr& e) {
-    if (auto v = lower_ode_variadic(e)) return v;
+  std::optional<Val> lower_ode_fn(const mir::Expr& e, CallArguments& actuals) {
+    if (auto v = lower_ode_variadic(e, actuals)) return v;
     std::optional<OdeSpec::Solver> legacy_solver;
     if (e.name == "integrate_ode_rk45")
       legacy_solver = OdeSpec::RK45;
@@ -5242,29 +6368,38 @@ struct Lowering {
       // integrate_ode_*(f, z_init, t0, ts, theta, x_r, x_i[, rtol, atol,
       // max_steps]). Everything but z_init and theta is data, and is
       // captured in the spec the kernel reads through the op payload.
-      if (e.args.size() < 7) fail(e.name + ": unexpected arity", e.raw);
+      if (actuals.size() < 7) fail(e.name + ": unexpected arity", e.raw);
       auto spec = std::make_shared<OdeSpec>();
-      auto fit = fun_defs.find(e.args[0].name);
+      // The callback name is retained as source metadata; all value-bearing
+      // actuals use the lazy wrapper so each is acquired once.
+      const mir::Expr& rhs_expr = actuals.at(0).expr();
+      auto fit = fun_defs.find(rhs_expr.name);
       if (fit == fun_defs.end())
-        fail(e.name + ": unknown right-hand side " + e.args[0].name, e.raw);
+        fail(e.name + ": unknown right-hand side " + rhs_expr.name, e.raw);
       spec->adopt(fun_defs);
-      spec->rhs_name = e.args[0].name;
+      spec->rhs_name = rhs_expr.name;
       spec->legacy = true;
       spec->solver = *legacy_solver;
       spec->stiff =
           spec->solver == OdeSpec::BDF || spec->solver == OdeSpec::ADAMS;
       stamp_ode_defaults(*spec);
-      spec->t0 = const_values(e.args[2]).at(0);
-      spec->ts = const_values(e.args[3]);
-      spec->x_r = const_values(e.args[5]);
-      spec->x_i = const_ints(e.args[6]);
-      if (e.args.size() >= 10) {
-        spec->rtol = const_values(e.args[7]).at(0);
-        spec->atol = const_values(e.args[8]).at(0);
-        spec->max_steps = (long)const_values(e.args[9]).at(0);
+      spec->t0 = actuals.at(2).require_constant_reals("ODE initial time").at(0);
+      spec->ts = actuals.at(3).require_constant_reals("ODE output times");
+      spec->x_r = actuals.at(5).require_constant_reals("ODE real data");
+      spec->x_i = actuals.at(6).require_constant_ints("ODE integer data");
+      if (actuals.size() >= 10) {
+        spec->rtol = actuals.at(7)
+                         .require_constant_reals("ODE relative tolerance")
+                         .at(0);
+        spec->atol = actuals.at(8)
+                         .require_constant_reals("ODE absolute tolerance")
+                         .at(0);
+        spec->max_steps = (long)actuals.at(9)
+                              .require_constant_reals("ODE maximum steps")
+                              .at(0);
       }
-      Val z0 = lower_expr(e.args[1]);
-      Val theta = lower_expr(e.args[4]);
+      Val z0 = actuals.at(1).value();
+      Val theta = actuals.at(4).value();
       const int64_t S = g.slots[z0.slot].len;
       const int64_t N = (int64_t)spec->ts.size();
       // Compile the right-hand side now that its argument sizes are known.
@@ -5443,7 +6578,7 @@ struct Lowering {
     out.n_unconstrained += raw_len;
 
     if (tr.kind == mir::Transform::Identity) {
-      Val value{raw, scalar_autodiff(), psi};
+      Val value{raw, scalar_autodiff(), psi, owning_layout(psi)};
       CompiledModel::ParamView serial_view = parameter_view(s, raw, raw_len);
       scope[s.decl_id] = value;
       // In write_array mode the column order is dictated by the FnWriteParam
@@ -5548,6 +6683,7 @@ struct Lowering {
     }
     Val con =
         emit_raw(opcode, ins, con_len, psi, tr_idata, jac, scalar_autodiff());
+    con.layout = owning_layout(psi);
     jac_slots.push_back(jac);
     scope[s.decl_id] = con;
     if (!in_write_array)
@@ -5621,6 +6757,7 @@ struct Lowering {
             sh.si = v.si;
             sh.deferred_shape = false;
             v.autodiff = sh.autodiff;
+            v.layout = owning_layout(v.si);
             scope[s.decl_id] = v;
             sync_data_local(s.decl_id, s.init, v);
           } else {
@@ -5649,6 +6786,7 @@ struct Lowering {
             require_binding(v, sh.len, expected, s.decl_id, s.raw);
             v.autodiff = sh.autodiff;
             v.si = expected;
+            v.layout = owning_layout(v.si);
             scope[s.decl_id] = v;
           }
           decls[s.decl_id] = sh;
@@ -5689,8 +6827,8 @@ struct Lowering {
               fail("indexed assignment to undeclared " + s.lhs);
             SlotInfo si = dl->second.si;
             si.param_free = true;
-            prev_v =
-                Val{add_slot(dl->second.len, false), dl->second.autodiff, si};
+            prev_v = Val{add_slot(dl->second.len, false), dl->second.autodiff,
+                         si, owning_layout(si)};
             const double initial =
                 dl->second.int_array
                     ? static_cast<double>(std::numeric_limits<int>::min())
@@ -5721,8 +6859,9 @@ struct Lowering {
               fail("full-span assignment needs a container for " + s.lhs,
                    s.raw);
             require_binding(rhs_v, g.slots[prev].len, prev_v.si, s.lhs, s.raw);
-            Val nv = emit_value(OP_SET_SLICE, {prev_v, rhs_v},
-                                g.slots[prev].len, out_si, {0});
+            Val nv = with_layout(emit_value(OP_SET_SLICE, {prev_v, rhs_v},
+                                            g.slots[prev].len, out_si, {0}),
+                                 owning_layout(out_si));
             propagate_int_update(nv, prev_v, rhs_v, 0, 1);
             scope[s.lhs] = nv;
             sync_indexed_data_local(s.lhs, nv);
@@ -5737,9 +6876,11 @@ struct Lowering {
               fail("row assignment index out of bounds for " + s.lhs);
             if (g.slots[rhs].len != prev_v.si.cols)
               fail("row assignment size mismatch for " + s.lhs);
-            Val nv = emit_value(OP_SET_SLICE_STRIDED, {prev_v, rhs_v},
-                                g.slots[prev].len, out_si,
-                                {(int)i, (int)prev_v.si.rows});
+            Val nv =
+                with_layout(emit_value(OP_SET_SLICE_STRIDED, {prev_v, rhs_v},
+                                       g.slots[prev].len, out_si,
+                                       {(int)i, (int)prev_v.si.rows}),
+                            owning_layout(out_si));
             propagate_int_update(nv, prev_v, rhs_v, i, prev_v.si.rows);
             scope[s.lhs] = nv;
             sync_indexed_data_local(s.lhs, nv);
@@ -5758,8 +6899,10 @@ struct Lowering {
             SlotInfo expected = indexed_view(prev_v.si, 1, width, s.rhs.type_);
             require_binding(rhs_v, width, expected, s.lhs, s.raw);
             const int64_t start = (i - 1) * width;
-            Val nv = emit_value(OP_SET_SLICE, {prev_v, rhs_v},
-                                g.slots[prev].len, out_si, {(int)start});
+            Val nv =
+                with_layout(emit_value(OP_SET_SLICE, {prev_v, rhs_v},
+                                       g.slots[prev].len, out_si, {(int)start}),
+                            owning_layout(out_si));
             propagate_int_update(nv, prev_v, rhs_v, start, 1);
             scope[s.lhs] = nv;
             sync_indexed_data_local(s.lhs, nv);
@@ -5783,8 +6926,10 @@ struct Lowering {
             if (g.slots[rhs].len != len)
               fail("range assignment size mismatch for " + s.lhs);
             const int64_t start = len == 0 ? 0 : lo - 1;
-            Val nv = emit_value(OP_SET_SLICE, {prev_v, rhs_v},
-                                g.slots[prev].len, out_si, {(int)start});
+            Val nv =
+                with_layout(emit_value(OP_SET_SLICE, {prev_v, rhs_v},
+                                       g.slots[prev].len, out_si, {(int)start}),
+                            owning_layout(out_si));
             propagate_int_update(nv, prev_v, rhs_v, start, 1);
             scope[s.lhs] = nv;
             sync_indexed_data_local(s.lhs, nv);
@@ -5844,8 +6989,10 @@ struct Lowering {
             if (g.slots[rhs].len != len)
               fail("range assignment size mismatch for " + s.lhs);
             const int64_t start = len == 0 ? 0 : j * prev_v.si.rows + lo - 1;
-            Val nv = emit_value(OP_SET_SLICE, {prev_v, rhs_v},
-                                g.slots[prev].len, out_si, {(int)start});
+            Val nv =
+                with_layout(emit_value(OP_SET_SLICE, {prev_v, rhs_v},
+                                       g.slots[prev].len, out_si, {(int)start}),
+                            owning_layout(out_si));
             propagate_int_update(nv, prev_v, rhs_v, start, 1);
             scope[s.lhs] = nv;
             sync_indexed_data_local(s.lhs, nv);
@@ -5904,6 +7051,46 @@ struct Lowering {
             sync_indexed_data_local(s.lhs, nv);
             return;
           }
+          // A full array-index prefix followed by an explicit `:` for every
+          // remaining dimension: H[i, :, :] on array[N] matrix[R, C] (a
+          // container leaf), or y_approx[i, :] on a plain array[N, S] real
+          // (the remaining dimension is just another array axis, no
+          // container leaf at all) -- either way this spells the same
+          // whole-remainder replacement flat_addr's "whole elements" case
+          // already gives an implicit-rest prefix. Not `all_single` (the
+          // trailing indices are All, not omitted or Single), so it falls
+          // outside the block above.
+          if (dd) {
+            size_t prefix_len = 0;
+            while (prefix_len < s.lhs_idx.size() &&
+                   s.lhs_idx[prefix_len].name == "IndexSingle")
+              ++prefix_len;
+            bool trailing_all = true;
+            for (size_t d = prefix_len; d < s.lhs_idx.size(); ++d)
+              if (s.lhs_idx[d].name != "IndexAll") trailing_all = false;
+            if (prefix_len > 0 && trailing_all && prefix_len < dd->size() &&
+                s.lhs_idx.size() == dd->size()) {
+              std::vector<int64_t> ix;
+              ix.reserve(prefix_len);
+              for (size_t d = 0; d < prefix_len; ++d) {
+                const int64_t one = eval_int(s.lhs_idx[d].args[0]);
+                check_index(one, (*dd)[d], "array assignment index", s.raw);
+                ix.push_back(one - 1);
+              }
+              const bool mat = array_shape(prev_v.si).leaf == ViewKind::Matrix;
+              const Addr a = flat_addr(*dd, mat, ix);
+              require_binding(
+                  rhs_v, a.len,
+                  indexed_view(prev_v.si, prefix_len, a.len, s.rhs.type_),
+                  s.lhs, s.raw);
+              Val nv = emit_value(OP_SET_SLICE, {prev_v, rhs_v},
+                                  g.slots[prev].len, out_si, {(int)a.off});
+              propagate_int_update(nv, prev_v, rhs_v, a.off, 1);
+              scope[s.lhs] = nv;
+              sync_indexed_data_local(s.lhs, nv);
+              return;
+            }
+          }
           int64_t flat = 0;
           if (all_single && s.lhs_idx.size() == 1) {
             flat = eval_int(s.lhs_idx[0].args[0]) - 1;
@@ -5917,8 +7104,10 @@ struct Lowering {
               desc += " [" + (ix.name.empty() ? "?" : ix.name) + "]";
             fail(desc, s.raw);
           }
-          Val nv = emit_value(OP_SET_INDEX, {prev_v, rhs_v}, g.slots[prev].len,
-                              out_si, {(int)flat});
+          Val nv =
+              with_layout(emit_value(OP_SET_INDEX, {prev_v, rhs_v},
+                                     g.slots[prev].len, out_si, {(int)flat}),
+                          owning_layout(out_si));
           propagate_int_update(nv, prev_v, rhs_v, flat, 1);
           scope[s.lhs] = nv;
           sync_indexed_data_local(s.lhs, nv);
@@ -5963,6 +7152,7 @@ struct Lowering {
               rhs.autodiff = dl->second.autodiff;
             }
           }
+          rhs.layout = owning_layout(rhs.si);
           scope[s.lhs] = rhs;
           sync_data_local(s.lhs, s.rhs, rhs);
         }
@@ -6644,6 +7834,57 @@ CompiledModel compile_model(const std::string& mir_text, const DataMap& data) {
       w.interp = std::make_shared<WaInterp>(prog, std::move(env));
     }
     cm.write_array = std::move(w);
+  }
+  if (prog->has_transform_inits) {
+    // The inverse parameter transforms. Nothing is interpreted here: the
+    // section runs only when a caller actually supplies constrained starting
+    // values, so a model nobody inits by name never pays for a bound
+    // expression this build cannot evaluate.
+    CompiledModel::TransformInits ti;
+    std::vector<InitParam> params;
+    if (cm.views.size() != cm.unc_params.size()) {
+      ti.truncated = "the constrained and free parameter lists disagree (" +
+                     std::to_string(cm.views.size()) + " vs " +
+                     std::to_string(cm.unc_params.size()) + ")";
+    } else {
+      for (size_t i = 0; i < cm.views.size(); ++i) {
+        const CompiledModel::ParamView& view = cm.views[i];
+        const CompiledModel::UncParam& unc = cm.unc_params[i];
+        if (view.name != unc.name) {
+          ti.truncated =
+              "constrained and free parameters are out of order at " +
+              view.name;
+          break;
+        }
+        InitParam p;
+        p.name = view.name;
+        p.dims = view.dims;
+        p.constrained_len = view.len;
+        p.free_len = unc.len;
+        // The leaf is the unit the arena keeps contiguous inside each
+        // element of the surrounding array. An innermost matrix is one
+        // whatever the transform is -- the arena stores it column-major
+        // while a serial init lists it first-index-fastest, and an
+        // elementwise transform over an array of matrices has to cross that
+        // permutation too. Otherwise only a structured transform has a leaf;
+        // an elementwise one treats each value on its own, which for a
+        // vector or a plain array is the same enumeration either way.
+        p.leaf_rank = view.matrix_storage                  ? 2
+                      : is_structured_check(unc.transform) ? 1
+                                                           : 0;
+        if ((size_t)p.leaf_rank > p.dims.size()) {
+          ti.truncated = view.name +
+                         " declares fewer dimensions than its "
+                         "transform needs";
+          break;
+        }
+        params.push_back(std::move(p));
+      }
+    }
+    if (ti.truncated.empty())
+      ti.interp =
+          std::make_shared<InitInterp>(prog, lo.td.env(), std::move(params));
+    cm.transform_inits = std::move(ti);
   }
   prep.plain("compile", "total", compile_time);
   prep.report();

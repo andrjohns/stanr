@@ -80,8 +80,8 @@ struct AdjProgram {
 // forward never rewrites shares one adjoint cell with its source, the way
 // the replay's registers share one vari, so a live-out or live-in register
 // may not have an adjoint cell of its own.
-// `fwd` rides along for the CALL payloads: a CALL's adjoint is its
-// kernel's own backward, and the ranges live in fwd.calls.
+// `fwd` supplies normalized CALL payloads: one per CALL instruction, with a
+// pre-resolved kernel backward and precomputed value/adjoint ranges.
 void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
                  double* adj);
 

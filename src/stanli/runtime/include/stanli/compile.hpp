@@ -9,6 +9,7 @@
 #define STANLI_COMPILE_HPP
 
 #include <stanli/data.hpp>
+#include <stanli/init_interp.hpp>
 #include <stanli/graph.hpp>
 #include <stanli/mir.hpp>
 
@@ -197,6 +198,17 @@ struct CompiledModel {
     }
   };
   std::optional<WriteArray> write_array;
+
+  // Starting values on the constrained scale, when stanc3's inverse
+  // parameter transforms reached this model. Absent for a MIR without a
+  // transform_inits section; present with `truncated` set when the section
+  // is there but cannot be run, so a caller reports why instead of starting
+  // somewhere the user did not ask for.
+  struct TransformInits {
+    std::shared_ptr<InitInterp> interp;
+    std::string truncated;
+  };
+  std::optional<TransformInits> transform_inits;
 };
 
 CompiledModel compile_model(const std::string& mir_text, const DataMap& data);

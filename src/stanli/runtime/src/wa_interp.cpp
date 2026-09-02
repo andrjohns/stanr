@@ -12,23 +12,43 @@
 
 namespace stanli {
 
+const ScalarRng* scalar_rng_family(const std::string& name) {
+  static const std::map<std::string, ScalarRng> kFamilies = {
+      {"poisson_log_rng", ScalarRng::PoissonLog},
+      {"uniform_rng", ScalarRng::Uniform},
+      {"bernoulli_rng", ScalarRng::Bernoulli},
+      {"normal_rng", ScalarRng::Normal},
+      {"lognormal_rng", ScalarRng::Lognormal},
+      {"binomial_rng", ScalarRng::Binomial},
+      {"gumbel_rng", ScalarRng::Gumbel},
+      {"beta_binomial_rng", ScalarRng::BetaBinomial},
+      {"exponential_rng", ScalarRng::Exponential},
+  };
+  const auto found = kFamilies.find(name);
+  return found == kFamilies.end() ? nullptr : &found->second;
+}
+
 size_t scalar_rng_arity(ScalarRng family) {
   switch (family) {
     case ScalarRng::PoissonLog:
     case ScalarRng::Bernoulli:
+    case ScalarRng::Exponential:
       return 1;
     case ScalarRng::Uniform:
     case ScalarRng::Normal:
     case ScalarRng::Lognormal:
     case ScalarRng::Binomial:
+    case ScalarRng::Gumbel:
       return 2;
+    case ScalarRng::BetaBinomial:
+      return 3;
   }
   throw std::logic_error("unknown scalar RNG family");
 }
 
 bool scalar_rng_is_int(ScalarRng family) {
   return family == ScalarRng::PoissonLog || family == ScalarRng::Bernoulli ||
-         family == ScalarRng::Binomial;
+         family == ScalarRng::Binomial || family == ScalarRng::BetaBinomial;
 }
 
 double scalar_rng_draw(ScalarRng family, const double* args, size_t nargs,
@@ -50,6 +70,13 @@ double scalar_rng_draw(ScalarRng family, const double* args, size_t nargs,
     case ScalarRng::Binomial:
       return static_cast<double>(
           stan::math::binomial_rng(static_cast<int>(args[0]), args[1], g));
+    case ScalarRng::Gumbel:
+      return stan::math::gumbel_rng(args[0], args[1], g);
+    case ScalarRng::BetaBinomial:
+      return static_cast<double>(stan::math::beta_binomial_rng(
+          static_cast<int>(args[0]), args[1], args[2], g));
+    case ScalarRng::Exponential:
+      return stan::math::exponential_rng(args[0], g);
   }
   throw std::logic_error("unknown scalar RNG family");
 }
@@ -88,6 +115,19 @@ void multi_normal_rng_draw(const double* location, size_t location_size,
 
   const Eigen::VectorXd draw =
       stan::math::multi_normal_rng(mu, sigma, rng.gen());
+  for (size_t i = 0; i < output_size; ++i)
+    output[i] = draw[static_cast<Eigen::Index>(i)];
+}
+
+void dirichlet_rng_draw(const double* alpha, size_t alpha_size, double* output,
+                        size_t output_size, WaRng& rng) {
+  if ((alpha_size != 0 && alpha == nullptr) ||
+      (output_size != 0 && output == nullptr) || output_size != alpha_size)
+    throw std::logic_error("malformed dirichlet RNG arguments");
+  Eigen::VectorXd a(static_cast<Eigen::Index>(alpha_size));
+  for (size_t i = 0; i < alpha_size; ++i)
+    a[static_cast<Eigen::Index>(i)] = alpha[i];
+  const Eigen::VectorXd draw = stan::math::dirichlet_rng(a, rng.gen());
   for (size_t i = 0; i < output_size; ++i)
     output[i] = draw[static_cast<Eigen::Index>(i)];
 }
@@ -455,6 +495,17 @@ bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
     return true;
   }
 
+  // Whole-vector concentration argument, one simplex draw.
+  if (base == "dirichlet") {
+    const auto& alpha = av.at(0);
+    const int64_t K = (int64_t)alpha.r.size();
+    out->dims = {K};
+    out->r.resize(static_cast<size_t>(K));
+    dirichlet_rng_draw(alpha.r.data(), alpha.r.size(), out->r.data(),
+                       out->r.size(), rng);
+    return true;
+  }
+
   // Whole-vector argument, one categorical draw.
   if (base == "categorical" || base == "categorical_logit") {
     int k = 0;
@@ -498,7 +549,8 @@ bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
     } else if (base == "beta") {
       v = stan::math::beta_rng(sc(0, i), sc(1, i), g);
     } else if (base == "exponential") {
-      v = stan::math::exponential_rng(sc(0, i), g);
+      const double args[] = {sc(0, i)};
+      v = scalar_rng_draw(ScalarRng::Exponential, args, 1, rng);
     } else if (base == "chi_square") {
       v = stan::math::chi_square_rng(sc(0, i), g);
     } else if (base == "cauchy") {
@@ -511,6 +563,14 @@ bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
       v = stan::math::student_t_rng(sc(0, i), sc(1, i), sc(2, i), g);
     } else if (base == "weibull") {
       v = stan::math::weibull_rng(sc(0, i), sc(1, i), g);
+    } else if (base == "gumbel") {
+      const double args[] = {sc(0, i), sc(1, i)};
+      v = scalar_rng_draw(ScalarRng::Gumbel, args, 2, rng);
+    } else if (base == "beta_binomial") {
+      const double args[] = {sc(0, i), sc(1, i), sc(2, i)};
+      vi = static_cast<int>(
+          scalar_rng_draw(ScalarRng::BetaBinomial, args, 3, rng));
+      iv = true;
     } else if (base == "bernoulli") {
       const double args[] = {sc(0, i)};
       vi =

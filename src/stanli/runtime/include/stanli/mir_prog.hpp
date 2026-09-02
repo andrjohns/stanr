@@ -21,7 +21,9 @@
 #define STANLI_MIR_PROG_HPP
 
 #include <stanli/mir.hpp>
+#include <stanli/optable.hpp>
 #include <stanli/program.hpp>
+#include <stanli/rng_family.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -97,6 +99,10 @@ struct ProgramCompiler {
   // the region's, which is what makes them the caller's to answer about --
   // being in `reals` only says the region has read one as a value.
   std::set<std::string> extern_bound;
+  // Whether this region belongs to generated quantities. Only there is an
+  // RNG draw legal, and only there is a program guaranteed never to be
+  // replayed under var -- which is what lets it hold a CALL at all.
+  bool in_write_array = false;
   int branch_depth = 0;  // inside a branch on a runtime value
   // A while is a genuinely runtime loop: its condition and state must be
   // evaluated again on every trip, rather than folded once while the program
@@ -1373,6 +1379,90 @@ struct ProgramCompiler {
     return out;
   }
 
+  // Every RNG spelling the region can carry, which is exactly the set the
+  // graph's OP_RNG kernel speaks.
+  static bool rng_call_name(const std::string& name) {
+    return scalar_rng_family(name) != nullptr || name == "categorical_rng" ||
+           name == "multi_normal_rng" || name == "dirichlet_rng";
+  }
+
+  // A draw inside a runtime-control region, spelled as one Program::CALL on
+  // the graph's own OP_RNG kernel rather than transcribed family by family.
+  // The stream, the stan-math call and the argument contract are then the
+  // kernel's, so the region and the graph cannot disagree about what a draw
+  // is or where in the stream it lands. CALL is double-only, which is the
+  // right constraint here rather than a limitation: generated quantities
+  // never runs a gradient, and OP_RNG has no backward for the carver to
+  // generate one from, so the island keeps the replay it will never use.
+  Range rng_call(const mir::Expr& e) {
+    if (!in_write_array)
+      bail(e.name + " is supported only in generated quantities");
+    std::vector<Range> args;
+    args.reserve(e.args.size());
+    for (const mir::Expr& a : e.args) args.push_back(expr(a));
+
+    uint8_t variant = 0;
+    int out_len = 1;
+    ViewKind out_kind = ViewKind::Flat;
+    std::vector<int> idata;
+    if (const ScalarRng* family = scalar_rng_family(e.name)) {
+      // An integer draw is runtime geometry: a size, an index or a branch
+      // condition the region has no way to know. That is the interpreter's
+      // remit, so leave the whole tranche there rather than quietly serving
+      // one out of a double register.
+      if (scalar_rng_is_int(*family))
+        bail(e.name + ": an integer draw stays on WaInterp");
+      if (args.size() != scalar_rng_arity(*family))
+        bail(e.name + ": wrong number of arguments");
+      for (const Range& a : args)
+        if (!is_scalar(a))
+          bail(e.name + ": container arguments stay on WaInterp");
+      variant = static_cast<uint8_t>(*family);
+    } else if (e.name == "categorical_rng") {
+      bail("categorical_rng: an integer draw stays on WaInterp");
+    } else if (e.name == "dirichlet_rng") {
+      if (args.size() != 1 || args[0].kind != ViewKind::Vector ||
+          args[0].len <= 0)
+        bail("dirichlet_rng: expected one concentration vector");
+      variant = kDirichletRngVariant;
+      out_len = args[0].len;
+      out_kind = ViewKind::Vector;
+    } else {
+      if (args.size() != 2 || args[0].kind != ViewKind::Vector ||
+          args[1].kind != ViewKind::Matrix)
+        bail(
+            "multi_normal_rng: expected a location vector and a covariance "
+            "matrix");
+      if (args[1].rows != args[0].len || args[1].cols != args[0].len)
+        bail("multi_normal_rng: covariance shape must match the location");
+      variant = kMultiNormalRngVariant;
+      out_len = args[0].len;
+      out_kind = ViewKind::Vector;
+      idata.push_back(out_len);
+    }
+
+    // Fresh registers, so the result cannot alias an argument -- which the
+    // kernel would otherwise have to be written to tolerate.
+    const int r = alloc(out_len);
+    Program::Call call;
+    call.opcode = OP_RNG;
+    call.variant = variant;
+    call.n_in = (int8_t)args.size();
+    for (size_t k = 0; k < args.size(); ++k) {
+      call.in[k] = args[k].reg;
+      call.in_len[k] = args[k].len;
+    }
+    call.out = r;
+    call.out_len = out_len;
+    call.idata = std::move(idata);
+    if (!bind_call(call)) bail("the RNG kernel is unavailable");
+    p.calls.push_back(std::move(call));
+    p.code.push_back(Program::Instr{Program::CALL, 0, (int)p.calls.size() - 1});
+    Range out{r, out_len};
+    out.kind = out_kind;
+    return out;
+  }
+
   Range matrix_gram(const Range& m, bool transpose_first) {
     if (m.kind != ViewKind::Matrix)
       bail(std::string(transpose_first ? "crossprod" : "tcrossprod") +
@@ -1466,10 +1556,32 @@ struct ProgramCompiler {
       out.cols = value.rows;
       return out;
     }
+    if (rng_call_name(e.name)) return rng_call(e);
     if (e.name == "tcrossprod" && e.args.size() == 1)
       return matrix_gram(expr(e.args[0]), false);
     if (e.name == "crossprod" && e.args.size() == 1)
       return matrix_gram(expr(e.args[0]), true);
+    if (e.name == "multiply_lower_tri_self_transpose" && e.args.size() == 1) {
+      // One instruction rather than the scalar sums matrix_gram emits above:
+      // the upper triangle has to be dropped before the product, and the
+      // reverse-mode overload's pullback symmetrises the output adjoint and
+      // masks the result. Scalar MULs would reproduce neither.
+      const Range m = expr(e.args[0]);
+      if (m.kind != ViewKind::Matrix)
+        bail("multiply_lower_tri_self_transpose requires a matrix");
+      if (m.rows != 0 && m.rows > kMaxRegs / m.rows)
+        bail("multiply_lower_tri_self_transpose result is too large");
+      const int64_t width = m.rows * m.rows;
+      const int r = alloc((int)width);
+      if (width != 0)
+        p.code.push_back(Program::Instr{Program::MULT_LOWER_TRI_SELF_TRANSPOSE,
+                                        r, m.reg, (int32_t)m.rows,
+                                        (int32_t)m.cols, m.len});
+      Range out{r, (int)width};
+      out.kind = ViewKind::Matrix;
+      out.rows = out.cols = m.rows;
+      return out;
+    }
     if (e.name == "add_diag" && e.args.size() == 2) {
       const Range input = expr(e.args[0]);
       const Range diagonal = expr(e.args[1]);
@@ -1870,21 +1982,63 @@ struct ProgramCompiler {
               "constant and is what the region can reproduce)");
         if ((int)e.args.size() != arity)
           bail(e.name + " takes " + std::to_string(arity) + " arguments here");
-        int argv[kMaxDensityArgs];
+        Range argv[kMaxDensityArgs];
+        bool any_container = false;
         for (int k = 0; k < arity; ++k) {
-          const Range a = expr(e.args[(size_t)k]);
-          // One lp per call: a vectorized density inside a branch would
-          // have to sum over its arguments, which this does not do.
-          if (!is_scalar(a)) bail(e.name + " on a container");
-          argv[k] = a.reg;
+          argv[k] = expr(e.args[(size_t)k]);
+          if (!is_scalar(argv[k])) any_container = true;
         }
+        if (any_container) {
+          // One propto-OFF call, vectorized the way CmdStan's generated
+          // code would call it (stan-math's own broadcasting over an
+          // Eigen::Map per container argument -- program_density_vec),
+          // not `len` scalar calls summed by hand, which would not sum in
+          // the same order. Every container argument recycles to the same
+          // length, Stan's own rule for a vectorized call; and the density
+          // has to be one whose partials tier already pays for the extra
+          // instantiations (program_density.cpp), the same affordability
+          // line the mask-dispatched partials draw.
+          int64_t len = 0;
+          bool ok = program_density_container_capable(dc);
+          for (int k = 0; ok && k < arity; ++k) {
+            const Range& a = argv[k];
+            if (is_scalar(a)) continue;
+            if (a.kind != ViewKind::Vector && a.kind != ViewKind::RowVector) {
+              ok = false;
+            } else if (a.len <= 0) {
+              ok = false;
+            } else if (len == 0) {
+              len = a.len;
+            } else if (len != a.len) {
+              ok = false;
+            }
+          }
+          if (!ok) bail(e.name + " on a container");
+          Program::VecDensity v;
+          v.density_id = (uint16_t)dc;
+          v.arity = (uint8_t)arity;
+          v.len = (int32_t)len;
+          for (int k = 0; k < arity; ++k) {
+            v.arg_reg[k] = argv[k].reg;
+            if (!is_scalar(argv[k])) v.container_mask |= (uint8_t)(1u << k);
+          }
+          const int r = alloc(1);
+          p.vec_densities.push_back(v);
+          p.code.push_back(Program::Instr{Program::DENSITY_VEC, r,
+                                          (int)p.vec_densities.size() - 1, 0, 0,
+                                          0});
+          return {r, 1};
+        }
+        int argv_reg[kMaxDensityArgs];
+        for (int k = 0; k < arity; ++k) argv_reg[k] = argv[k].reg;
         // Three arguments or fewer ride in the instruction; a fourth
         // needs the contiguous form, so copy them into a block.
-        int a0 = argv[0], a1 = arity > 1 ? argv[1] : 0;
-        int a2 = arity > 2 ? argv[2] : 0;
+        int a0 = argv_reg[0], a1 = arity > 1 ? argv_reg[1] : 0;
+        int a2 = arity > 2 ? argv_reg[2] : 0;
         if (arity > 3) {
           a0 = alloc(arity);
-          for (int k = 0; k < arity; ++k) emit(Program::MOV, a0 + k, argv[k]);
+          for (int k = 0; k < arity; ++k)
+            emit(Program::MOV, a0 + k, argv_reg[k]);
           a1 = 0;
           a2 = 0;
         }
@@ -2109,7 +2263,8 @@ struct ProgramCompiler {
       // Predicates, spelled on the comparison opcodes rather than opcodes of
       // their own: both read through value_of, so neither carries an adjoint
       // edge, which is what a 0/1 answer wants. x != x holds for NaN alone.
-      if (e.name == "is_nan" || e.name == "is_inf" || e.name == "PNot__") {
+      if (e.name == "is_nan" || e.name == "is_inf" || e.name == "PNot__" ||
+          e.name == "logical_negation") {
         const int rhs = e.name == "is_nan" ? -1 : konst(0.0);
         const Program::Code c = e.name == "is_nan" ? Program::NE : Program::EQ;
         const int r = alloc(a.len);
@@ -2409,6 +2564,18 @@ struct ProgramCompiler {
             extern_bound.insert(s.lhs);
             it = reals.find(s.lhs);
           }
+        }
+        if (it == reals.end() && s.lhs_idx.empty()) {
+          // First touch of this name from here, and nothing to import as a
+          // live-in either: an --O1 inliner return-temp (or similar
+          // compiler-introduced local) whose only other write sat in a
+          // branch the surrounding graph lowering folded away as
+          // unreachable, so it never got a slot to hand this region. A
+          // full-variable write with no prior binding is exactly the
+          // zero-length "adopt the assigned shape" case below, minus the
+          // placeholder declaration -- give it one now.
+          reals[s.lhs] = Range{};
+          it = reals.find(s.lhs);
         }
         if (it == reals.end()) bail("assignment to undeclared " + s.lhs);
         const Range dst = it->second;
@@ -2756,6 +2923,24 @@ struct ProgramCompiler {
       }
       case mir::Stmt::NRFunApp:
         if (s.fn_name == "FnValidateSize") return;
+        if (s.fn_name == "FnReject") {
+          // Only a literal message: interleaving a runtime value would need
+          // to format it into the thrown string at forward time, which this
+          // machine has no instruction for. `reject("some literal")` is the
+          // common case (a guard on a parameter's domain) and needs none.
+          std::string msg;
+          for (const auto& a : s.fn_args) {
+            if (a.kind != mir::Expr::LitStr)
+              bail(
+                  "statement function FnReject with a runtime-valued "
+                  "message argument (a literal-only message is supported "
+                  "here)");
+            msg += a.lit_s;
+          }
+          p.messages.push_back(std::move(msg));
+          emit(Program::REJECT, 0, (int)p.messages.size() - 1);
+          return;
+        }
         bail("statement function " + s.fn_name +
              " requires the MIR interpreter");
       case mir::Stmt::Skip:

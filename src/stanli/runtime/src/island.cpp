@@ -271,10 +271,11 @@ struct Compiler {
     call.opcode = op.opcode;
     call.variant = op.variant;
     call.n_in = (int8_t)op.n_in;
+    call.forward = k->forward;
+    call.backward = k->backward;
     for (int j = 0; j < op.n_in; ++j) {
       call.in[j] = read_reg(op.in[j]);
       call.in_len[j] = (int)g.slots[op.in[j]].len;
-      call.bwd_in[j] = call.in[j];
     }
     call.out = write_reg(op.out);
     call.out_len = (int)g.slots[op.out].len;
@@ -285,7 +286,6 @@ struct Compiler {
       if (call.out < call.in[j] + call.in_len[j] &&
           call.in[j] < call.out + call.out_len)
         return false;
-    call.bwd_out = call.out;
     call.scratch_len =
         k->scratch_size ? (int)k->scratch_size(op, g.slots.data()) : 0;
     call.scratch = call.scratch_len ? alloc(call.scratch_len) : 0;
@@ -666,7 +666,9 @@ int carve_islands(Graph& g,
       const bool specialized = static_cast<bool>(optimized);
       Op is;
       is.opcode = OP_ISLAND;
-      is.variant = specialized ? kIslandSoftmax3Variant : 0;
+      is.variant = specialized             ? kIslandSoftmax3Variant
+                   : cc.prog.calls.empty() ? 0
+                                           : kIslandCallVariant;
       is.n_in = (int)cc.live_in_slots.size();
       for (int k = 0; k < is.n_in; ++k) is.in[k] = cc.live_in_slots[k];
       is.out = g.add_slot(packed, false);
