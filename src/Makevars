@@ -39,8 +39,7 @@ SUNDIALS_SOURCES = $(wildcard sundials/*.c) \
   nvector/serial/nvector_serial.c
 SUNDIALS_OBJECTS = $(SUNDIALS_SOURCES:.c=.o)
 
-STANLI_SOURCES = $(filter-out stanli/runtime/src/build_id.cpp, \
-  $(wildcard stanli/runtime/src/*.cpp)) \
+STANLI_SOURCES = $(wildcard stanli/runtime/src/*.cpp) \
   $(wildcard stanli/runtime/kernels/*.cpp)
 STANLI_OBJECTS = $(STANLI_SOURCES:.cpp=.o)
 
@@ -87,4 +86,4 @@ $(STANLI_RUNNER_ARCHIVE): $(RUNNER_OBJECTS) $(SUNDIALS_OBJECTS)
 
 clean:
 	rm -rf ../inst/lib ../inst/tbb-build;
-	rm -f stanr.so $(OBJECTS) $(RUNNER_OBJECTS) $(STANLI_PACKAGE_OBJECTS) $(STANLI_PACKAGE_ARCHIVE) stanli/runtime/src/build_id.o $(SUNDIALS_OBJECTS) include/stanli_pch.hpp.gch include/stanli_pch.hpp.pch
+	rm -f stanr.so $(OBJECTS) $(RUNNER_OBJECTS) $(STANLI_PACKAGE_OBJECTS) $(STANLI_PACKAGE_ARCHIVE) $(SUNDIALS_OBJECTS) include/stanli_pch.hpp.gch include/stanli_pch.hpp.pch
