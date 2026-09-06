@@ -376,6 +376,10 @@ bool gen_adjoint(IslandProg& p) {
 
     ncode.push_back(I);
 
+    // Nothing is written, and compact_program leaves such an instruction's
+    // `dst` in the numbering it had before compaction.
+    if (wl == 0) continue;
+
     // An output value is needed as this instruction LEFT it, so only a
     // later overwrite can lose it.
     if (spec.has(kProgramSaveOut)) A.vd = save_range(I.dst, wl, i);
@@ -420,11 +424,13 @@ using CAdjA = Eigen::Map<const Eigen::ArrayXd>;
 
 void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
                  double* adj) {
-  KernelCtx* call_ctx = nullptr;
-  if (!fwd.calls.empty()) {
-    static thread_local KernelCtx worker_call_ctx;
-    call_ctx = &worker_call_ctx;
-  }
+  // A per-invocation local, not a shared static: island_bwd_native calls
+  // back into run_adjoint for an island's own adjoint program, and that
+  // program can itself contain a CALL. A static (or thread_local) ctx here
+  // aliased the outer and inner frames, so the recursive call clobbered
+  // in/in_adj/out fields the outer frame still needed after it returned.
+  KernelCtx worker_call_ctx;
+  KernelCtx* call_ctx = fwd.calls.empty() ? nullptr : &worker_call_ctx;
   for (const AdjInstr& I : ap.code) {
     if (I.code == Program::CALL) {
       // The kernel's own backward is the rule: values from the (possibly
@@ -440,7 +446,9 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
       for (int k = 0; k < call.n_in; ++k) {
         ctx.in[k] = Desc{const_cast<double*>(val) + call.bwd_value_in[k],
                          call.in_len[k]};
-        ctx.in_adj[k] = Desc{adj + call.bwd_adj_in[k], call.in_len[k]};
+        ctx.in_adj[k] = (call.input_adjoint_mask & (uint8_t)(1u << k))
+                            ? Desc{adj + call.bwd_adj_in[k], call.in_len[k]}
+                            : Desc{nullptr, call.in_len[k]};
       }
       ctx.out =
           Desc{const_cast<double*>(val) + call.bwd_value_out, call.out_len};
@@ -450,6 +458,7 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
       ctx.scratch = const_cast<double*>(val) + call.scratch;
       ctx.idata = call.idata.data();
       ctx.n_idata = (int64_t)call.idata.size();
+      ctx.udata = call.udata_owner.get();
       call.backward(ctx);
       for (int j = 0; j < call.out_len; ++j) adj[call.bwd_adj_out + j] = 0.0;
       continue;
@@ -512,7 +521,11 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
         break;
       case Program::POW: {
         adj[I.dst] = 0.0;
-        if (val[I.va] == 0.0) break;
+        if (val[I.va] == 0.0) {
+          adj[I.a] +=
+              pow_zero_base_partial((uint8_t)I.len, t, val[I.va], val[I.vb]);
+          break;
+        }
         const double m = t * val[I.vd];
         adj[I.a] += m * val[I.vb] / val[I.va];
         adj[I.b] += m * std::log(val[I.va]);
@@ -746,16 +759,15 @@ void run_adjoint(const Program& fwd, const AdjProgram& ap, const double* val,
       }
       case Program::DYN_INDEX:
       case Program::IDIV:
-      case Program::MAX_RANGE:
+      case Program::EXTREMA_RANGE:
       case Program::JZ:
       case Program::JMP:
       case Program::DIAG_PRE_MULTIPLY:
       case Program::DIAG_POST_MULTIPLY:
-      case Program::MATRIX_EXP:
       case Program::MDIVIDE_LEFT:
       case Program::MDIVIDE_RIGHT_SPD:
-      case Program::QUAD_FORM_SYM:
-      case Program::MULT_LOWER_TRI_SELF_TRANSPOSE:
+      case Program::TRANSFORM:
+      case Program::PRINT:
       case Program::REJECT:
       case Program::DENSITY_VEC:
         break;  // gen_adjoint refuses these; unreachable

@@ -30,6 +30,7 @@
 #include <ostream>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace stanli {
 
@@ -189,39 +190,87 @@ class ops_partials_edge<ViewElt, stanli::rvar, void> {
 template <typename ViewElt, typename Op>
 class ops_partials_edge<ViewElt, Op, require_eigen_vt<is_fvar, Op>> {
  public:
-  using partials_t = Eigen::Array<double, -1, 1>;
+  using partials_t = Eigen::Map<Eigen::Array<double, -1, 1>>;
+  Eigen::Index size_{0};
+  bool owns_partials_{true};
+  std::vector<double> owned_;
   partials_t partials_;
   broadcast_array<partials_t> partials_vec_{partials_};
 
   template <typename OpT, require_eigen_vt<is_fvar, OpT>* = nullptr>
-  explicit ops_partials_edge(const OpT& ops)
-      : partials_(partials_t::Zero(ops.size())), size_(ops.size()) {}
+  explicit ops_partials_edge(const OpT& ops, std::size_t idx)
+      : ops_partials_edge(slot_for(idx, ops.size()), ops.size()) {}
   ops_partials_edge(const ops_partials_edge& o)
-      : partials_(o.partials_), partials_vec_(partials_), size_(o.size_) {}
+      : size_(o.size_),
+        owns_partials_(o.owns_partials_),
+        owned_(o.owns_partials_ ? o.owned_ : std::vector<double>()),
+        partials_(o.owns_partials_ ? owned_.data()
+                                   : const_cast<double*>(o.partials_.data()),
+                  o.size_) {}
 
-  Eigen::Index size_{0};
   int size() const { return static_cast<int>(size_); }
   void emit(double* dst) const {
+    if (partials_.data() == dst) return;
     for (Eigen::Index i = 0; i < size_; ++i) dst[i] = partials_(i);
+  }
+
+ private:
+  static double* slot_for(std::size_t idx, Eigen::Index n) {
+    stanli::sink* s = stanli::active_sink();
+    if (s != nullptr && s->buf[idx] != nullptr && s->len[idx] == n)
+      return s->buf[idx];
+    return nullptr;
+  }
+  ops_partials_edge(double* slot, Eigen::Index n)
+      : size_(n),
+        owns_partials_(slot == nullptr),
+        owned_(owns_partials_ ? static_cast<std::size_t>(n) : std::size_t{0}),
+        partials_(owns_partials_ ? owned_.data() : slot, n) {
+    partials_.setZero();
   }
 };
 
 template <typename ViewElt, typename Op>
 class ops_partials_edge<ViewElt, Op, require_std_vector_vt<is_fvar, Op>> {
  public:
-  using partials_t = Eigen::Array<double, -1, 1>;
+  using partials_t = Eigen::Map<Eigen::Array<double, -1, 1>>;
+  std::size_t size_{0};
+  bool owns_partials_{true};
+  std::vector<double> owned_;
   partials_t partials_;
   broadcast_array<partials_t> partials_vec_{partials_};
 
-  explicit ops_partials_edge(const Op& ops)
-      : partials_(partials_t::Zero(ops.size())), size_(ops.size()) {}
+  explicit ops_partials_edge(const Op& ops, std::size_t idx)
+      : ops_partials_edge(slot_for(idx, ops.size()), ops.size()) {}
   ops_partials_edge(const ops_partials_edge& o)
-      : partials_(o.partials_), partials_vec_(partials_), size_(o.size_) {}
+      : size_(o.size_),
+        owns_partials_(o.owns_partials_),
+        owned_(o.owns_partials_ ? o.owned_ : std::vector<double>()),
+        partials_(o.owns_partials_ ? owned_.data()
+                                   : const_cast<double*>(o.partials_.data()),
+                  o.size_) {}
 
-  std::size_t size_{0};
   int size() const { return static_cast<int>(size_); }
   void emit(double* dst) const {
+    if (partials_.data() == dst) return;
     for (std::size_t i = 0; i < size_; ++i) dst[i] = partials_(i);
+  }
+
+ private:
+  static double* slot_for(std::size_t idx, std::size_t n) {
+    stanli::sink* s = stanli::active_sink();
+    if (s != nullptr && s->buf[idx] != nullptr &&
+        s->len[idx] == static_cast<int64_t>(n))
+      return s->buf[idx];
+    return nullptr;
+  }
+  ops_partials_edge(double* slot, std::size_t n)
+      : size_(n),
+        owns_partials_(slot == nullptr),
+        owned_(owns_partials_ ? n : std::size_t{0}),
+        partials_(owns_partials_ ? owned_.data() : slot,
+                  static_cast<Eigen::Index>(n)) {
+    partials_.setZero();
   }
 };
 
@@ -243,7 +292,8 @@ class partials_propagator<stanli::rvar, void, Ops...> {
 
   template <typename... Types>
   explicit partials_propagator(Types&&... ops)
-      : edges_(ops_partials_edge<double, std::decay_t<Ops>>(ops)...) {}
+      : edges_(build_edges(std::index_sequence_for<Ops...>{},
+                           std::forward<Types>(ops)...)) {}
 
   stanli::rvar build(double value) {
     stanli::sink* s = stanli::active_sink();
@@ -256,11 +306,28 @@ class partials_propagator<stanli::rvar, void, Ops...> {
   }
 
  private:
+  template <std::size_t I, typename OpT>
+  static auto make_edge(OpT&& op) {
+    using E = std::tuple_element_t<I, decltype(edges_)>;
+    if constexpr (std::is_constructible_v<E, OpT&&, std::size_t>) {
+      return E(std::forward<OpT>(op), I);
+    } else {
+      return E(std::forward<OpT>(op));
+    }
+  }
+
+  template <typename... Types, std::size_t... I>
+  static std::tuple<ops_partials_edge<double, std::decay_t<Ops>>...>
+  build_edges(std::index_sequence<I...>, Types&&... ops) {
+    return {make_edge<I>(std::forward<Types>(ops))...};
+  }
+
   template <std::size_t I>
   void emit_one(stanli::sink* s) {
     using E = std::tuple_element_t<I, decltype(edges_)>;
     if constexpr (rt_has_emit<E>::value) {
-      if (s->buf[I] != nullptr) std::get<I>(edges_).emit(s->buf[I]);
+      auto& e = std::get<I>(edges_);
+      if (s->buf[I] != nullptr && e.size() == s->len[I]) e.emit(s->buf[I]);
     }
   }
 

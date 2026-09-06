@@ -38,6 +38,14 @@ void set_message_sink(MessageSink sink);
 // One print() line, from either path.
 void emit_message(const std::string& text);
 
+// Install a sink for emit_diagnostic, or pass nullptr to restore the
+// stderr default.
+void set_diagnostic_sink(MessageSink sink);
+
+// One operator-facing trace line: STANLI_DEBUG_* traces, the preparation
+// profiler, and structured-loop diagnostics.
+void emit_diagnostic(const std::string& text);
+
 }  // namespace stanli
 
 #endif

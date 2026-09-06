@@ -1,5 +1,7 @@
 #include <stanli/wa_interp.hpp>
 
+#include <stanli/function_registry.hpp>
+#include <stanli/higher_order_eval.hpp>
 #include <stanli/mir_interp.hpp>
 
 #include <stan/math.hpp>
@@ -13,19 +15,14 @@
 namespace stanli {
 
 const ScalarRng* scalar_rng_family(const std::string& name) {
-  static const std::map<std::string, ScalarRng> kFamilies = {
-      {"poisson_log_rng", ScalarRng::PoissonLog},
-      {"uniform_rng", ScalarRng::Uniform},
-      {"bernoulli_rng", ScalarRng::Bernoulli},
-      {"normal_rng", ScalarRng::Normal},
-      {"lognormal_rng", ScalarRng::Lognormal},
-      {"binomial_rng", ScalarRng::Binomial},
-      {"gumbel_rng", ScalarRng::Gumbel},
-      {"beta_binomial_rng", ScalarRng::BetaBinomial},
-      {"exponential_rng", ScalarRng::Exponential},
-  };
-  const auto found = kFamilies.find(name);
-  return found == kFamilies.end() ? nullptr : &found->second;
+  // The unified FunctionSpec registry owns the name-to-family mapping; the
+  // enum-keyed arity and integer-result helpers below stay the single
+  // statement of each family's properties, which registration reuses.
+  const FunctionSpec* spec = function_spec(name, FunctionFamily::Builtin);
+  if (spec == nullptr || spec->builtin() == nullptr ||
+      spec->builtin()->shape != BuiltinShapePolicy::Rng)
+    return nullptr;
+  return &spec->builtin()->rng;
 }
 
 size_t scalar_rng_arity(ScalarRng family) {
@@ -175,8 +172,10 @@ std::vector<double> WaInterp::eval(
     return false;
   };
   h.fun = [this, &cur, &rng](const mir::Expr& e, DataMap::Entry* out) {
-    return rng_fun(*cur, e, out, rng) || ode_fun(*cur, e, out) ||
-           algebra_fun(*cur, e, out);
+    return rng_fun(*cur, e, out, rng) ||
+           evaluate_retained_higher_order(
+               funs_, e, [&](const mir::Expr& arg) { return cur->eval(arg); },
+               out);
   };
   MirInterp<double> in(funs_, "write_array", std::move(h));
   cur = &in;
@@ -275,180 +274,6 @@ bool WaInterp::write_param(MirInterp<double>& in, const mir::Stmt& s,
   for (int64_t k = 0; k < len; ++k)
     row.push_back(k < (int64_t)e.r.size() ? e.r[(size_t)k]
                                           : (double)e.i[(size_t)k]);
-  return true;
-}
-
-namespace {
-
-// The right-hand side handed to stan-math's integrators: the interpreter
-// evaluates the model's own function at whatever times the solver picks.
-// Everything is double here; generated quantities never differentiate.
-struct InterpRhs {
-  const std::map<std::string, const mir::FunDef*>* funs;
-  const mir::FunDef* rhs;
-
-  // Templated like ode.cpp's MirRhs: the old integrate_ode interface
-  // probes var instantiations even when every input is double.
-  template <typename T_y, typename T_param>
-  std::vector<stan::return_type_t<T_y, T_param>> operator()(
-      const double& t, const std::vector<T_y>& y,
-      const std::vector<T_param>& theta, const std::vector<double>& x_r,
-      const std::vector<int>& x_i, std::ostream* = nullptr) const {
-    using T = stan::return_type_t<T_y, T_param>;
-    std::vector<T> tv{T(t)}, yv(y.begin(), y.end()),
-        thv(theta.begin(), theta.end()), xrv(x_r.begin(), x_r.end());
-    MirInterp<T> ev(*funs, "ODE function");
-    return ev.call(*rhs, {tv, yv, thv, xrv}, {x_i});
-  }
-};
-
-// The algebraic system handed to stan-math's legacy Powell solver.  As with
-// InterpRhs, the apparently double-only write_array path still needs a
-// templated callback: stan-math differentiates the system with respect to
-// the unknown vector internally to form the Newton step.
-struct InterpAlgebraSystem {
-  const std::map<std::string, const mir::FunDef*>* funs;
-  const mir::FunDef* system;
-
-  template <typename T_x, typename T_y>
-  Eigen::Matrix<stan::return_type_t<typename T_x::Scalar, typename T_y::Scalar>,
-                Eigen::Dynamic, 1>
-  operator()(const T_x& x, const T_y& y, const std::vector<double>& x_r,
-             const std::vector<int>& x_i, std::ostream* = nullptr) const {
-    using T = stan::return_type_t<typename T_x::Scalar, typename T_y::Scalar>;
-    std::vector<std::vector<T>> reals(3);
-    reals[0].reserve(static_cast<size_t>(x.size()));
-    reals[1].reserve(static_cast<size_t>(y.size()));
-    reals[2].reserve(x_r.size());
-    for (Eigen::Index i = 0; i < x.size(); ++i) reals[0].push_back(T(x(i)));
-    for (Eigen::Index i = 0; i < y.size(); ++i) reals[1].push_back(T(y(i)));
-    for (double value : x_r) reals[2].push_back(T(value));
-
-    MirInterp<T> ev(*funs, "algebraic system");
-    const std::vector<T> result = ev.call(*system, reals, {x_i});
-    Eigen::Matrix<T, Eigen::Dynamic, 1> out(
-        static_cast<Eigen::Index>(result.size()));
-    for (size_t i = 0; i < result.size(); ++i)
-      out(static_cast<Eigen::Index>(i)) = result[i];
-    return out;
-  }
-};
-
-}  // namespace
-
-bool WaInterp::ode_fun(MirInterp<double>& in, const mir::Expr& e,
-                       DataMap::Entry* out) {
-  enum class LegacySolver { RK45, BDF, ADAMS };
-  LegacySolver solver;
-  if (e.name == "integrate_ode_rk45")
-    solver = LegacySolver::RK45;
-  else if (e.name == "integrate_ode_bdf")
-    solver = LegacySolver::BDF;
-  else if (e.name == "integrate_ode_adams")
-    solver = LegacySolver::ADAMS;
-  else
-    return false;
-  if (e.args.size() < 7)
-    throw CompileError("stanli write_array: " + e.name + " arity");
-  auto fit = funs_.find(e.args[0].name);
-  if (fit == funs_.end())
-    throw CompileError("stanli write_array: unknown right-hand side " +
-                       e.args[0].name);
-  const auto vec = [&](size_t k) { return in.eval(e.args[k]).r; };
-  const std::vector<double> z0 = vec(1);
-  const double t0 = vec(2).at(0);
-  const std::vector<double> ts = vec(3);
-  const std::vector<double> theta = vec(4);
-  const std::vector<double> x_r = vec(5);
-  DataMap::Entry xie = in.eval(e.args[6]);
-  std::vector<int> x_i = xie.i;
-  if (x_i.empty())
-    for (double v : xie.r) x_i.push_back((int)v);
-  const bool multistep =
-      solver == LegacySolver::BDF || solver == LegacySolver::ADAMS;
-  // Solver defaults match the lowering's (and stan-math's own): rk45
-  // 1e-6/1e-6/1e6, BDF and Adams 1e-10/1e-10/1e8.
-  double rtol = multistep ? 1e-10 : 1e-6, atol = rtol;
-  long max_steps = multistep ? 100000000 : 1000000;
-  if (e.args.size() >= 10) {
-    rtol = vec(7).at(0);
-    atol = vec(8).at(0);
-    max_steps = (long)vec(9).at(0);
-  }
-  InterpRhs f{&funs_, fit->second};
-  std::vector<std::vector<double>> sol;
-  switch (solver) {
-    case LegacySolver::RK45:
-      sol = stan::math::integrate_ode_rk45(f, z0, t0, ts, theta, x_r, x_i,
-                                           nullptr, rtol, atol, max_steps);
-      break;
-    case LegacySolver::BDF:
-      sol = stan::math::integrate_ode_bdf(f, z0, t0, ts, theta, x_r, x_i,
-                                          nullptr, rtol, atol, max_steps);
-      break;
-    case LegacySolver::ADAMS:
-      sol = stan::math::integrate_ode_adams(f, z0, t0, ts, theta, x_r, x_i,
-                                            nullptr, rtol, atol, max_steps);
-      break;
-  }
-  // array[N, S]: Fortran storage to match the interpreter's N-D indexing.
-  const int64_t N = (int64_t)sol.size();
-  const int64_t S = N > 0 ? (int64_t)sol[0].size() : 0;
-  out->dims = {N, S};
-  out->r.resize((size_t)(N * S));
-  for (int64_t n = 0; n < N; ++n)
-    for (int64_t k = 0; k < S; ++k)
-      out->r[(size_t)(n + N * k)] = sol[(size_t)n][(size_t)k];
-  return true;
-}
-
-bool WaInterp::algebra_fun(MirInterp<double>& in, const mir::Expr& e,
-                           DataMap::Entry* out) {
-  if (e.name != "algebra_solver") return false;
-  if (e.args.size() != 5 && e.args.size() != 8)
-    throw CompileError("stanli write_array: algebra_solver arity");
-  const auto fit = funs_.find(e.args[0].name);
-  if (fit == funs_.end())
-    throw CompileError("stanli write_array: unknown algebraic system " +
-                       e.args[0].name);
-
-  const auto vec = [&](size_t k) { return in.eval(e.args[k]).r; };
-  const std::vector<double> xv = vec(1);
-  const std::vector<double> yv = vec(2);
-  const std::vector<double> x_r = vec(3);
-  DataMap::Entry xie = in.eval(e.args[4]);
-  std::vector<int> x_i = xie.i;
-  if (x_i.empty())
-    for (double value : xie.r) x_i.push_back(static_cast<int>(value));
-
-  // These are the legacy algebra_solver defaults, matching AlgebraSpec and
-  // stan-math's generated-model interface.  The eight-argument overload
-  // supplies relative tolerance, function tolerance, and step limit.
-  double relative_tolerance = 1e-10;
-  double function_tolerance = 1e-6;
-  int64_t max_num_steps = 1000;
-  if (e.args.size() == 8) {
-    relative_tolerance = vec(5).at(0);
-    function_tolerance = vec(6).at(0);
-    max_num_steps = static_cast<int64_t>(vec(7).at(0));
-  }
-
-  Eigen::VectorXd x(static_cast<Eigen::Index>(xv.size()));
-  Eigen::VectorXd y(static_cast<Eigen::Index>(yv.size()));
-  for (size_t i = 0; i < xv.size(); ++i)
-    x(static_cast<Eigen::Index>(i)) = xv[i];
-  for (size_t i = 0; i < yv.size(); ++i)
-    y(static_cast<Eigen::Index>(i)) = yv[i];
-
-  const Eigen::VectorXd solved = stan::math::algebra_solver(
-      InterpAlgebraSystem{&funs_, fit->second}, x, y, x_r, x_i, nullptr,
-      relative_tolerance, function_tolerance, max_num_steps);
-  out->is_int = false;
-  out->i.clear();
-  out->dims = {static_cast<int64_t>(solved.size())};
-  out->r.resize(static_cast<size_t>(solved.size()));
-  for (Eigen::Index i = 0; i < solved.size(); ++i)
-    out->r[static_cast<size_t>(i)] = solved(i);
   return true;
 }
 

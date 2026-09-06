@@ -17,13 +17,17 @@ namespace {
 // The register regions run_rhs seeds before the program starts, in the order
 // the fields appear on RhsProgram.
 void compact_rhs(RhsProgram& p) {
-  std::vector<std::pair<int, int>> seeded{
-      {p.t_reg, 1}, {p.y0, p.n_y}, {p.th0, p.n_th}, {p.xr0, p.n_xr}};
+  std::vector<std::pair<int, int>> seeded{{p.t_reg, 1},
+                                          {p.y0, p.n_y},
+                                          {p.yp0, p.n_yp},
+                                          {p.th0, p.n_th},
+                                          {p.xr0, p.n_xr}};
   compact_program(p, seeded);
   p.t_reg = seeded[0].first;
   p.y0 = seeded[1].first;
-  p.th0 = seeded[2].first;
-  p.xr0 = seeded[3].first;
+  p.yp0 = seeded[2].first;
+  p.th0 = seeded[3].first;
+  p.xr0 = seeded[4].first;
 }
 
 bool supported_rhs_view(const mir::UnsizedView& view) {
@@ -91,6 +95,91 @@ void stamp_rhs_view(Range* range, const mir::UnsizedView& view) {
 }
 
 }  // namespace
+
+RhsProgram compile_dae_args(
+    const mir::FunDef& f, const std::map<std::string, const mir::FunDef*>& funs,
+    int n_y, const std::vector<RhsArg>& args) {
+  RhsProgram p;
+  if (f.arg_names.size() != args.size() + 3) {
+    p.why = "DAE residual takes " + std::to_string(f.arg_names.size()) +
+            " arguments, the call passes " + std::to_string(args.size() + 3) +
+            " (t, y, y', and " + std::to_string(args.size()) + " more)";
+    return p;
+  }
+  if (f.arg_views.size() != f.arg_names.size()) {
+    p.why = "DAE residual has incomplete unsized argument metadata";
+    return p;
+  }
+  for (size_t i = 0; i < f.arg_views.size(); ++i) {
+    if (!supported_rhs_view(f.arg_views[i])) {
+      p.why = "DAE residual argument " + std::to_string(i + 1) +
+              " has an unsupported logical view";
+      return p;
+    }
+  }
+  ProgramCompiler c{p, funs};
+  try {
+    int n_th = 0, n_xr = 0;
+    for (const auto& a : args) {
+      if (a.is_int) continue;
+      (a.is_param ? n_th : n_xr) += a.len;
+    }
+    p.t_reg = c.alloc(1);
+    p.y0 = c.alloc(n_y);
+    p.yp0 = c.alloc(n_y);
+    p.th0 = c.alloc(n_th);
+    p.xr0 = c.alloc(n_xr);
+    p.n_y = n_y;
+    p.n_yp = n_y;
+    p.n_th = n_th;
+    p.n_xr = n_xr;
+    c.reals[f.arg_names[0]] = Range{p.t_reg, 1};
+    Range y{p.y0, n_y};
+    stamp_rhs_view(&y, f.arg_views[1]);
+    c.reals[f.arg_names[1]] = y;
+    Range yp{p.yp0, n_y};
+    stamp_rhs_view(&yp, f.arg_views[2]);
+    c.reals[f.arg_names[2]] = yp;
+    int th_at = 0, xr_at = 0;
+    for (size_t k = 0; k < args.size(); ++k) {
+      const RhsArg& a = args[k];
+      const std::string& name = f.arg_names[k + 3];
+      if (a.is_int) {
+        c.ints[name] = std::vector<long>(a.ints.begin(), a.ints.end());
+      } else if (a.is_param) {
+        Range r{p.th0 + th_at, a.len};
+        stamp_rhs_view(&r, f.arg_views[k + 3]);
+        c.reals[name] = r;
+        th_at += a.len;
+      } else {
+        Range r{p.xr0 + xr_at, a.len};
+        stamp_rhs_view(&r, f.arg_views[k + 3]);
+        c.reals[name] = r;
+        xr_at += a.len;
+      }
+    }
+    Range out{0, 0};
+    try {
+      for (const auto& s : f.body) c.stmt(s);
+      c.bail("DAE residual returned no value");
+    } catch (ProgramCompiler::Returned& r) {
+      out = r.r;
+    }
+    if (out.len != n_y)
+      c.bail("DAE residual returns " + std::to_string(out.len) +
+             " values for " + std::to_string(n_y) + " states");
+    for (int k = 0; k < out.len; ++k) p.out_regs.push_back(out.reg + k);
+    c.finish();
+    compact_rhs(p);
+    p.ok = true;
+  } catch (Bail& b) {
+    p.ok = false;
+    p.why = b.why;
+    p.code.clear();
+    p.out_regs.clear();
+  }
+  return p;
+}
 
 RhsProgram compile_rhs_args(
     const mir::FunDef& f, const std::map<std::string, const mir::FunDef*>& funs,

@@ -106,7 +106,9 @@ struct MirRhs {
   }
 };
 
-// in = {z_init, theta}; data ts / x_r / x_i and tolerances live in the spec.
+// in = {z_init, theta} for fixed times, or {z_init, theta, t0, ts} when
+// modern solve times are runtime operands. Data x_r / x_i and tolerances live
+// in the spec.
 // out = N_ts * S, array-major (time outer, state inner), matching Stan's
 // array[N, S] layout.
 // The modern family's functor convention: an Eigen state in and out, and
@@ -141,14 +143,17 @@ struct VarRhs {
   }
 };
 
-// in = {z_init, theta}; data ts / x_r / x_i and tolerances live in the spec.
+// in = {z_init, theta} for fixed times, or {z_init, theta, t0, ts} when
+// modern solve times are runtime operands. Data x_r / x_i and tolerances live
+// in the spec.
 // out = N_ts * S, array-major (time outer, state inner), matching Stan's
 // array[N, S] layout.
-template <typename T_y0, typename T_theta>
-std::vector<std::vector<stan::return_type_t<T_y0, T_theta>>> solve(
+template <typename T_y0, typename T_theta, typename T_t0, typename T_ts>
+std::vector<std::vector<stan::return_type_t<T_y0, T_theta, T_t0, T_ts>>> solve(
     const OdeSpec& s, const std::vector<T_y0>& z0,
-    const std::vector<T_theta>& theta) {
-  using T = stan::return_type_t<T_y0, T_theta>;
+    const std::vector<T_theta>& theta, const T_t0& t0,
+    const std::vector<T_ts>& ts) {
+  using T = stan::return_type_t<T_y0, T_theta, T_t0, T_ts>;
   VarRhs f{&s};
   Eigen::Matrix<T_y0, Eigen::Dynamic, 1> y0((Eigen::Index)z0.size());
   for (size_t i = 0; i < z0.size(); ++i) y0((Eigen::Index)i) = z0[i];
@@ -162,18 +167,18 @@ std::vector<std::vector<stan::return_type_t<T_y0, T_theta>>> solve(
     std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> res;
     switch (s.solver) {
       case OdeSpec::BDF:
-        res = stan::math::ode_bdf_tol_impl("integrate_ode_bdf", f, y0, s.t0,
-                                           s.ts, s.rtol, s.atol, s.max_steps,
-                                           nullptr, theta, s.x_r, s.x_i);
+        res = stan::math::ode_bdf_tol_impl("integrate_ode_bdf", f, y0, t0, ts,
+                                           s.rtol, s.atol, s.max_steps, nullptr,
+                                           theta, s.x_r, s.x_i);
         break;
       case OdeSpec::ADAMS:
-        res = stan::math::ode_adams_tol_impl("integrate_ode_adams", f, y0, s.t0,
-                                             s.ts, s.rtol, s.atol, s.max_steps,
+        res = stan::math::ode_adams_tol_impl("integrate_ode_adams", f, y0, t0,
+                                             ts, s.rtol, s.atol, s.max_steps,
                                              nullptr, theta, s.x_r, s.x_i);
         break;
       default:
-        res = stan::math::ode_rk45_tol_impl("integrate_ode_rk45", f, y0, s.t0,
-                                            s.ts, s.rtol, s.atol, s.max_steps,
+        res = stan::math::ode_rk45_tol_impl("integrate_ode_rk45", f, y0, t0, ts,
+                                            s.rtol, s.atol, s.max_steps,
                                             nullptr, theta, s.x_r, s.x_i);
         break;
     }
@@ -190,21 +195,21 @@ std::vector<std::vector<stan::return_type_t<T_y0, T_theta>>> solve(
   std::vector<Eigen::Matrix<T, Eigen::Dynamic, 1>> res;
   switch (s.solver) {
     case OdeSpec::BDF:
-      res = stan::math::ode_bdf_tol(f, y0, s.t0, s.ts, s.rtol, s.atol,
-                                    s.max_steps, nullptr, theta, s.x_r, s.x_i);
+      res = stan::math::ode_bdf_tol(f, y0, t0, ts, s.rtol, s.atol, s.max_steps,
+                                    nullptr, theta, s.x_r, s.x_i);
       break;
     case OdeSpec::ADAMS:
       res =
-          stan::math::ode_adams_tol(f, y0, s.t0, s.ts, s.rtol, s.atol,
-                                    s.max_steps, nullptr, theta, s.x_r, s.x_i);
+          stan::math::ode_adams_tol(f, y0, t0, ts, s.rtol, s.atol, s.max_steps,
+                                    nullptr, theta, s.x_r, s.x_i);
       break;
     case OdeSpec::CKRK:
-      res = stan::math::ode_ckrk_tol(f, y0, s.t0, s.ts, s.rtol, s.atol,
-                                     s.max_steps, nullptr, theta, s.x_r, s.x_i);
+      res = stan::math::ode_ckrk_tol(f, y0, t0, ts, s.rtol, s.atol, s.max_steps,
+                                     nullptr, theta, s.x_r, s.x_i);
       break;
     default:
-      res = stan::math::ode_rk45_tol(f, y0, s.t0, s.ts, s.rtol, s.atol,
-                                     s.max_steps, nullptr, theta, s.x_r, s.x_i);
+      res = stan::math::ode_rk45_tol(f, y0, t0, ts, s.rtol, s.atol, s.max_steps,
+                                     nullptr, theta, s.x_r, s.x_i);
       break;
   }
   std::vector<std::vector<T>> out;
@@ -504,25 +509,29 @@ void solve_direct_rk(KernelCtx& ctx, const OdeSpec& spec) {
     throw std::runtime_error("direct RK observer produced too few states");
 }
 
-// Solve with the scalar types selected at lowering. OP_ODE variant bit 2 marks
-// an explicit type mask: low bit y0, next bit theta (1 = var). Variant zero is
-// the compatibility encoding for hand-built graphs and means the former
-// both-var behavior.
-// The scratch layout remains [y0 columns, theta columns] for every activity
-// combination; inactive columns are explicit zeros for deterministic scratch,
-// while ode_bwd gates their scatter with the same type mask.
-template <bool YAutodiff, bool ThetaAutodiff>
+// New calls carry {y0, theta, t0, ts}. Bit 4 marks the four-bit scalar-type
+// mask: y0, theta, t0, and ts. Older two-input graphs retain their historical
+// bit-2 encoding and read times from OdeSpec.
+template <bool YAutodiff, bool ThetaAutodiff, bool T0Autodiff, bool TsAutodiff>
 void ode_fwd_typed(KernelCtx& ctx, const OdeSpec& s) {
   using T_y0 = std::conditional_t<YAutodiff, var, double>;
   using T_theta = std::conditional_t<ThetaAutodiff, var, double>;
-  const int64_t S = ctx.in[0].len, P = ctx.in[1].len, W = S + P;
+  using T_t0 = std::conditional_t<T0Autodiff, var, double>;
+  using T_ts = std::conditional_t<TsAutodiff, var, double>;
+  const bool runtime_times = ctx.n_in >= 4;
+  const int64_t S = ctx.in[0].len, P = ctx.in[1].len;
+  const int64_t N = runtime_times ? ctx.in[3].len : (int64_t)s.ts.size();
+  const int64_t W = S + P + (runtime_times ? 1 + N : 0);
   double* J = ctx.scratch;
+  const double t0_value = runtime_times ? ctx.in[2].data[0] : s.t0;
+  const double* ts_values = runtime_times ? ctx.in[3].data : s.ts.data();
 
-  if constexpr (!YAutodiff && !ThetaAutodiff) {
+  if constexpr (!YAutodiff && !ThetaAutodiff && !T0Autodiff && !TsAutodiff) {
     // A data-only solve has no reason to construct a nested reverse-mode tape.
     std::vector<T_y0> z0(ctx.in[0].data, ctx.in[0].data + S);
     std::vector<T_theta> th(ctx.in[1].data, ctx.in[1].data + P);
-    const auto solv = solve(s, z0, th);
+    const std::vector<double> ts(ts_values, ts_values + N);
+    const auto solv = solve(s, z0, th, t0_value, ts);
     for (size_t n = 0; n < solv.size(); ++n)
       for (int64_t k = 0; k < S; ++k)
         ctx.out.data[(int64_t)n * S + k] = solv[n][k];
@@ -531,16 +540,20 @@ void ode_fwd_typed(KernelCtx& ctx, const OdeSpec& s) {
     // The lowering-time switch keeps the exact current solve as a same-binary
     // oracle without an environment lookup in this repeated kernel. A payload
     // is present only when generated differentiation refused no opcode.
-    if (s.direct_rk_enabled && s.direct_rk &&
-        (s.solver == OdeSpec::RK45 || s.solver == OdeSpec::CKRK) &&
-        direct_rk_shape_ok<YAutodiff, ThetaAutodiff>(ctx, s)) {
-      solve_direct_rk<YAutodiff, ThetaAutodiff>(ctx, s);
-      return;
+    if constexpr (!T0Autodiff && !TsAutodiff) {
+      if (s.direct_rk_enabled && s.direct_rk && !runtime_times &&
+          (s.solver == OdeSpec::RK45 || s.solver == OdeSpec::CKRK) &&
+          direct_rk_shape_ok<YAutodiff, ThetaAutodiff>(ctx, s)) {
+        solve_direct_rk<YAutodiff, ThetaAutodiff>(ctx, s);
+        return;
+      }
     }
     stan::math::nested_rev_autodiff nested;
     std::vector<T_y0> z0(ctx.in[0].data, ctx.in[0].data + S);
     std::vector<T_theta> th(ctx.in[1].data, ctx.in[1].data + P);
-    const auto solv = solve(s, z0, th);
+    T_t0 t0 = t0_value;
+    std::vector<T_ts> ts(ts_values, ts_values + N);
+    const auto solv = solve(s, z0, th, t0, ts);
     for (size_t n = 0; n < solv.size(); ++n)
       for (int64_t k = 0; k < S; ++k)
         ctx.out.data[(int64_t)n * S + k] = solv[n][k].val();
@@ -570,6 +583,22 @@ void ode_fwd_typed(KernelCtx& ctx, const OdeSpec& s) {
       } else {
         for (int64_t i = 0; i < P; ++i) J[o * W + S + i] = 0.0;
       }
+      if (runtime_times) {
+        if constexpr (T0Autodiff) {
+          J[o * W + S + P] = t0.adj();
+          t0.vi_->adj_ = 0.0;
+        } else {
+          J[o * W + S + P] = 0.0;
+        }
+        if constexpr (TsAutodiff) {
+          for (int64_t i = 0; i < N; ++i) {
+            J[o * W + S + P + 1 + i] = ts[(size_t)i].adj();
+            ts[(size_t)i].vi_->adj_ = 0.0;
+          }
+        } else {
+          for (int64_t i = 0; i < N; ++i) J[o * W + S + P + 1 + i] = 0.0;
+        }
+      }
       output->adj_ = 0.0;
     }
   }
@@ -587,31 +616,62 @@ void ode_fwd(KernelCtx& ctx) {
   if (values_only()) {
     const std::vector<double> z0(ctx.in[0].data, ctx.in[0].data + S);
     const std::vector<double> th(ctx.in[1].data, ctx.in[1].data + P);
-    const auto solv = solve(s, z0, th);
+    const double t0 = ctx.n_in >= 4 ? ctx.in[2].data[0] : s.t0;
+    const std::vector<double> ts =
+        ctx.n_in >= 4 ? std::vector<double>(ctx.in[3].data,
+                                            ctx.in[3].data + ctx.in[3].len)
+                      : s.ts;
+    const auto solv = solve(s, z0, th, t0, ts);
     for (size_t n = 0; n < solv.size(); ++n)
       for (int64_t k = 0; k < S; ++k)
         ctx.out.data[(int64_t)n * S + k] = solv[n][k];
     return;
   }
   const uint8_t type_mask =
-      (ctx.variant & 0x4u) != 0 ? (ctx.variant & 0x3u) : 0x3u;
-  if (type_mask == 0x3u)
-    ode_fwd_typed<true, true>(ctx, s);
-  else if (type_mask == 0x1u)
-    ode_fwd_typed<true, false>(ctx, s);
-  else if (type_mask == 0x2u)
-    ode_fwd_typed<false, true>(ctx, s);
-  else
-    ode_fwd_typed<false, false>(ctx, s);
+      (ctx.variant & 0x10u) != 0
+          ? (ctx.variant & 0x0fu)
+          : ((ctx.variant & 0x4u) != 0 ? (ctx.variant & 0x3u) : 0x3u);
+  const bool t0_autodiff = (type_mask & 0x4u) != 0;
+  const bool ts_autodiff = (type_mask & 0x8u) != 0;
+#define STANLI_ODE_FWD_TIMES(Y, TH)               \
+  if (t0_autodiff) {                              \
+    if (ts_autodiff)                              \
+      ode_fwd_typed<Y, TH, true, true>(ctx, s);   \
+    else                                          \
+      ode_fwd_typed<Y, TH, true, false>(ctx, s);  \
+  } else {                                        \
+    if (ts_autodiff)                              \
+      ode_fwd_typed<Y, TH, false, true>(ctx, s);  \
+    else                                          \
+      ode_fwd_typed<Y, TH, false, false>(ctx, s); \
+  }
+  if ((type_mask & 0x3u) == 0x3u) {
+    STANLI_ODE_FWD_TIMES(true, true);
+  } else if ((type_mask & 0x3u) == 0x1u) {
+    STANLI_ODE_FWD_TIMES(true, false);
+  } else if ((type_mask & 0x3u) == 0x2u) {
+    STANLI_ODE_FWD_TIMES(false, true);
+  } else {
+    STANLI_ODE_FWD_TIMES(false, false);
+  }
+#undef STANLI_ODE_FWD_TIMES
 }
 
 void ode_bwd(KernelCtx& ctx) {
   const uint8_t type_mask =
-      (ctx.variant & 0x4u) != 0 ? (ctx.variant & 0x3u) : 0x3u;
+      (ctx.variant & 0x10u) != 0
+          ? (ctx.variant & 0x0fu)
+          : ((ctx.variant & 0x4u) != 0 ? (ctx.variant & 0x3u) : 0x3u);
   const bool y_active = (type_mask & 0x1u) != 0 && ctx.in_adj[0].data;
   const bool theta_active = (type_mask & 0x2u) != 0 && ctx.in_adj[1].data;
-  if (!y_active && !theta_active) return;
-  const int64_t S = ctx.in[0].len, P = ctx.in[1].len, W = S + P;
+  const bool t0_active =
+      ctx.n_in >= 4 && (type_mask & 0x4u) != 0 && ctx.in_adj[2].data;
+  const bool ts_active =
+      ctx.n_in >= 4 && (type_mask & 0x8u) != 0 && ctx.in_adj[3].data;
+  if (!y_active && !theta_active && !t0_active && !ts_active) return;
+  const int64_t S = ctx.in[0].len, P = ctx.in[1].len;
+  const int64_t N = ctx.n_in >= 4 ? ctx.in[3].len : 0;
+  const int64_t W = S + P + (ctx.n_in >= 4 ? 1 + N : 0);
   const double* J = ctx.scratch;
   for (int64_t o = ctx.out.len; o-- > 0;) {
     const double a = ctx.out_adj_vec.data[o];
@@ -620,11 +680,17 @@ void ode_bwd(KernelCtx& ctx) {
     if (theta_active)
       for (int64_t i = 0; i < P; ++i)
         ctx.in_adj[1].data[i] += a * J[o * W + S + i];
+    if (t0_active) ctx.in_adj[2].data[0] += a * J[o * W + S + P];
+    if (ts_active)
+      for (int64_t i = 0; i < N; ++i)
+        ctx.in_adj[3].data[i] += a * J[o * W + S + P + 1 + i];
   }
 }
 
 int64_t ode_scratch(const Op& op, const Slot* slots) {
-  return slots[op.out].len * (slots[op.in[0]].len + slots[op.in[1]].len);
+  int64_t width = slots[op.in[0]].len + slots[op.in[1]].len;
+  if (op.n_in >= 4) width += 1 + slots[op.in[3]].len;
+  return slots[op.out].len * width;
 }
 
 }  // namespace

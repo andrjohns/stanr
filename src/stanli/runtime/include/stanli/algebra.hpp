@@ -5,45 +5,53 @@
 #ifndef STANLI_ALGEBRA_HPP
 #define STANLI_ALGEBRA_HPP
 
-#include <stanli/mir.hpp>
-#include <stanli/ode_prog.hpp>
+#include <stanli/callback.hpp>
 
 #include <cstdint>
-#include <map>
-#include <string>
 #include <vector>
 
 namespace stanli {
 
-struct AlgebraSpec {
-  std::map<std::string, mir::FunDef> owned;
-  std::map<std::string, const mir::FunDef*> funs_map;
+struct AlgebraSpec : RetainedCallback {
+  enum Solver { Powell, Newton };
+
+  // Compatibility name retained for tooling/tests; storage and lookup live
+  // in the shared RetainedCallback base.
   std::string system_name;
+  const mir::FunDef* system() const { return callback(system_name); }
 
-  void adopt(const std::map<std::string, const mir::FunDef*>& src) {
-    for (const auto& [name, def] : src) owned[name] = *def;
-    for (const auto& [name, def] : owned) funs_map[name] = &def;
-  }
-  const mir::FunDef* system() const {
-    auto it = owned.find(system_name);
-    return it == owned.end() ? nullptr : &it->second;
-  }
-  const std::map<std::string, const mir::FunDef*>* funs() const {
-    return &funs_map;
-  }
-
-  std::vector<double> x_r;
-  std::vector<int> x_i;
+  // Variadic solve_* calls pack all active real callback arguments into the
+  // kernel's second input and all data reals into x_r. `args` reconstructs
+  // the original positional signature for the compiled/interpreted callback.
+  bool variadic = false;
+  // Newton's first control is its scaling step, kept under the Powell name.
   double relative_tolerance = 1e-10;
   double function_tolerance = 1e-6;
   int64_t max_num_steps = 1000;
+  Solver solver = Powell;
 
-  // Algebra systems have (unknown, parameters, real data, integer data),
-  // while RhsProgram's seed convention has an extra leading scalar time.
-  // Lowering compiles a synthetic, unused time formal so the mature ODE
-  // register machine can be shared without changing either Stan signature.
-  RhsProgram prog;
+  void select(const mir::AlgebraCall& call) {
+    solver = call.method == mir::AlgebraMethod::Newton ? Newton : Powell;
+    variadic = !call.legacy;
+    relative_tolerance = solver == Newton ? 1e-3 : 1e-10;
+    function_tolerance = 1e-6;
+    max_num_steps = call.legacy && solver == Powell ? 1000 : 200;
+  }
 };
+
+// Algebra systems take (unknown, ...) while RhsProgram seeds a leading
+// scalar time. A synthetic, unused time formal lets the ODE register
+// machine compile the system unchanged; the retained definition keeps the
+// source signature for the interpreter fallback.
+inline mir::FunDef with_leading_time(const mir::FunDef& system) {
+  mir::FunDef adapted = system;
+  adapted.arg_names.insert(adapted.arg_names.begin(), "__stanli_unused_time");
+  adapted.arg_types.insert(adapted.arg_types.begin(), "UReal");
+  adapted.arg_views.insert(adapted.arg_views.begin(),
+                           mir::UnsizedView{0, mir::UnsizedLeaf::Real});
+  adapted.arg_data_only.insert(adapted.arg_data_only.begin(), true);
+  return adapted;
+}
 
 }  // namespace stanli
 

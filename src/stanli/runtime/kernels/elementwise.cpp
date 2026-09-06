@@ -59,84 +59,20 @@ void fma_bwd(KernelCtx& ctx) {
 
 // OP_MATVEC: out = X * beta, X data laid out COLUMN-major (Stan/Eigen
 // convention), idata = {rows, cols}. X as a parameter is out of scope.
-// Four rows at a time. The single-row form is one serial dependency
-// chain -- each `acc +=` waits on the previous -- so it ran at about one
-// multiply-add per cycle regardless of how wide the machine is; on
-// prophet (1169x25 and 1169x34) that was 82% of the gradient. Four
-// independent accumulators fill the pipeline and let the loads pair up.
-//
-// Every element still sums over columns in ascending order, exactly as
-// before, so this is bitwise identical to the var path it is checked
-// against (tests/test_matvec.cpp). Eigen's gemv is faster still and
-// reassociates; that costs 1-2 ULP against stan-math's own multiply on
-// every model with a matrix, and is not worth it.
 void matvec_fwd(KernelCtx& ctx) {
   const int64_t rows = ctx.idata[0], cols = ctx.idata[1];
-  const double* X = ctx.in[0].data;
-  const double* b = ctx.in[1].data;
-  double* out = ctx.out.data;
-  int64_t r = 0;
-  for (; r + 4 <= rows; r += 4) {
-    double a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-    for (int64_t c = 0; c < cols; ++c) {
-      const double bc = b[c];
-      const double* col = X + c * rows + r;
-      a0 += col[0] * bc;
-      a1 += col[1] * bc;
-      a2 += col[2] * bc;
-      a3 += col[3] * bc;
-    }
-    out[r] = a0;
-    out[r + 1] = a1;
-    out[r + 2] = a2;
-    out[r + 3] = a3;
-  }
-  for (; r < rows; ++r) {
-    double acc = 0;
-    for (int64_t c = 0; c < cols; ++c) acc += X[c * rows + r] * b[c];
-    out[r] = acc;
-  }
+  Eigen::Map<const Eigen::MatrixXd> Xm(ctx.in[0].data, rows, cols);
+  Eigen::Map<const Eigen::VectorXd> bm(ctx.in[1].data, cols);
+  Eigen::Map<Eigen::VectorXd> outm(ctx.out.data, rows);
+  outm.noalias() = Xm * bm;
 }
 void matvec_bwd(KernelCtx& ctx) {
   const int64_t rows = ctx.idata[0], cols = ctx.idata[1];
-  const double* X = ctx.in[0].data;
-  const double* dout = ctx.out_adj_vec.data;
   if (ctx.in_adj[1].data != nullptr) {
-    // Rows descending: the var tape replays eta's entries in reverse
-    // creation order, and matching its accumulation order keeps parity
-    // with the reference bitwise.
-    // Four columns at a time, each accumulating in a register seeded
-    // from the adjoint it will write back. Keeping the running value in
-    // a register rather than re-reading memory changes nothing about the
-    // arithmetic -- same terms, same order, same intermediates -- but it
-    // gives four independent chains instead of one dependent store, and
-    // reads each column contiguously instead of striding by `rows`.
-    double* adj = ctx.in_adj[1].data;
-    int64_t c = 0;
-    for (; c + 4 <= cols; c += 4) {
-      double a0 = adj[c], a1 = adj[c + 1], a2 = adj[c + 2], a3 = adj[c + 3];
-      const double* c0 = X + c * rows;
-      const double* c1 = c0 + rows;
-      const double* c2 = c1 + rows;
-      const double* c3 = c2 + rows;
-      for (int64_t r = rows - 1; r >= 0; --r) {
-        const double d = dout[r];
-        a0 += c0[r] * d;
-        a1 += c1[r] * d;
-        a2 += c2[r] * d;
-        a3 += c3[r] * d;
-      }
-      adj[c] = a0;
-      adj[c + 1] = a1;
-      adj[c + 2] = a2;
-      adj[c + 3] = a3;
-    }
-    for (; c < cols; ++c) {
-      double a = adj[c];
-      const double* col = X + c * rows;
-      for (int64_t r = rows - 1; r >= 0; --r) a += col[r] * dout[r];
-      adj[c] = a;
-    }
+    Eigen::Map<const Eigen::MatrixXd> Xm(ctx.in[0].data, rows, cols);
+    Eigen::Map<const Eigen::VectorXd> doutm(ctx.out_adj_vec.data, rows);
+    Eigen::Map<Eigen::VectorXd> adjm(ctx.in_adj[1].data, cols);
+    adjm.noalias() += Xm.transpose() * doutm;
   }
 }
 
@@ -369,16 +305,26 @@ void slice_strided_bwd(KernelCtx& ctx) {
     ctx.in_adj[0].data[start + i * stride] += ctx.out_adj_vec.data[i];
 }
 
-// OP_GATHER: out[k] = in[idata[k]] (0-based indices); adjoints scatter-add
-// in ascending k, matching the var path's edge order (duplicates included).
+// OP_GATHER: out[k] = in[idata[k]] (0-based indices).
 void gather_fwd(KernelCtx& ctx) {
   for (int64_t k = 0; k < ctx.out.len; ++k)
     ctx.out.data[k] = ctx.in[0].data[ctx.idata[k]];
 }
 void gather_bwd(KernelCtx& ctx) {
   if (!ctx.in_adj[0].data) return;
-  for (int64_t k = 0; k < ctx.out.len; ++k)
-    ctx.in_adj[0].data[ctx.idata[k]] += ctx.out_adj_vec.data[k];
+  double* in_adj = ctx.in_adj[0].data;
+  const double* out_adj = ctx.out_adj_vec.data;
+  const int* idata = ctx.idata;
+  const int64_t n = ctx.out.len;
+  int64_t k = 0;
+  while (k < n) {
+    const int idx = idata[k];
+    double sum = out_adj[k];
+    int64_t j = k + 1;
+    while (j < n && idata[j] == idx) sum += out_adj[j++];
+    in_adj[idx] += sum;
+    k = j;
+  }
 }
 
 // OP_CONCAT2: out = [in[0]; in[1]] (contiguous; serves append_row of

@@ -209,9 +209,19 @@ struct CompiledModel {
     std::string truncated;
   };
   std::optional<TransformInits> transform_inits;
+  // Each part of the model that has no compiled path and would run through
+  // the MIR interpreter, with the lowering's reason.
+  std::vector<std::string> interpreter_fallbacks;
 };
 
 CompiledModel compile_model(const std::string& mir_text, const DataMap& data);
+
+// The warning a host shows once per model with interpreter_fallbacks, and
+// the compile error STANLI_NO_INTERPRETER turns it into. `probe_failure` is
+// what the interpreter threw when a host probed it.
+std::string interpreter_error(const CompiledModel& cm);
+std::string interpreter_warning(const CompiledModel& cm,
+                                const std::string& probe_failure = "");
 
 }  // namespace stanli
 

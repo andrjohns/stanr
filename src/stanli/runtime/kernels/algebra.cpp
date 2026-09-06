@@ -61,10 +61,70 @@ struct MirSystem {
   }
 };
 
+struct MirVariadicSystem {
+  const AlgebraSpec* spec;
+
+  template <typename T_x, typename T_theta>
+  Eigen::Matrix<
+      stan::return_type_t<typename T_x::Scalar, typename T_theta::Scalar>,
+      Eigen::Dynamic, 1>
+  operator()(const T_x& x, std::ostream* const, const T_theta& theta) const {
+    using T =
+        stan::return_type_t<typename T_x::Scalar, typename T_theta::Scalar>;
+    std::vector<T> result;
+    if (spec->prog.ok) {
+      run_rhs<T>(spec->prog, 0.0, x.data(), theta.data(), (size_t)theta.size(),
+                 spec->x_r.data(), result);
+    } else {
+      const mir::FunDef* system = spec->system();
+      if (!system) throw std::runtime_error("solve: missing algebraic system");
+      std::vector<std::vector<T>> reals(1);
+      reals[0].reserve((size_t)x.size());
+      for (Eigen::Index i = 0; i < x.size(); ++i) reals[0].push_back(T(x(i)));
+      std::vector<std::vector<int>> ints;
+      size_t theta_at = 0, xr_at = 0;
+      for (const RhsArg& arg : spec->args) {
+        if (arg.is_int) {
+          ints.push_back(arg.ints);
+          continue;
+        }
+        std::vector<T> values;
+        values.reserve((size_t)arg.len);
+        if (arg.is_param) {
+          for (int i = 0; i < arg.len; ++i)
+            values.push_back(T(theta((Eigen::Index)theta_at++)));
+        } else {
+          for (int i = 0; i < arg.len; ++i)
+            values.push_back(T(spec->x_r[xr_at++]));
+        }
+        reals.push_back(std::move(values));
+      }
+      MirInterp<T> ev(*spec->funs(), "algebraic system");
+      result = ev.call(*system, reals, ints);
+    }
+    Eigen::Matrix<T, Eigen::Dynamic, 1> out((Eigen::Index)result.size());
+    for (size_t i = 0; i < result.size(); ++i) out((Eigen::Index)i) = result[i];
+    return out;
+  }
+};
+
 Eigen::VectorXd solve_double(const AlgebraSpec& spec, const Desc& x_desc,
                              const Desc& y_desc) {
   Eigen::Map<const Eigen::VectorXd> x(x_desc.data, x_desc.len);
   Eigen::Map<const Eigen::VectorXd> y(y_desc.data, y_desc.len);
+  if (spec.variadic) {
+    if (spec.solver == AlgebraSpec::Newton)
+      return stan::math::solve_newton_tol(
+          MirVariadicSystem{&spec}, x, spec.relative_tolerance,
+          spec.function_tolerance, spec.max_num_steps, nullptr, y);
+    return stan::math::solve_powell_tol(
+        MirVariadicSystem{&spec}, x, spec.relative_tolerance,
+        spec.function_tolerance, spec.max_num_steps, nullptr, y);
+  }
+  if (spec.solver == AlgebraSpec::Newton)
+    return stan::math::algebra_solver_newton(
+        MirSystem{&spec}, x, y, spec.x_r, spec.x_i, nullptr,
+        spec.relative_tolerance, spec.function_tolerance, spec.max_num_steps);
   return stan::math::algebra_solver(
       MirSystem{&spec}, x, y, spec.x_r, spec.x_i, nullptr,
       spec.relative_tolerance, spec.function_tolerance, spec.max_num_steps);
@@ -98,6 +158,20 @@ void algebra_fwd(KernelCtx& ctx) {
   const MirSystem system{&spec};
   stan::math::jacobian(
       [&](const auto& y_var) {
+        if (spec.variadic) {
+          if (spec.solver == AlgebraSpec::Newton)
+            return stan::math::solve_newton_tol(
+                MirVariadicSystem{&spec}, x, spec.relative_tolerance,
+                spec.function_tolerance, spec.max_num_steps, nullptr, y_var);
+          return stan::math::solve_powell_tol(
+              MirVariadicSystem{&spec}, x, spec.relative_tolerance,
+              spec.function_tolerance, spec.max_num_steps, nullptr, y_var);
+        }
+        if (spec.solver == AlgebraSpec::Newton)
+          return stan::math::algebra_solver_newton(
+              system, x, y_var, spec.x_r, spec.x_i, nullptr,
+              spec.relative_tolerance, spec.function_tolerance,
+              spec.max_num_steps);
         return stan::math::algebra_solver(system, x, y_var, spec.x_r, spec.x_i,
                                           nullptr, spec.relative_tolerance,
                                           spec.function_tolerance,

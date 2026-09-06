@@ -4,6 +4,7 @@
 #include <stanli/packet.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -86,6 +87,7 @@ static void bind_call_fwd_ctx(const Program::Call& call, double* reg,
   ctx.scratch = reg + call.scratch;
   ctx.idata = call.idata.data();
   ctx.n_idata = (int64_t)call.idata.size();
+  ctx.udata = call.udata_owner.get();
   // Not a call-site fact: the draw stream belongs to the evaluation, so it
   // is rebound with the pointer fields rather than resolved once.
   ctx.eval_state = state;
@@ -107,6 +109,134 @@ bool bind_call(Program::Call& call) {
   return true;
 }
 
+int64_t kernel_call_scratch(int64_t (*scratch_size)(const Op&, const Slot*),
+                            uint16_t opcode, uint8_t variant, int8_t n_in,
+                            const int32_t* in_len, int32_t out_len,
+                            const int* idata, int64_t n_idata,
+                            const void* udata) {
+  if (scratch_size == nullptr) return 0;
+  Op op;
+  op.opcode = opcode;
+  op.variant = variant;
+  op.n_in = n_in;
+  op.out = n_in;
+  op.idata = idata;
+  op.n_idata = n_idata;
+  op.udata = udata;
+  std::vector<Slot> slots((size_t)n_in + 1);
+  for (int k = 0; k < n_in; ++k) {
+    op.in[k] = k;
+    slots[(size_t)k].len = in_len[k];
+  }
+  slots.back().len = out_len;
+  return scratch_size(op, slots.data());
+}
+
+void run_call_var(const Program::Call& call, stan::math::var* reg) {
+  using ArenaDoubles = stan::arena_t<std::vector<double>>;
+  using ArenaVaris = stan::arena_t<std::vector<stan::math::vari*>>;
+  if (call.forward == nullptr || call.backward == nullptr)
+    throw std::logic_error("unbound Program::CALL var replay");
+
+  std::array<int32_t, 6> in_offset{};
+  int32_t total = 0;
+  for (int k = 0; k < call.n_in; ++k) {
+    in_offset[(size_t)k] = total;
+    total += call.in_len[k];
+  }
+  const int32_t out_offset = total;
+  total += call.out_len;
+  const int32_t scratch_offset = total;
+  total += call.scratch_len;
+
+  ArenaDoubles values((size_t)total, 0.0);
+  ArenaDoubles adjoints((size_t)total, 0.0);
+  ArenaVaris input_varis;
+  input_varis.reserve((size_t)out_offset);
+  for (int k = 0; k < call.n_in; ++k) {
+    for (int i = 0; i < call.in_len[k]; ++i) {
+      const stan::math::var& x = reg[(size_t)(call.in[k] + i)];
+      values[(size_t)(in_offset[(size_t)k] + i)] = x.val();
+      input_varis.push_back(x.vi_);
+    }
+  }
+
+  KernelCtx ctx;
+  double* const value_base = values.empty() ? nullptr : values.data();
+  ctx.n_in = call.n_in;
+  for (int k = 0; k < call.n_in; ++k)
+    ctx.in[k] = Desc{value_base ? value_base + in_offset[(size_t)k] : nullptr,
+                     call.in_len[k]};
+  ctx.out = Desc{value_base ? value_base + out_offset : nullptr, call.out_len};
+  ctx.variant = call.variant;
+  ctx.scratch = value_base ? value_base + scratch_offset : nullptr;
+  ctx.idata = call.idata.data();
+  ctx.n_idata = (int64_t)call.idata.size();
+  ctx.udata = call.udata_owner.get();
+  call.forward(ctx);
+
+  ArenaVaris output_varis((size_t)call.out_len);
+  for (int i = 0; i < call.out_len; ++i) {
+    reg[(size_t)(call.out + i)] =
+        stan::math::var(values[(size_t)(out_offset + i)]);
+    output_varis[(size_t)i] = reg[(size_t)(call.out + i)].vi_;
+  }
+
+  const KernelFn backward = call.backward;
+  const uint8_t variant = call.variant;
+  const uint8_t input_adjoint_mask = call.input_adjoint_mask;
+  const int8_t n_in = call.n_in;
+  std::array<int32_t, 6> in_len{};
+  for (int k = 0; k < n_in; ++k) in_len[(size_t)k] = call.in_len[k];
+  const int32_t out_len = call.out_len;
+  const stan::arena_t<std::vector<int>> idata(call.idata.begin(),
+                                              call.idata.end());
+  const void* const udata = call.udata_owner.get();
+  stan::math::reverse_pass_callback([backward, variant, input_adjoint_mask,
+                                     n_in, in_len, out_len, idata, udata,
+                                     values, adjoints, input_varis,
+                                     output_varis, in_offset, out_offset,
+                                     scratch_offset]() mutable {
+    std::fill(adjoints.begin(), adjoints.end(), 0.0);
+    KernelCtx reverse;
+    double* const value_base = values.empty() ? nullptr : values.data();
+    double* const adjoint_base = adjoints.empty() ? nullptr : adjoints.data();
+    reverse.n_in = n_in;
+    for (int k = 0; k < n_in; ++k) {
+      reverse.in[k] =
+          Desc{value_base ? value_base + in_offset[(size_t)k] : nullptr,
+               in_len[(size_t)k]};
+      reverse.in_adj[k] =
+          (input_adjoint_mask & (uint8_t)(1u << k))
+              ? Desc{adjoint_base ? adjoint_base + in_offset[(size_t)k]
+                                  : nullptr,
+                     in_len[(size_t)k]}
+              : Desc{nullptr, in_len[(size_t)k]};
+    }
+    reverse.out = Desc{value_base ? value_base + out_offset : nullptr, out_len};
+    reverse.variant = variant;
+    reverse.scratch = value_base ? value_base + scratch_offset : nullptr;
+    reverse.idata = idata.data();
+    reverse.n_idata = (int64_t)idata.size();
+    reverse.udata = udata;
+    for (int i = 0; i < out_len; ++i)
+      adjoints[(size_t)(out_offset + i)] = output_varis[(size_t)i]->adj_;
+    reverse.out_adj_vec =
+        Desc{adjoint_base ? adjoint_base + out_offset : nullptr, out_len};
+    reverse.out_adj = out_len == 1 ? output_varis[0]->adj_ : 0.0;
+    backward(reverse);
+
+    size_t vari_at = input_varis.size();
+    for (int k = n_in; k-- > 0;) {
+      vari_at -= (size_t)in_len[(size_t)k];
+      if (!(input_adjoint_mask & (uint8_t)(1u << k))) continue;
+      for (int i = in_len[(size_t)k]; i-- > 0;)
+        input_varis[vari_at + (size_t)i]->adj_ +=
+            adjoints[(size_t)(in_offset[(size_t)k] + i)];
+    }
+  });
+}
+
 void run_call(const Program::Call& call, double* reg, KernelCtx& ctx,
               EvalState* state) {
   if (call.forward == nullptr)
@@ -125,7 +255,10 @@ void register_density_kernels();
 void register_legacy_kernels();
 void register_matrix_kernels();
 void register_algebra_kernels();
+void register_quadrature_kernels();
 void register_ode_kernels();
+void register_dae_kernels();
+void register_ode_adjoint_kernels();
 void register_constrain_kernels();
 void register_eltwise_kernels();
 void register_scalar_binary_kernels();
@@ -134,6 +267,7 @@ void register_mixture_kernels();
 void register_message_kernels();
 void register_rng_kernel();
 void register_island_kernel();
+void register_structured_loop_kernel();
 
 static void ensure_registered() {
   static const bool once = [] {
@@ -142,7 +276,10 @@ static void ensure_registered() {
     register_legacy_kernels();
     register_matrix_kernels();
     register_algebra_kernels();
+    register_quadrature_kernels();
     register_ode_kernels();
+    register_dae_kernels();
+    register_ode_adjoint_kernels();
     register_constrain_kernels();
     register_message_kernels();
     register_rng_kernel();
@@ -151,6 +288,7 @@ static void ensure_registered() {
     register_scalar_unary_ad_kernels();
     register_mixture_kernels();
     register_island_kernel();
+    register_structured_loop_kernel();
     return true;
   }();
   (void)once;
@@ -251,20 +389,27 @@ Executor::Executor(const Executor& src) : graph_(src.graph_) {
 }
 
 void Executor::bind_() {
+  const auto checked_size = [](int64_t a, int64_t b) {
+    const auto max = static_cast<uint64_t>(std::vector<double>{}.max_size());
+    if (a < 0 || b < 0 || static_cast<uint64_t>(a) > max ||
+        static_cast<uint64_t>(b) > max - static_cast<uint64_t>(a))
+      throw std::length_error("executor arena size overflow");
+    return a + b;
+  };
   // Parameters first so the gradient vector is contiguous in declaration
   // order; then everything else.
   int64_t off = 0;
   for (auto& s : graph_.slots) {
     if (s.is_param) {
       s.offset = off;
-      off += s.len;
+      off = checked_size(off, s.len);
     }
   }
   n_params_ = off;
   for (auto& s : graph_.slots) {
     if (!s.is_param) {
       s.offset = off;
-      off += s.len;
+      off = checked_size(off, s.len);
     }
   }
   values_.assign(off, 0.0);
@@ -289,7 +434,7 @@ void Executor::bind_() {
     const Slot& s = graph_.slots[i];
     if (s.is_param) {
       adjoint_offsets[i] = adj_off;
-      adj_off += s.len;
+      adj_off = checked_size(adj_off, s.len);
     }
   }
   assert(adj_off == n_params_);
@@ -297,7 +442,7 @@ void Executor::bind_() {
     const Slot& s = graph_.slots[i];
     if (!s.is_param && (written[i] || (int)i == graph_.result_slot)) {
       adjoint_offsets[i] = adj_off;
-      adj_off += s.len;
+      adj_off = checked_size(adj_off, s.len);
     }
   }
   adjoints_.assign(adj_off, 0.0);
@@ -321,7 +466,8 @@ void Executor::bind_() {
       throw std::runtime_error(std::string("opcode not registered: ") +
                                opcode_name(op.opcode));
     scratch_offsets.push_back(scratch);
-    scratch += k.scratch_size ? k.scratch_size(op, graph_.slots.data()) : 0;
+    scratch = checked_size(
+        scratch, k.scratch_size ? k.scratch_size(op, graph_.slots.data()) : 0);
   }
   scratch_.assign(scratch, 0.0);
 
@@ -331,10 +477,17 @@ void Executor::bind_() {
   // gradient, which on the serial models (one op per observation, nothing to
   // vectorize) was a third of the time.
   ctx_.resize(graph_.ops.size());
+  kernel_states_.clear();
   out2_adj_ptr_.assign(graph_.ops.size(), nullptr);
   for (size_t i = 0; i < graph_.ops.size(); ++i) {
     ctx_[i] =
         make_ctx_(graph_.ops[i], scratch_offsets[i], written, adjoint_offsets);
+    const Kernel& k = kernel(graph_.ops[i].opcode);
+    if (k.make_state) {
+      kernel_states_.emplace_back(
+          k.make_state(graph_.ops[i], graph_.slots.data()));
+      ctx_[i].state = kernel_states_.back().get();
+    }
     const int o2 = graph_.ops[i].out2;
     if (o2 >= 0) {
       assert(adjoint_offsets[o2] >= 0);
@@ -346,8 +499,9 @@ void Executor::bind_() {
   fwd_fn_.resize(graph_.ops.size());
   bwd_.clear();
   bwd_.reserve(graph_.ops.size());
-  for (size_t i = 0; i < graph_.ops.size(); ++i)
+  for (size_t i = 0; i < graph_.ops.size(); ++i) {
     fwd_fn_[i] = resolve_forward_fn(graph_.ops[i]);
+  }
   for (size_t i = graph_.ops.size(); i-- > 0;) {
     void (*b)(KernelCtx&) = kernel(graph_.ops[i].opcode).backward;
     if (b) bwd_.push_back(BwdStep{b, &ctx_[i], out2_adj_ptr_[i]});

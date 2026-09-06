@@ -371,21 +371,6 @@ void cdf_fwd(KernelCtx& ctx, F&& f) {
         ctx, [&](const auto&... a) { return stan::math::fn(y, a...); }); \
   }
 
-// Ordinal regression. The outcome goes over as a std::vector<int>, not
-// the Eigen map the other lpmfs use: ordered_logistic hands its outcome
-// to scalar_seq_view and then asks for data(), whose non-const overload
-// wants a mutable pointer that a Map<const VectorXi> cannot supply. A
-// std::vector is also exactly what CmdStan's generated code passes, so
-// this is the instantiation the references were produced from. The copy
-// is n ints per evaluation, against a density over the same n.
-#define STANLI_DEFINE_ORDERED_FWD(code, fn, nargs, vecmask)                   \
-  void fn##_fwd_gen(KernelCtx& ctx) {                                         \
-    const std::vector<int> y(ctx.idata, ctx.idata + ctx.n_idata);             \
-    density_fwd_v<nargs, 2, vecmask>(                                         \
-        ctx, [&](const auto&... a) { return stan::math::fn<true>(y, a...); }, \
-        [&](const auto&... a) { return stan::math::fn<false>(y, a...); });    \
-  }
-
 // Declarations of everything the shards define, so registration in
 // densities.cpp can name them without seeing their bodies.
 #define STANLI_DECLARE_FWD(code, fn, ...) void fn##_fwd_gen(KernelCtx&);
@@ -394,7 +379,6 @@ STANLI_INT_DENSITY_LIST(STANLI_DECLARE_FWD)
 STANLI_SCALAR_CDF_LIST(STANLI_DECLARE_FWD)
 STANLI_INT_CDF_LIST(STANLI_DECLARE_FWD)
 STANLI_TWO_INT_CDF_LIST(STANLI_DECLARE_FWD)
-STANLI_ORDERED_DENSITY_LIST(STANLI_DECLARE_FWD)
 #undef STANLI_DECLARE_FWD
 
 // The hand-written ones, which predate the lists and are not the same

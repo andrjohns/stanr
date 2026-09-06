@@ -41,6 +41,12 @@ void each_write(const Program& p, const Program::Instr& I, F fn) {
     fn(Span{c.scratch, c.scratch_len});
     return;
   }
+  if (I.code == Program::TRANSFORM) {
+    const Program::Transform& tr = p.transforms[(size_t)I.a];
+    fn(Span{tr.out, tr.out_len});
+    fn(Span{tr.jac, 1});
+    return;
+  }
   const int len = program_output_len(I);
   if (len > 0) fn(Span{I.dst, len});
 }
@@ -50,6 +56,11 @@ void each_read(const Program& p, const Program::Instr& I, F fn) {
   if (I.code == Program::CALL) {
     const Program::Call& c = p.calls[(size_t)I.a];
     for (int j = 0; j < c.n_in; ++j) fn(Span{c.in[j], c.in_len[j]});
+    return;
+  }
+  if (I.code == Program::TRANSFORM) {
+    const Program::Transform& tr = p.transforms[(size_t)I.a];
+    for (int k = 0; k < tr.n_in; ++k) fn(Span{tr.in[k], tr.in_len[k]});
     return;
   }
   if (I.code == Program::DENSITY) {
@@ -69,6 +80,12 @@ void each_read(const Program& p, const Program::Instr& I, F fn) {
       fn(Span{v.arg_reg[k], ((v.container_mask >> k) & 1u) ? v.len : 1});
     return;
   }
+  if (I.code == Program::PRINT || I.code == Program::REJECT) {
+    const Program::Message& message = p.messages[(size_t)I.a];
+    for (size_t k = 0; k < message.value_reg.size(); ++k)
+      fn(Span{message.value_reg[k], message.value_len[k]});
+    return;
+  }
   const ProgramOpSpec& spec = program_code_spec(I.code);
   if (spec.has(kProgramNoInputs)) return;
   fn(Span{I.a, spec.has(kProgramRangeA) ? I.len : 1});
@@ -84,12 +101,25 @@ void remap(Program::Call& c, const std::vector<int>& m) {
   if (c.scratch_len > 0) c.scratch = m[(size_t)c.scratch];
 }
 
+void remap(Program::Transform& tr, const std::vector<int>& m) {
+  for (int k = 0; k < tr.n_in; ++k)
+    if (tr.in_len[k] > 0) tr.in[k] = m[(size_t)tr.in[k]];
+  if (tr.out_len > 0) tr.out = m[(size_t)tr.out];
+  tr.jac = m[(size_t)tr.jac];
+}
+
 void remap(Program::VecDensity& v, const std::vector<int>& m) {
   for (int k = 0; k < v.arity; ++k) v.arg_reg[k] = m[(size_t)v.arg_reg[k]];
 }
 
+void remap(Program::Message& message, const std::vector<int>& m) {
+  for (size_t k = 0; k < message.value_reg.size(); ++k)
+    if (message.value_len[k] > 0)
+      message.value_reg[k] = m[(size_t)message.value_reg[k]];
+}
+
 void remap(Program::Instr& I, const std::vector<int>& m) {
-  if (I.code == Program::CALL) return;
+  if (I.code == Program::CALL || I.code == Program::TRANSFORM) return;
   const ProgramOpSpec& spec = program_code_spec(I.code);
   if (program_output_len(I) > 0) I.dst = m[(size_t)I.dst];
   // DENSITY_VEC's `a` is a vec_densities index, not a register; its own
@@ -120,7 +150,8 @@ bool forwardable_producer(Program::Code code) {
   // output and scratch ranges outside Instr. Instructions without a generated
   // adjoint are outside this experiment as well: the important saving is the
   // producer/copy pair in both the forward and generated reverse streams.
-  if (code == Program::MOV || code == Program::MOVR || code == Program::CALL)
+  if (code == Program::MOV || code == Program::MOVR || code == Program::CALL ||
+      code == Program::TRANSFORM)
     return false;
   const ProgramOpSpec& spec = program_code_spec(code);
   return !spec.has(kProgramNoOutput) && !spec.has(kProgramNoAdjoint);
@@ -243,8 +274,14 @@ bool compact_program_gated(Program& p, std::vector<std::pair<int, int>>& seeded,
       return false;
     if (I.code == Program::CALL && (I.a < 0 || (size_t)I.a >= p.calls.size()))
       return false;
+    if (I.code == Program::TRANSFORM &&
+        (I.a < 0 || (size_t)I.a >= p.transforms.size()))
+      return false;
     if (I.code == Program::DENSITY_VEC &&
         (I.a < 0 || (size_t)I.a >= p.vec_densities.size()))
+      return false;
+    if ((I.code == Program::PRINT || I.code == Program::REJECT) &&
+        (I.a < 0 || (size_t)I.a >= p.messages.size()))
       return false;
   }
 
@@ -441,8 +478,11 @@ bool compact_program_gated(Program& p, std::vector<std::pair<int, int>>& seeded,
     if (remove[i]) continue;
     Program::Instr I = p.code[i];
     if (I.code == Program::CALL) remap(p.calls[(size_t)I.a], map);
+    if (I.code == Program::TRANSFORM) remap(p.transforms[(size_t)I.a], map);
     if (I.code == Program::DENSITY_VEC)
       remap(p.vec_densities[(size_t)I.a], map);
+    if (I.code == Program::PRINT || I.code == Program::REJECT)
+      remap(p.messages[(size_t)I.a], map);
     remap(I, map);
     if (branches(I.code)) I.dst = new_pc[(size_t)I.dst];
     code.push_back(I);

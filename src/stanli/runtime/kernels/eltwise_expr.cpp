@@ -8,7 +8,9 @@
 
 #include <stan/math/prim.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace stanli {
 namespace {
@@ -223,22 +225,17 @@ void pow_fwd(KernelCtx& ctx) {
     ctx.out.data[i] =
         std::pow(ctx.in[0].data[s0 ? 0 : i], ctx.in[1].data[s1 ? 0 : i]);
 }
-// A zero base contributes nothing to either partial. Every one of
-// stan-math's four rev pow overloads says so -- the scalar and the
-// (scalar base, matrix exponent) ones return early on
-// `value_of(base) == 0.0`, the two matrix ones `select` on
-// `value_of(base) != 0.0` -- and both partials would otherwise be
-// nonfinite there: b*v/a is 0/0 when a is 0, and log(a) is -inf meeting
-// v = 0. The skip is elementwise because the base is, and it is a skip
-// rather than a multiply by a zero mask for the reason sqrtv_bwd's is:
-// multiplying an inf by zero is the NaN being avoided. A NaN base still
-// propagates, since `NaN == 0.0` is false.
 void pow_bwd(KernelCtx& ctx) {
   const bool s0 = scal(ctx, 0), s1 = scal(ctx, 1);
   if (ctx.out.len == 1) {
     const double a = ctx.in[0].data[0], b = ctx.in[1].data[0];
     const double v = ctx.out.data[0];
-    if (a == 0.0) return;
+    if (a == 0.0) {
+      if (ctx.in_adj[0].data)
+        ctx.in_adj[0].data[0] +=
+            pow_zero_base_partial(ctx.variant, ctx.out_adj, a, b);
+      return;
+    }
     if (ctx.in_adj[0].data) ctx.in_adj[0].data[0] += ctx.out_adj * b * v / a;
     if (ctx.in_adj[1].data)
       ctx.in_adj[1].data[0] += ctx.out_adj * std::log(a) * v;
@@ -249,7 +246,12 @@ void pow_bwd(KernelCtx& ctx) {
     const double b = ctx.in[1].data[s1 ? 0 : i];
     const double v = ctx.out.data[i];
     const double dout = ctx.out_adj_vec.data[i];
-    if (a == 0.0) continue;
+    if (a == 0.0) {
+      if (ctx.in_adj[0].data)
+        ctx.in_adj[0].data[s0 ? 0 : i] +=
+            pow_zero_base_partial(ctx.variant, dout, a, b);
+      continue;
+    }
     if (ctx.in_adj[0].data) ctx.in_adj[0].data[s0 ? 0 : i] += dout * b * v / a;
     if (ctx.in_adj[1].data)
       ctx.in_adj[1].data[s1 ? 0 : i] += dout * std::log(a) * v;
@@ -262,6 +264,47 @@ void dot_fwd(KernelCtx& ctx) {
 void dot_bwd(KernelCtx& ctx) {
   if (ctx.in_adj[0].data) dx_a(ctx, 0) += ctx.out_adj * in_a(ctx, 1);
   if (ctx.in_adj[1].data) dx_a(ctx, 1) += ctx.out_adj * in_a(ctx, 0);
+}
+
+// ---- grouped dots: columns/rows_dot_product, columns/rows_dot_self --------
+// idata = {groups, width, group_stride, cell_stride}; result cell g folds
+// the width source cells at g*group_stride + k*cell_stride. The AoS
+// reverse-mode overloads CmdStan's model block instantiates accumulate each
+// group's value strictly in order (dot_product's arena .val().dot() and
+// dot_self's explicit loop both reduce sequentially), so the forward is a
+// scalar in-order loop rather than OP_DOT's packet redux; the prim double
+// partial reduxes group differently by ulps at width >= the packet size,
+// below reference-CSV precision. Self forms pass the one input twice and the
+// backward accumulates both terms, the same convention OP_DOT's dot_self
+// call relies on.
+void group_dot_fwd(KernelCtx& ctx) {
+  const int64_t groups = ctx.idata[0], width = ctx.idata[1];
+  const int64_t gs = ctx.idata[2], cs = ctx.idata[3];
+  const double* a = ctx.in[0].data;
+  const double* b = ctx.in[1].data;
+  for (int64_t g = 0; g < groups; ++g) {
+    double sum = 0.0;
+    for (int64_t k = 0; k < width; ++k)
+      sum += a[g * gs + k * cs] * b[g * gs + k * cs];
+    ctx.out.data[g] = sum;
+  }
+}
+void group_dot_bwd(KernelCtx& ctx) {
+  const int64_t groups = ctx.idata[0], width = ctx.idata[1];
+  const int64_t gs = ctx.idata[2], cs = ctx.idata[3];
+  const double* a = ctx.in[0].data;
+  const double* b = ctx.in[1].data;
+  // A one-column or one-row input makes a one-cell container result, which
+  // a register-machine call still marks vector_output; take whichever
+  // adjoint form the caller populated.
+  const double* dout =
+      ctx.out_adj_vec.data != nullptr ? ctx.out_adj_vec.data : &ctx.out_adj;
+  for (int64_t g = 0; g < groups; ++g)
+    for (int64_t k = 0; k < width; ++k) {
+      const int64_t at = g * gs + k * cs;
+      if (ctx.in_adj[0].data) ctx.in_adj[0].data[at] += dout[g] * b[at];
+      if (ctx.in_adj[1].data) ctx.in_adj[1].data[at] += dout[g] * a[at];
+    }
 }
 
 // ---- unaries ---------------------------------------------------------------
@@ -499,6 +542,27 @@ void repv_bwd(KernelCtx& ctx) {
     ctx.in_adj[0].data[0] += ctx.out_adj_vec.data[i];
 }
 
+int64_t repv_extent(const KernelCtx& ctx) {
+  if (ctx.n_in != 2 || ctx.in[1].len != 1)
+    throw std::logic_error("dynamic rep_vector extent is not scalar");
+  const double raw = ctx.in[1].data[0];
+  if (!std::isfinite(raw) || std::trunc(raw) != raw || raw < 0 ||
+      raw > static_cast<double>(ctx.out.len))
+    throw std::domain_error("dynamic rep_vector extent exceeds capacity");
+  return static_cast<int64_t>(raw);
+}
+void repv_dynamic_fwd(KernelCtx& ctx) {
+  const int64_t n = repv_extent(ctx);
+  for (int64_t i = 0; i < n; ++i) ctx.out.data[i] = ctx.in[0].data[0];
+  std::fill(ctx.out.data + n, ctx.out.data + ctx.out.len, 0.0);
+}
+void repv_dynamic_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data) return;
+  const int64_t n = repv_extent(ctx);
+  for (int64_t i = 0; i < n; ++i)
+    ctx.in_adj[0].data[0] += ctx.out_adj_vec.data[i];
+}
+
 // Generated from STANLI_SCALAR_UNARY_LIST (optable.hpp): the value in the
 // forward, the ordered delta and its pullback topology in the backward.
 // Shape-preserving and elementwise, so a re-rolled vector arrives here as one
@@ -539,6 +603,7 @@ void register_eltwise_kernels() {
   register_kernel(OP_DIV, Kernel{div_fwd, div_bwd, nullptr});
   register_kernel(OP_POW, Kernel{pow_fwd, pow_bwd, nullptr});
   register_kernel(OP_DOT, Kernel{dot_fwd, dot_bwd, nullptr});
+  register_kernel(OP_GROUP_DOT, Kernel{group_dot_fwd, group_dot_bwd, nullptr});
   register_kernel(OP_NEG, Kernel{negu_fwd, negu_bwd, nullptr});
   register_kernel(OP_EXPV, Kernel{expv_fwd, expv_bwd, nullptr});
   register_kernel(OP_TANHV, Kernel{tanhv_fwd, tanhv_bwd, nullptr});
@@ -555,6 +620,8 @@ void register_eltwise_kernels() {
   register_kernel(OP_VARIANCE, Kernel{dispersion_fwd<false>, dispersion_bwd,
                                       dispersion_scratch});
   register_kernel(OP_REP_VEC, Kernel{repv_fwd, repv_bwd, nullptr});
+  register_kernel(OP_REP_VEC_DYNAMIC,
+                  Kernel{repv_dynamic_fwd, repv_dynamic_bwd, nullptr});
 }
 
 }  // namespace stanli

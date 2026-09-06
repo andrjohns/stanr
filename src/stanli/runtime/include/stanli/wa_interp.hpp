@@ -103,9 +103,6 @@ class WaInterp {
                    std::vector<double>& row);
   bool rng_fun(MirInterp<double>& in, const mir::Expr& e, DataMap::Entry* out,
                WaRng& rng);
-  bool ode_fun(MirInterp<double>& in, const mir::Expr& e, DataMap::Entry* out);
-  bool algebra_fun(MirInterp<double>& in, const mir::Expr& e,
-                   DataMap::Entry* out);
 
   std::shared_ptr<const mir::Program> prog_;
   std::map<std::string, const mir::FunDef*> funs_;

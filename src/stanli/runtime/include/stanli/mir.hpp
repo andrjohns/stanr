@@ -9,9 +9,11 @@
 #include <stanli/sexp.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace stanli {
@@ -60,6 +62,90 @@ struct Expr {
   std::string raw;         // Unsupported diagnostics
 };
 
+// stanc leaves these calls in MIR rather than folding them: four have
+// non-finite/platform values, while the mathematical constants are still part
+// of the same language surface. Keep name recognition and values together so
+// graph lowering, the register compiler, and MirInterp cannot grow different
+// subsets. FnNegInf is the optimizer's internal spelling of the same
+// negative-infinity constant.
+enum class NullaryConstantKind : uint8_t {
+  E,
+  Pi,
+  Log2,
+  Log10,
+  Sqrt2,
+  MachinePrecision,
+  NegativeInfinity,
+  PositiveInfinity,
+  NotANumber,
+};
+
+inline std::optional<NullaryConstantKind> nullary_constant_kind(const Expr& e) {
+  if (e.kind != Expr::FunApp || !e.args.empty()) return std::nullopt;
+  if (e.fn_lib == Expr::Lib::Internal)
+    return e.name == "FnNegInf" ? std::optional<NullaryConstantKind>(
+                                      NullaryConstantKind::NegativeInfinity)
+                                : std::nullopt;
+  if (e.fn_lib != Expr::Lib::StanLib) return std::nullopt;
+  if (e.name == "e") return NullaryConstantKind::E;
+  if (e.name == "pi") return NullaryConstantKind::Pi;
+  if (e.name == "log2") return NullaryConstantKind::Log2;
+  if (e.name == "log10") return NullaryConstantKind::Log10;
+  if (e.name == "sqrt2") return NullaryConstantKind::Sqrt2;
+  if (e.name == "machine_precision")
+    return NullaryConstantKind::MachinePrecision;
+  if (e.name == "negative_infinity")
+    return NullaryConstantKind::NegativeInfinity;
+  if (e.name == "positive_infinity")
+    return NullaryConstantKind::PositiveInfinity;
+  if (e.name == "not_a_number") return NullaryConstantKind::NotANumber;
+  return std::nullopt;
+}
+
+inline double nullary_constant_value(NullaryConstantKind kind) {
+  switch (kind) {
+    case NullaryConstantKind::E:
+      return 0x1.5bf0a8b145769p+1;
+    case NullaryConstantKind::Pi:
+      return 0x1.921fb54442d18p+1;
+    case NullaryConstantKind::Log2:
+      return 0x1.62e42fefa39efp-1;
+    case NullaryConstantKind::Log10:
+      return 0x1.26bb1bbb55516p+1;
+    case NullaryConstantKind::Sqrt2:
+      return 0x1.6a09e667f3bcdp+0;
+    case NullaryConstantKind::MachinePrecision:
+      return std::numeric_limits<double>::epsilon();
+    case NullaryConstantKind::NegativeInfinity:
+      return -std::numeric_limits<double>::infinity();
+    case NullaryConstantKind::PositiveInfinity:
+      return std::numeric_limits<double>::infinity();
+    case NullaryConstantKind::NotANumber:
+      return std::numeric_limits<double>::quiet_NaN();
+  }
+  return std::numeric_limits<double>::quiet_NaN();
+}
+
+inline std::optional<double> nullary_constant(const Expr& e) {
+  const auto kind = nullary_constant_kind(e);
+  return kind ? std::optional<double>(nullary_constant_value(*kind))
+              : std::nullopt;
+}
+
+// Calls whose value comes from the evaluation context rather than solely
+// from their arguments. Keep their recognition beside the other shared MIR
+// call metadata so every backend, effect analysis, and optimizer agrees on
+// the spelling and arity. Backends still own the state itself.
+enum class StatefulIntrinsicKind : uint8_t { Target };
+
+inline std::optional<StatefulIntrinsicKind> stateful_intrinsic_kind(
+    const Expr& e) {
+  if (e.kind == Expr::FunApp && e.fn_lib == Expr::Lib::StanLib &&
+      e.name == "target" && e.args.empty())
+    return StatefulIntrinsicKind::Target;
+  return std::nullopt;
+}
+
 // A matrix row is a non-contiguous Eigen block.  Transposing it changes the
 // logical orientation but not the stride, so an outer elementwise expression
 // containing it has no packet access and Stan Math's product reduces in
@@ -99,6 +185,19 @@ inline bool language_scalar(const Expr& e) {
                                   e.unsized.leaf == UnsizedLeaf::Real);
 }
 
+inline bool eigen_leaf(const Expr& e) {
+  return e.unsized.leaf == UnsizedLeaf::Vector ||
+         e.unsized.leaf == UnsizedLeaf::RowVector ||
+         e.unsized.leaf == UnsizedLeaf::Matrix;
+}
+
+inline uint8_t pow_zero_base_law(const Expr& base, const Expr& exponent,
+                                 bool exponent_autodiff) {
+  if (exponent_autodiff) return kPowZeroBaseGuarded;
+  if (!eigen_leaf(base)) return kPowZeroBaseScalar;
+  return eigen_leaf(exponent) ? kPowZeroBaseGuarded : kPowZeroBaseMatrix;
+}
+
 inline bool source_unary_elementwise(const std::string& name) {
   bool unary = false;
 #define STANLI_SOURCE_UNARY(code, fn_name, value, delta, topology) \
@@ -118,6 +217,7 @@ inline bool source_binary_elementwise(const std::string& name) {
   STANLI_SCALAR_BINARY_LIST(STANLI_SOURCE_BINARY)
   STANLI_SCALAR_BINARY_INT_FIRST_LIST(STANLI_SOURCE_BINARY)
   STANLI_SCALAR_BINARY_INT_SECOND_LIST(STANLI_SOURCE_BINARY)
+  STANLI_SCALAR_BINARY_INTEGER_LIST(STANLI_SOURCE_BINARY)
 #undef STANLI_SOURCE_BINARY
   return binary || name == "Plus__" || name == "Minus__" ||
          name == "EltTimes__" || name == "EltDivide__" || name == "EltPow__" ||
@@ -463,14 +563,133 @@ struct Program {
   std::vector<std::string> output_vars;
 };
 
-// reduce_sum(f, sliced, grainsize, shared...) reaches its partial-sum
-// function through a bare Var rather than a call, so both engines need the
-// same three answers about that reference: whether this is a reduce_sum at
-// all, which definition the name means, and what propto it asks for.
+// Higher-order Stan functions carry their callback as a bare Var rather than
+// a user-function call.  Keep family recognition here so graph lowering, the
+// register compiler, the interpreter, and effect analysis cannot acquire
+// different lists as support grows.
+
+enum class HigherOrderFamily : uint8_t {
+  ReduceSum,
+  MapRect,
+  Algebra,
+  Integrate1D,
+  Ode,
+  Dae,
+};
+
+struct HigherOrderCall {
+  HigherOrderFamily family;
+};
+
+enum class QuadratureMethod : uint8_t {
+  Integrate1D,
+  DoubleExponential,
+  GaussKronrod,
+};
+
+struct QuadratureCall {
+  QuadratureMethod method;
+  bool legacy = false;
+  bool with_tolerance = false;
+  size_t callback_args_begin = 3;
+};
+
+enum class OdeMethod : uint8_t { Rk45, Bdf, Adams, Ckrk, Adjoint };
+
+struct OdeCall {
+  OdeMethod method;
+  bool legacy = false;
+  bool with_tolerance = false;
+  // First callback argument after (f, y0, t0, ts) and optional controls.
+  size_t callback_args_begin = 4;
+};
+
+struct DaeCall {
+  bool with_tolerance = false;
+  // First callback argument after (f, y0, yp0, t0, ts) and optional controls.
+  size_t callback_args_begin = 5;
+};
+
+inline std::optional<DaeCall> dae_call(std::string_view name) {
+  if (name == "dae") return DaeCall{};
+  if (name == "dae_tol") return DaeCall{true, 8};
+  return {};
+}
+
+enum class AlgebraMethod : uint8_t { Powell, Newton };
+
+struct AlgebraCall {
+  AlgebraMethod method;
+  bool legacy = false;
+  bool with_tolerance = false;
+  size_t callback_args_begin = 2;
+};
+
+inline std::optional<AlgebraCall> algebra_call(std::string_view name) {
+  if (name == "algebra_solver") return AlgebraCall{AlgebraMethod::Powell, true};
+  if (name == "algebra_solver_newton")
+    return AlgebraCall{AlgebraMethod::Newton, true};
+  if (name == "solve_newton") return AlgebraCall{AlgebraMethod::Newton};
+  if (name == "solve_powell") return AlgebraCall{AlgebraMethod::Powell};
+  if (name == "solve_newton_tol")
+    return AlgebraCall{AlgebraMethod::Newton, false, true, 5};
+  if (name == "solve_powell_tol")
+    return AlgebraCall{AlgebraMethod::Powell, false, true, 5};
+  return {};
+}
+
+inline std::optional<OdeCall> ode_call(std::string_view name) {
+  if (name == "integrate_ode") return OdeCall{OdeMethod::Rk45, true, false, 4};
+  if (name == "integrate_ode_rk45")
+    return OdeCall{OdeMethod::Rk45, true, false, 4};
+  if (name == "integrate_ode_bdf")
+    return OdeCall{OdeMethod::Bdf, true, false, 4};
+  if (name == "integrate_ode_adams")
+    return OdeCall{OdeMethod::Adams, true, false, 4};
+  if (name == "ode_rk45") return OdeCall{OdeMethod::Rk45};
+  if (name == "ode_bdf") return OdeCall{OdeMethod::Bdf};
+  if (name == "ode_adams") return OdeCall{OdeMethod::Adams};
+  if (name == "ode_ckrk") return OdeCall{OdeMethod::Ckrk};
+  if (name == "ode_rk45_tol") return OdeCall{OdeMethod::Rk45, false, true, 7};
+  if (name == "ode_bdf_tol") return OdeCall{OdeMethod::Bdf, false, true, 7};
+  if (name == "ode_adams_tol") return OdeCall{OdeMethod::Adams, false, true, 7};
+  if (name == "ode_ckrk_tol") return OdeCall{OdeMethod::Ckrk, false, true, 7};
+  if (name == "ode_adjoint_tol_ctl")
+    return OdeCall{OdeMethod::Adjoint, false, true, 15};
+  return {};
+}
+
+inline std::optional<QuadratureCall> quadrature_call(std::string_view name) {
+  if (name == "integrate_1d")
+    return QuadratureCall{QuadratureMethod::Integrate1D, true, false, 3};
+  if (name == "integrate_1d_double_exponential")
+    return QuadratureCall{QuadratureMethod::DoubleExponential, false, false, 3};
+  if (name == "integrate_1d_double_exponential_tol")
+    return QuadratureCall{QuadratureMethod::DoubleExponential, false, true, 6};
+  if (name == "integrate_1d_gauss_kronrod")
+    return QuadratureCall{QuadratureMethod::GaussKronrod, false, false, 3};
+  if (name == "integrate_1d_gauss_kronrod_tol")
+    return QuadratureCall{QuadratureMethod::GaussKronrod, false, true, 6};
+  return {};
+}
+
+inline std::optional<HigherOrderCall> higher_order_call(const Expr& e) {
+  if (e.kind != Expr::FunApp || e.fn_lib != Expr::Lib::StanLib) return {};
+  const std::string_view name = e.name;
+  if (name == "reduce_sum" || name == "reduce_sum_static")
+    return HigherOrderCall{HigherOrderFamily::ReduceSum};
+  if (name == "map_rect") return HigherOrderCall{HigherOrderFamily::MapRect};
+  if (algebra_call(name)) return HigherOrderCall{HigherOrderFamily::Algebra};
+  if (quadrature_call(name))
+    return HigherOrderCall{HigherOrderFamily::Integrate1D};
+  if (ode_call(name)) return HigherOrderCall{HigherOrderFamily::Ode};
+  if (dae_call(name)) return HigherOrderCall{HigherOrderFamily::Dae};
+  return {};
+}
 
 inline bool is_reduce_sum(const Expr& e) {
-  return e.kind == Expr::FunApp && e.fn_lib == Expr::Lib::StanLib &&
-         (e.name == "reduce_sum" || e.name == "reduce_sum_static");
+  const auto call = higher_order_call(e);
+  return call && call->family == HigherOrderFamily::ReduceSum;
 }
 
 // The `_lupdf` / `_lupmf` spelling at the functor reference is stanc3's
@@ -509,12 +728,13 @@ inline std::vector<UnsizedView> reduce_sum_partial_views(const Expr& e) {
   return views;
 }
 
-// The reader mangles an overloaded definition's name and rewrites its call
-// sites, but a functor reference is a Var and is never rewritten. Take the
-// unmangled name when it is the only one, and otherwise select the overload
-// whose formals match the call reduce_sum will make. Returns null when the
-// name resolves to nothing or, impossibly, to more than one.
-inline const FunDef* resolve_reduce_sum_partial(
+// The reader mangles an overloaded definition's name and rewrites ordinary
+// call sites, but a higher-order callback reference is a Var and is never
+// rewritten. Take the unmangled name when it is the only one, and otherwise
+// select the overload whose formals match the call the family will make.
+// Returns null when the name resolves to nothing or, impossibly, to more than
+// one.  Family-specific helpers only have to construct `views`.
+inline const FunDef* resolve_callback(
     const std::map<std::string, const FunDef*>& funs, const std::string& base,
     const std::vector<UnsizedView>& views) {
   const auto exact = funs.find(base);
