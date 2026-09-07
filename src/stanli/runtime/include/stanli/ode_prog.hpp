@@ -36,8 +36,8 @@ struct IslandProg;
 
 struct RhsProgram : Program {
   // Where run_rhs deposits the call arguments.
-  int t_reg = -1, y0 = -1, th0 = -1, xr0 = -1;
-  int n_y = 0, n_th = 0, n_xr = 0;
+  int t_reg = -1, y0 = -1, yp0 = -1, th0 = -1, xr0 = -1;
+  int n_y = 0, n_yp = 0, n_th = 0, n_xr = 0;
   bool ok = false;
   std::string why;  // why not, when !ok
 };
@@ -62,6 +62,13 @@ struct RhsArg {
 // Compile `f` against a variadic argument list. Never throws: failure
 // comes back as ok == false with a reason.
 RhsProgram compile_rhs_args(
+    const mir::FunDef& f, const std::map<std::string, const mir::FunDef*>& funs,
+    int n_y, const std::vector<RhsArg>& args);
+
+// Compile a DAE residual with the convention (t, y, y', ...args). The result
+// uses the same register program and packed variadic argument representation
+// as an ODE RHS, with one additional seeded state-derivative region.
+RhsProgram compile_dae_args(
     const mir::FunDef& f, const std::map<std::string, const mir::FunDef*>& funs,
     int n_y, const std::vector<RhsArg>& args);
 
@@ -114,6 +121,33 @@ void seed_rhs_regs(const RhsProgram& p, const T_time& t, const T_y* y,
   for (int i = 0; i < p.n_xr; ++i) reg[(size_t)(p.xr0 + i)] = T(xr[i]);
 }
 
+template <typename T, typename T_time, typename T_y, typename T_yp,
+          typename T_theta>
+void seed_dae_regs(const RhsProgram& p, const T_time& t, const T_y* y,
+                   const T_yp* yp, const T_theta* th, size_t n_th_source,
+                   const double* xr, std::vector<T>& reg) {
+  if ((int)reg.size() < p.n_regs) reg.resize((size_t)p.n_regs);
+  for (int i = 0; i < p.n_y; ++i) reg[(size_t)(p.y0 + i)] = T(y[i]);
+  for (int i = 0; i < p.n_yp; ++i) reg[(size_t)(p.yp0 + i)] = T(yp[i]);
+  for (int i = 0; i < p.n_th; ++i) reg[(size_t)(p.th0 + i)] = T(th[i]);
+  for (size_t i = (size_t)p.n_th; i < n_th_source; ++i) {
+    [[maybe_unused]] const T promoted(th[i]);
+  }
+  reg[(size_t)p.t_reg] = T(t);
+  for (int i = 0; i < p.n_xr; ++i) reg[(size_t)(p.xr0 + i)] = T(xr[i]);
+}
+
+template <typename T, typename T_time, typename T_y, typename T_yp,
+          typename T_theta>
+std::vector<T>& eval_dae_regs(const RhsProgram& p, const T_time& t,
+                              const T_y* y, const T_yp* yp, const T_theta* th,
+                              size_t n_th_source, const double* xr) {
+  std::vector<T>& reg = rhs_regs<T>();
+  seed_dae_regs<T>(p, t, y, yp, th, n_th_source, xr, reg);
+  run_program(p, reg);
+  return reg;
+}
+
 template <typename T, typename T_time, typename T_y, typename T_theta>
 std::vector<T>& eval_rhs_regs(const RhsProgram& p, const T_time& t,
                               const T_y* y, const T_theta* th,
@@ -126,6 +160,17 @@ std::vector<T>& eval_rhs_regs(const RhsProgram& p, const T_time& t,
 }
 
 }  // namespace detail
+
+template <typename T, typename T_time, typename T_y, typename T_yp,
+          typename T_theta>
+void run_dae_into(const RhsProgram& p, const T_time& t, const T_y* y,
+                  const T_yp* yp, const T_theta* th, size_t n_th_source,
+                  const double* xr, T* out) {
+  const std::vector<T>& reg =
+      detail::eval_dae_regs<T>(p, t, y, yp, th, n_th_source, xr);
+  for (size_t i = 0; i < p.out_regs.size(); ++i)
+    out[i] = reg[(size_t)p.out_regs[i]];
+}
 
 // Caller-owned output form for hot callback adapters. The destination must
 // hold p.out_regs.size() scalars and must not alias the reusable register file.

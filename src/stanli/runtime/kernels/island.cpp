@@ -134,7 +134,7 @@ void island_calls_fwd(KernelCtx& ctx) { island_fwd_impl<true>(ctx); }
 
 bool island_has_effect(const Program& p) {
   for (const Program::Instr& I : p.code) {
-    if (I.code == Program::REJECT) return true;
+    if (I.code == Program::PRINT || I.code == Program::REJECT) return true;
     if (I.code != Program::CALL) continue;
     // A payload index out of range is malformed rather than pure; refusing
     // to fold is the safe answer either way.

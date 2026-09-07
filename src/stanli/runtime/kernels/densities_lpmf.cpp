@@ -446,7 +446,5 @@ void beta_binomial_fwd(KernelCtx& ctx) {
 STANLI_TWO_INT_CDF_LIST(STANLI_DEFINE_TWO_INT_CDF_FWD)
 #undef STANLI_DEFINE_TWO_INT_CDF_FWD
 
-STANLI_ORDERED_DENSITY_LIST(STANLI_DEFINE_ORDERED_FWD)
-
 }  // namespace dens
 }  // namespace stanli

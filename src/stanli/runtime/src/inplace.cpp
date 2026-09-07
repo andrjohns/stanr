@@ -382,7 +382,7 @@ int elide_full_extent_stores(Graph& g, const std::vector<int>& roots) {
       if (r <= i || r >= next_write) continue;
       // Island bodies name outer slots in a payload this rename cannot
       // reach.
-      if (g.ops[r].opcode == OP_ISLAND) {
+      if (g.ops[r].opcode == OP_ISLAND || g.ops[r].opcode == OP_LOOP) {
         ok = false;
         break;
       }

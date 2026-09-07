@@ -59,11 +59,6 @@ void register_density_kernels() {
   // so the same expansion gives them the right backward.
   STANLI_TWO_INT_CDF_LIST(STANLI_REGISTER_CDF)
 #undef STANLI_REGISTER_CDF
-#define STANLI_REGISTER_ORDERED(code, fn, nargs, vm) \
-  register_kernel(                                   \
-      code, Kernel{fn##_fwd_gen, density_bwd<nargs>, density_scratch<nargs>});
-  STANLI_ORDERED_DENSITY_LIST(STANLI_REGISTER_ORDERED)
-#undef STANLI_REGISTER_ORDERED
 }
 
 }  // namespace stanli

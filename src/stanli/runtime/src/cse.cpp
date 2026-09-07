@@ -26,6 +26,8 @@
 #include <stanli/cse.hpp>
 #include <stanli/optable.hpp>
 
+#include "pass_util.hpp"
+
 #include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,25 +40,10 @@ namespace {
 // cannot compare: a reduction whose variant selects its arithmetic grouping,
 // a compiled region, a solver.
 bool never_merge(uint16_t oc) {
-  return is_effectful_op(oc) || oc == OP_PROD_VEC || oc == OP_EXTREMA_VEC ||
-         oc == OP_ISLAND || oc == OP_ODE;
+  return is_effectful_op(oc) || has_op_trait(oc, op_trait::kVariantGrouped) ||
+         oc == OP_ISLAND || oc == OP_ODE || oc == OP_DAE ||
+         oc == OP_ODE_ADJOINT;
 }
-
-struct Key {
-  std::vector<int64_t> w;
-  bool operator==(const Key& o) const { return w == o.w; }
-};
-
-struct KeyHash {
-  size_t operator()(const Key& k) const {
-    size_t h = 1469598103934665603ull;
-    for (int64_t v : k.w) {
-      h ^= static_cast<size_t>(v);
-      h *= 1099511628211ull;
-    }
-    return h;
-  }
-};
 
 }  // namespace
 

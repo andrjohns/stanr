@@ -20,13 +20,18 @@
 #ifndef STANLI_PROGRAM_HPP
 #define STANLI_PROGRAM_HPP
 
+#include <stanli/callable_transform.hpp>
+#include <stanli/extrema_grouping.hpp>
 #include <stanli/kernel_types.hpp>
+#include <stanli/message.hpp>
+#include <stanli/optable.hpp>
 #include <stanli/program_density.hpp>
 
 #include <stan/math.hpp>
 
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -58,6 +63,16 @@ enum ProgramOpFlag : uint16_t {
   kProgramReadC = 1u << 11,
 };
 
+// EXTREMA_RANGE's `c` immediate. The register file has already materialized
+// every input contiguously, but the source expression's Eigen traversal is
+// still observable for NaNs, signed zero, ties, and adjoint selection. Keep
+// that grouping beside the integer-surface marker instead of guessing from
+// the materialized address at execution time.
+inline constexpr int32_t kProgramExtremaInteger = 1 << 0;
+inline constexpr int32_t kProgramExtremaScalar = 1 << 1;
+inline constexpr int32_t kProgramExtremaPhased = 1 << 2;
+inline constexpr int32_t kProgramExtremaPhaseShift = 3;
+
 // `a` is an operand wherever kProgramNoInputs is absent; b and c are not,
 // and the ones that are not hold register zero rather than nothing, so
 // which registers a program actually reads needs saying. DENSITY's arity
@@ -72,6 +87,7 @@ enum ProgramOpFlag : uint16_t {
   X(MUL, kProgramReadB | kProgramSaveA | kProgramSaveB)                      \
   X(DIV, kProgramReadB | kProgramSaveA | kProgramSaveB)                      \
   X(IDIV, kProgramReadB | kProgramNoAdjoint)                                 \
+  /* len holds the PowZeroBaseLaw; POW has no range. */                      \
   X(POW, kProgramReadB | kProgramSaveA | kProgramSaveB | kProgramSaveOut)    \
   X(FMAX, kProgramReadB | kProgramSaveA | kProgramSaveB)                     \
   X(FMIN, kProgramReadB | kProgramSaveA | kProgramSaveB)                     \
@@ -93,7 +109,8 @@ enum ProgramOpFlag : uint16_t {
   X(EQ, kProgramReadB)                                                       \
   X(NE, kProgramReadB)                                                       \
   X(DYN_INDEX, kProgramReadB | kProgramNoAdjoint)                            \
-  X(MAX_RANGE, kProgramRangeA | kProgramNoAdjoint)                           \
+  /* b selects max (1) or min (0); c stores kProgramExtrema* metadata. */    \
+  X(EXTREMA_RANGE, kProgramRangeA | kProgramNoAdjoint)                       \
   X(JZ, kProgramNoAdjoint | kProgramNoOutput)                                \
   X(JMP, kProgramNoInputs | kProgramNoAdjoint | kProgramNoOutput)            \
   X(LOG_RANGE, kProgramRangeA | kProgramSaveA | kProgramRangeOutput)         \
@@ -109,16 +126,14 @@ enum ProgramOpFlag : uint16_t {
   X(FMA, kProgramReadB | kProgramReadC | kProgramSaveA | kProgramSaveB)      \
   X(DIAG_PRE_MULTIPLY, kProgramReadB | kProgramNoAdjoint)                    \
   X(DIAG_POST_MULTIPLY, kProgramReadB | kProgramNoAdjoint)                   \
-  X(MATRIX_EXP, kProgramRangeA | kProgramRangeOutput | kProgramNoAdjoint)    \
   X(MDIVIDE_LEFT, kProgramRangeA | kProgramRangeB | kProgramReadB |          \
                       kProgramRangeOutput | kProgramNoAdjoint)               \
   X(MDIVIDE_RIGHT_SPD, kProgramRangeA | kProgramRangeB | kProgramReadB |     \
                            kProgramRangeOutput | kProgramNoAdjoint)          \
-  X(QUAD_FORM_SYM, kProgramRangeA | kProgramRangeB | kProgramReadB |         \
-                       kProgramRangeOutput | kProgramNoAdjoint)              \
-  X(MULT_LOWER_TRI_SELF_TRANSPOSE, kProgramRangeA | kProgramNoAdjoint)       \
   X(DENSITY, 0)                                                              \
   X(CALL, 0)                                                                 \
+  X(TRANSFORM, kProgramNoInputs | kProgramNoAdjoint | kProgramNoOutput)      \
+  X(PRINT, kProgramNoInputs | kProgramNoAdjoint | kProgramNoOutput)          \
   X(REJECT, kProgramNoInputs | kProgramNoAdjoint | kProgramNoOutput)         \
   X(DENSITY_VEC, kProgramNoAdjoint)
 
@@ -154,9 +169,9 @@ struct Program {
     // union point with the graph executor -- one instruction gives the
     // register machine the graph's whole vocabulary, and its derivative
     // is the kernel's own backward rather than a transcribed rule. The
-    // kernels compute on doubles, so only run_program<double> can execute
-    // one; the carver keeps a CALL-bearing island only when the generated
-    // adjoint exists, so the var replay never meets it.
+    // kernels compute their values and partials on doubles. A generated
+    // adjoint invokes the backward directly; var replay uses a small adapter
+    // that exposes its output adjoints to the same backward implementation.
   };
   struct Instr {
     Code code = CONST;
@@ -173,6 +188,9 @@ struct Program {
   struct Call {
     uint16_t opcode = 0;
     uint8_t variant = 0;
+    // Inputs that receive derivatives when CALL is replayed over var. Integer
+    // lanes are values in the register file but are never autodiff operands.
+    uint8_t input_adjoint_mask = 0x3f;
     int8_t n_in = 0;
     // Resolved once when the call site is built. A registered kernel's
     // function identity is stable, so repeated table lookup during program
@@ -187,6 +205,9 @@ struct Program {
     int32_t scratch = 0;
     int32_t scratch_len = 0;
     std::vector<int> idata;
+    // Optional graph-kernel metadata. The shared owner lets a CALL retain the
+    // same solver/callback specification an ordinary graph Op points at.
+    std::shared_ptr<void> udata_owner;
     // Generated reverse binding. gen_adjoint normalizes CALL instructions to
     // one payload each, then caches their checkpointed value ranges and
     // compact adjoint ranges here. Forward-only Programs leave these zero.
@@ -194,6 +215,34 @@ struct Program {
     int32_t bwd_adj_in[6] = {0, 0, 0, 0, 0, 0};
     int32_t bwd_value_out = 0;
     int32_t bwd_adj_out = 0;
+  };
+
+  // A PRINT or REJECT payload: the shared literal template plus the Program-
+  // specific register ranges supplying its runtime values. A var replay skips
+  // PRINT because it must not repeat an observable effect; REJECT never gets
+  // a replay because its double forward already threw.
+  struct Message {
+    MessageSpec spec;
+    std::vector<int32_t> value_reg;
+    std::vector<int32_t> value_len;
+  };
+
+  // A callable constraint transform. Unlike CALL this is scalar-templated:
+  // runtime-control programs execute it for both double and var, while its
+  // kind comes from the same descriptor graph lowering uses.
+  struct Transform {
+    CallableTransformKind kind = CallableTransformKind::Ordered;
+    TransformDirection direction = TransformDirection::Constrain;
+    int8_t n_in = 0;
+    int32_t in[3] = {0, 0, 0};
+    int32_t in_len[3] = {0, 0, 0};
+    int32_t out = 0;
+    int32_t out_len = 0;
+    int32_t jac = 0;
+    int32_t batch = 1;
+    int32_t inner_raw = 0;
+    int32_t out_rows = 0;
+    int32_t out_cols = 0;
   };
 
   // A DENSITY_VEC's payload: same density id DENSITY uses, but one or more
@@ -215,17 +264,26 @@ struct Program {
   };
 
   std::vector<Instr> code;
-  std::vector<Call> calls;   // CALL payloads, indexed by Instr::a
-  std::vector<double> pool;  // CONSTR data
-  // REJECT's literal message text, indexed by Instr::a. Never touched as a
-  // register (REJECT is kProgramNoInputs), so it rides beside the register
-  // file rather than in it.
-  std::vector<std::string> messages;
+  std::vector<Call> calls;            // CALL payloads, indexed by Instr::a
+  std::vector<Transform> transforms;  // TRANSFORM payloads, indexed by Instr::a
+  std::vector<Message> messages;      // PRINT/REJECT payloads, by Instr::a
+  std::vector<double> pool;           // CONSTR data
   // DENSITY_VEC payloads, indexed by Instr::a.
   std::vector<VecDensity> vec_densities;
   int n_regs = 0;
   std::vector<int> out_regs;  // the values the caller reads back
 };
+
+template <typename T>
+std::string render_program_message(const Program::Message& message,
+                                   const T* reg) {
+  return render_message(
+      message.spec, message.value_reg.size(),
+      [&](std::size_t k) { return static_cast<int64_t>(message.value_len[k]); },
+      [&](std::size_t k, int64_t i) {
+        return stan::math::value_of(reg[message.value_reg[k] + i]);
+      });
+}
 
 struct ProgramOpSpec {
   const char* name;
@@ -255,10 +313,6 @@ inline constexpr int program_output_len(const Program::Instr& instr) {
   if (instr.code == Program::DIAG_PRE_MULTIPLY ||
       instr.code == Program::DIAG_POST_MULTIPLY)
     return static_cast<int>(static_cast<int64_t>(instr.c) * instr.len);
-  // Squares a rows x cols argument into a rows x rows result, so `len`
-  // measures the input run (kProgramRangeA) and the output is its own size.
-  if (instr.code == Program::MULT_LOWER_TRI_SELF_TRANSPOSE)
-    return static_cast<int>(static_cast<int64_t>(instr.b) * instr.b);
   const ProgramOpSpec& spec = program_code_spec(instr.code);
   return spec.has(kProgramNoOutput)      ? 0
          : spec.has(kProgramRangeOutput) ? instr.len
@@ -292,6 +346,20 @@ KernelCtx call_fwd_ctx(const Program::Call& call, double* reg);
 // call unbound, so malformed or unavailable opcodes fail closed.
 bool bind_call(Program::Call& call);
 
+// A kernel's scratch_size takes an Op/Slot pair, not a call site, so a
+// caller assembling a Program::Call by hand has to reconstruct that shape
+// first. Null `scratch_size` means zero.
+int64_t kernel_call_scratch(int64_t (*scratch_size)(const Op&, const Slot*),
+                            uint16_t opcode, uint8_t variant, int8_t n_in,
+                            const int32_t* in_len, int32_t out_len,
+                            const int* idata, int64_t n_idata,
+                            const void* udata);
+
+// Replay a graph-kernel call on a var register file. The kernel still owns its
+// value and pullback; this adapter only gathers/scatters the non-contiguous
+// vari pointers used by a runtime-control program.
+void run_call_var(const Program::Call& call, stan::math::var* reg);
+
 // Run one CALL forward through its pre-resolved function. `state` is the
 // caller's evaluation state, which is how a generated-quantities region
 // reaches the draw stream OP_RNG needs; null for every other caller, and
@@ -314,6 +382,31 @@ template <>
 struct ProgramCallCtx<true> {
   KernelCtx ctx;
 };
+
+void run_program_transform(const Program::Transform& tr, double* reg);
+void run_program_transform(const Program::Transform& tr, stan::math::var* reg);
+
+// pow through the overload the exponent's static type selects, keeping the
+// value std::pow gives so the double forward and the replay stay bitwise.
+template <typename T>
+inline T program_pow(uint8_t law, const T& a, const T& b) {
+  if constexpr (std::is_same_v<T, double>) {
+    return stan::math::pow(a, b);
+  } else {
+    if (law == kPowZeroBaseGuarded) return stan::math::pow(a, b);
+    T base = a;
+    const double av = stan::math::value_of(a);
+    const double exponent = stan::math::value_of(b);
+    return stan::math::make_callback_var(
+        std::pow(av, exponent), [base, av, exponent, law](auto&& vi) mutable {
+          if (av == 0.0) {
+            base.adj() += pow_zero_base_partial(law, vi.adj(), av, exponent);
+            return;
+          }
+          base.adj() += vi.adj() * vi.val() * exponent / av;
+        });
+  }
+}
 
 template <bool ReuseCallCtx, typename T>
 void run_program_impl(const Program& p, T* reg, EvalState* state = nullptr) {
@@ -364,7 +457,7 @@ void run_program_impl(const Program& p, T* reg, EvalState* state = nullptr) {
                                  static_cast<int>(stan::math::value_of(rb()))));
         break;
       case Program::POW:
-        d() = stan::math::pow(ra(), rb());
+        d() = program_pow(static_cast<uint8_t>(I.len), ra(), rb());
         break;
       case Program::FMAX:
         d() = stan::math::fmax(ra(), rb());
@@ -431,11 +524,71 @@ void run_program_impl(const Program& p, T* reg, EvalState* state = nullptr) {
         d() = reg[(size_t)(I.a + I.c + static_cast<int32_t>(raw) - 1)];
         break;
       }
-      case Program::MAX_RANGE: {
-        std::vector<T> owning;
-        if (I.len > 0)
-          owning.assign(&reg[(size_t)I.a], &reg[(size_t)(I.a + I.len)]);
-        d() = stan::math::max(owning);
+      case Program::EXTREMA_RANGE: {
+        const bool maximum = I.b != 0;
+        const bool integer = (I.c & kProgramExtremaInteger) != 0;
+        const bool scalar = (I.c & kProgramExtremaScalar) != 0;
+        const bool phased = (I.c & kProgramExtremaPhased) != 0;
+        if (integer && I.len == 0) {
+          // The register file stores integers as doubles, so call the actual
+          // integer overload solely to preserve Stan Math's empty-container
+          // exception instead of returning a floating-point infinity.
+          const std::vector<int> empty;
+          if (maximum)
+            (void)stan::math::max(empty);
+          else
+            (void)stan::math::min(empty);
+        }
+        if (I.len == 0) {
+          d() = T(maximum ? -std::numeric_limits<double>::infinity()
+                          : std::numeric_limits<double>::infinity());
+          break;
+        }
+        if (scalar) {
+          T selected = reg[(size_t)I.a];
+          for (int32_t i = 1; i < I.len; ++i) {
+            const T& candidate = reg[(size_t)(I.a + i)];
+            if (maximum ? stan::math::value_of(selected) <
+                              stan::math::value_of(candidate)
+                        : stan::math::value_of(candidate) <
+                              stan::math::value_of(selected))
+              selected = candidate;
+          }
+          d() = selected;
+          break;
+        }
+        const int64_t phase =
+            static_cast<int64_t>(I.c) >> kProgramExtremaPhaseShift;
+        if constexpr (std::is_same_v<T, double>) {
+          if (phased) {
+            d() = extrema_phased(&reg[(size_t)I.a], I.len, phase, maximum);
+          } else {
+            const Eigen::Map<const Eigen::VectorXd> input(&reg[(size_t)I.a],
+                                                          I.len);
+            const auto owning_grouping = input.unaryExpr(
+                Eigen::internal::core_cast_op<double, double>());
+            d() = maximum ? stan::math::max(owning_grouping)
+                          : stan::math::min(owning_grouping);
+          }
+        } else {
+          // Packet/phased instructions are parameter-free: an active source
+          // is classified scalar by ProgramCompiler. Recreate the double
+          // value grouping during replay and keep the result constant, just
+          // as generated Stan computes the extrema before promoting it into
+          // any downstream var expression.
+          std::vector<double> values((size_t)I.len);
+          for (int32_t i = 0; i < I.len; ++i)
+            values[(size_t)i] = stan::math::value_of(reg[(size_t)(I.a + i)]);
+          if (phased) {
+            d() = T(extrema_phased(values.data(), I.len, phase, maximum));
+          } else {
+            const Eigen::Map<const Eigen::VectorXd> input(values.data(), I.len);
+            const auto owning_grouping = input.unaryExpr(
+                Eigen::internal::core_cast_op<double, double>());
+            d() = T(maximum ? stan::math::max(owning_grouping)
+                            : stan::math::min(owning_grouping));
+          }
+        }
         break;
       }
       case Program::JZ:
@@ -503,34 +656,6 @@ void run_program_impl(const Program& p, T* reg, EvalState* state = nullptr) {
           out = stan::math::diag_post_multiply(m, v);
         break;
       }
-      case Program::MULT_LOWER_TRI_SELF_TRANSPOSE: {
-        using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-        const int32_t rows = I.b, cols = I.c;
-        if (rows == 0) break;
-        // A rows x 0 argument has no lower triangle to multiply, and
-        // stan-math answers with the zero matrix rather than reading it.
-        if (cols == 0) {
-          for (int32_t k = 0; k < rows * rows; ++k) reg[I.dst + k] = T(0.0);
-          break;
-        }
-        // Materialise rather than hand stan-math a Map: the reverse-mode
-        // overload copies its argument into arena storage, which wants a
-        // plain matrix type. One call keeps the upper-triangle mask and the
-        // triangular pullback exactly as CmdStan would have them.
-        const MatT input = Eigen::Map<const MatT>(reg + I.a, rows, cols);
-        Eigen::Map<MatT> output(reg + I.dst, rows, rows);
-        output = stan::math::multiply_lower_tri_self_transpose(input);
-        break;
-      }
-      case Program::MATRIX_EXP: {
-        using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-        const int32_t rows = I.b, cols = I.c;
-        if (rows == 0 || cols == 0) break;
-        Eigen::Map<const MatT> input(reg + I.a, rows, cols);
-        Eigen::Map<MatT> output(reg + I.dst, rows, cols);
-        output = stan::math::matrix_exp(input);
-        break;
-      }
       case Program::MDIVIDE_LEFT: {
         using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
         using VecT2 = Eigen::Matrix<T, Eigen::Dynamic, 1>;
@@ -567,26 +692,6 @@ void run_program_impl(const Program& p, T* reg, EvalState* state = nullptr) {
         }
         break;
       }
-      case Program::QUAD_FORM_SYM: {
-        using MatT = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-        using VecT2 = Eigen::Matrix<T, Eigen::Dynamic, 1>;
-        const int32_t nrow = std::abs(I.c);
-        if (nrow == 0) {
-          for (int32_t k = 0; k < I.len; ++k) reg[I.dst + k] = T(0.0);
-          break;
-        }
-        Eigen::Map<const MatT> a(reg + I.a, nrow, nrow);
-        if (I.c < 0) {
-          Eigen::Map<const VecT2> b(reg + I.b, nrow);
-          reg[(size_t)I.dst] = stan::math::quad_form_sym(a, b);
-        } else {
-          const int32_t ncol = static_cast<int32_t>(std::sqrt(I.len));
-          Eigen::Map<const MatT> b(reg + I.b, nrow, ncol);
-          Eigen::Map<MatT> output(reg + I.dst, ncol, ncol);
-          output = stan::math::quad_form_sym(a, b);
-        }
-        break;
-      }
       // One call for every scalar continuous probability function the runtime
       // has; program_density.cpp holds the switch, so the instantiations are
       // paid in one translation unit instead of in every one that runs a
@@ -598,18 +703,25 @@ void run_program_impl(const Program& p, T* reg, EvalState* state = nullptr) {
           else
             run_call(p.calls[(size_t)I.a], reg, state);
         } else {
-          // Kernels are double machinery; a program that reaches here
-          // under var was carved wrong, and saying so beats corrupting
-          // a gradient.
-          throw std::logic_error("CALL instruction in a var replay");
+          run_call_var(p.calls[(size_t)I.a], reg);
         }
+        break;
+      case Program::TRANSFORM:
+        run_program_transform(p.transforms[(size_t)I.a], reg);
+        break;
+      case Program::PRINT:
+        if constexpr (std::is_same_v<T, double>)
+          execute_message(MessageAction::Print,
+                          render_program_message(p.messages[(size_t)I.a], reg));
         break;
       // reject(): the same exception CmdStan's generated code throws from
       // the same place, so the sampler counts it as a rejected proposal
       // rather than a failure. No adjoint reaches this -- the forward
       // already threw -- so there is nothing to do under var either.
       case Program::REJECT:
-        throw std::domain_error(p.messages[(size_t)I.a]);
+        execute_message(MessageAction::Reject,
+                        render_program_message(p.messages[(size_t)I.a], reg));
+        break;
       case Program::DENSITY: {
         const int ar = program_density_arity(I.len);
         if (ar > 3) {

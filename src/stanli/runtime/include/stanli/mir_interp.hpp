@@ -23,10 +23,13 @@
 #include <stanli/compile.hpp>
 #include <stanli/container_shape.hpp>
 #include <stanli/data.hpp>
+#include <stanli/density_registry.hpp>
+#include <stanli/builtin_registry.hpp>
+#include <stanli/function_registry.hpp>
 #include <stanli/extrema_grouping.hpp>
-#include <stanli/message_sink.hpp>
+#include <stanli/mir_message.hpp>
 #include <stanli/mir.hpp>
-#include <stanli/optable.hpp>  // STANLI_SCALAR_UNARY_LIST
+#include <stanli/optable.hpp>
 #include <stanli/program.hpp>
 #include <stanli/structured_check.hpp>
 
@@ -38,7 +41,6 @@
 #include <functional>
 #include <limits>
 #include <map>
-#include <sstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -323,18 +325,19 @@ class MirInterp {
         }
         if (st.lhs_idx.empty()) {
           Value v = eval(st.rhs);
-          // A plain `int` name stays int for its whole lifetime; the RHS's
-          // own arithmetic (e.g. `sumnt2 += nts[i] * nts[i]`) does not, since
-          // MirInterp's binary ops answer in real registers. Re-declaring an
-          // int with an int-valued init already coerces (above); a later
-          // whole-variable reassignment needs the same coercion, or the next
-          // eval_int on this name (a parameter or array size, say) sees a
-          // real entry and fails as unknown.
+          // A declared numeric type stays fixed for its whole lifetime. The
+          // RHS's own representation can differ: MirInterp's binary ops use
+          // real registers, while an all-integer array literal is tagged int.
+          // Preserve int destinations as before, and apply Stan's implicit
+          // int-to-real promotion when assigning into a real destination.
           const Value* existing = find(st.lhs);
           if (existing && existing->is_int && !v.is_int) {
             v.is_int = true;
             v.i.clear();
             for (const T& x : v.r) v.i.push_back((int)val(x));
+          } else if (existing && !existing->is_int && v.is_int) {
+            v.is_int = false;
+            v.i.clear();
           }
           env_[st.lhs] = std::move(v);
           return;
@@ -433,61 +436,40 @@ class MirInterp {
           }
           return;
         }
-        // Contiguous subrange write into a 1-D value: x[a:b] = rhs.
-        if (st.lhs_idx.size() == 1 && st.lhs_idx[0].name == "IndexBetween" &&
-            en->dims.size() == 1) {
-          const long a = as_int(st.lhs_idx[0].args[0]);
-          const long b = as_int(st.lhs_idx[0].args[1]);
-          const int64_t n = b >= a ? b - a + 1 : 0;
-          if (n > 0 && (a < 1 || b > en->dims[0] || b > (long)en->r.size()))
-            fail("range assignment index out of bounds", st.raw);
-          if ((int64_t)v.r.size() != n)
-            fail("range assignment size mismatch", st.raw);
-          for (int64_t k = 0; k < n; ++k) {
-            const size_t dst = static_cast<size_t>(a - 1 + k);
-            en->r.at(dst) = v.r.at(static_cast<size_t>(k));
-            if (en->is_int)
-              en->i.at(dst) =
-                  v.is_int && static_cast<size_t>(k) < v.i.size()
-                      ? v.i[static_cast<size_t>(k)]
-                      : static_cast<int>(val(v.r.at(static_cast<size_t>(k))));
-          }
-          return;
-        }
-        // General scatter write with at least one integer-array selector.
-        // MirInterp storage is first-index-fast, so enumerate the last axis
-        // outside and the first axis inside, matching eval_indexed and the
-        // RHS's logical order. Repeated indices deliberately retain Stan's
-        // last-write-wins behavior. Validate the complete selection before
-        // mutating the destination so a malformed index remains atomic.
-        bool has_multi = false;
-        for (const auto& index : st.lhs_idx)
-          has_multi = has_multi || index.name == "IndexMulti";
-        if (has_multi && st.lhs_idx.size() <= en->dims.size()) {
-          std::vector<std::vector<int64_t>> selected(en->dims.size());
-          std::vector<int64_t> out_dims;
-          for (size_t d = 0; d < en->dims.size(); ++d) {
+        // General mixed-selection write through the shared index geometry:
+        // any static combination of Single, All, Between, Upfrom, and Multi
+        // selectors. The map enumerates destination cells in the
+        // interpreter's first-index-fast storage, matching eval_indexed and
+        // the RHS's logical order, so repeated indices deliberately retain
+        // Stan's last-write-wins behavior. Validate the complete selection
+        // before mutating the destination so a malformed index remains
+        // atomic.
+        if (!en->dims.empty() && st.lhs_idx.size() <= en->dims.size()) {
+          std::vector<std::vector<int64_t>> selected(st.lhs_idx.size());
+          std::vector<bool> drops(st.lhs_idx.size(), false);
+          bool supported = true;
+          for (size_t d = 0; supported && d < st.lhs_idx.size(); ++d) {
             const int64_t extent = en->dims[d];
-            const mir::Expr* index =
-                d < st.lhs_idx.size() ? &st.lhs_idx[d] : nullptr;
-            if (!index || index->name == "IndexAll") {
+            const mir::Expr& index = st.lhs_idx[d];
+            if (index.name == "IndexAll") {
               selected[d].reserve((size_t)extent);
               for (int64_t k = 0; k < extent; ++k) selected[d].push_back(k);
-              out_dims.push_back(extent);
-            } else if (index->name == "IndexSingle") {
-              const long one = as_int(index->args[0]);
+            } else if (index.name == "IndexSingle") {
+              const long one = as_int(index.args[0]);
               if (one < 1 || one > extent)
                 fail("multi-index assignment index out of bounds", st.raw);
               selected[d].push_back(one - 1);
-            } else if (index->name == "IndexBetween") {
-              const long lo = as_int(index->args[0]);
-              const long hi = as_int(index->args[1]);
+              drops[d] = true;
+            } else if (index.name == "IndexBetween" ||
+                       index.name == "IndexUpfrom") {
+              const long lo = as_int(index.args[0]);
+              const long hi =
+                  index.name == "IndexBetween" ? as_int(index.args[1]) : extent;
               if (hi >= lo && (lo < 1 || hi > extent))
                 fail("multi-index assignment range out of bounds", st.raw);
               for (long k = lo; k <= hi; ++k) selected[d].push_back(k - 1);
-              out_dims.push_back(hi >= lo ? hi - lo + 1 : 0);
-            } else if (index->name == "IndexMulti") {
-              const Value positions = eval(index->args[0]);
+            } else if (index.name == "IndexMulti") {
+              const Value positions = eval(index.args[0]);
               if (!positions.is_int)
                 fail("multi-index assignment needs an int index array", st.raw);
               selected[d].reserve(positions.i.size());
@@ -496,128 +478,36 @@ class MirInterp {
                   fail("multi-index assignment index out of bounds", st.raw);
                 selected[d].push_back(one - 1);
               }
-              out_dims.push_back((int64_t)positions.i.size());
             } else {
-              fail("unsupported multi-index assignment selector", st.raw);
+              supported = false;
             }
           }
-          std::vector<int64_t> stride(en->dims.size(), 1);
-          for (size_t d = 1; d < en->dims.size(); ++d)
-            stride[d] = stride[d - 1] * en->dims[d - 1];
-          std::vector<size_t> destinations;
-          std::function<void(int64_t, int64_t)> gather = [&](int64_t d,
-                                                             int64_t offset) {
-            if (d < 0) {
-              destinations.push_back((size_t)offset);
-              return;
+          if (supported) {
+            BuiltinIndexMap map;
+            try {
+              map = builtin_index_map(en->dims, 0, selected, drops,
+                                      SliceStorageOrder::FirstIndexFast);
+            } catch (const std::invalid_argument& error) {
+              fail(std::string("multi-index assignment: ") + error.what(),
+                   st.raw);
             }
-            for (int64_t position : selected[(size_t)d])
-              gather(d - 1, offset + position * stride[(size_t)d]);
-          };
-          gather((int64_t)en->dims.size() - 1, 0);
-          if (v.r.size() != destinations.size() ||
-              (!out_dims.empty() && v.dims != out_dims))
-            fail("multi-index assignment size mismatch", st.raw);
-          for (size_t k = 0; k < destinations.size(); ++k) {
-            const size_t dst = destinations[k];
-            en->r.at(dst) = v.r[k];
-            if (en->is_int)
-              en->i.at(dst) =
-                  v.is_int && k < v.i.size() ? v.i[k] : (int)val(v.r[k]);
-          }
-          return;
-        }
-        // General all-Single N-D element write.
-        if (st.lhs_idx.size() == en->dims.size()) {
-          bool all_single = true;
-          for (const auto& ix : st.lhs_idx)
-            if (ix.name != "IndexSingle") all_single = false;
-          if (all_single) {
-            int64_t flatpos = 0, stride = 1;
-            for (size_t d = 0; d < en->dims.size(); ++d) {
-              flatpos += (as_int(st.lhs_idx[d].args[0]) - 1) * stride;
-              stride *= en->dims[d];
+            if ((int64_t)v.r.size() != map.count ||
+                (!map.dimensions.empty() && v.dims != map.dimensions))
+              fail("multi-index assignment size mismatch", st.raw);
+            for (int64_t k = 0; k < map.count; ++k) {
+              const size_t dst = static_cast<size_t>(
+                  map.kind == BuiltinSliceMap::Kind::Contiguous ? map.offset + k
+                  : map.kind == BuiltinSliceMap::Kind::Strided
+                      ? map.offset + k * map.stride
+                      : map.gather[(size_t)k]);
+              en->r.at(dst) = v.r[(size_t)k];
+              if (en->is_int)
+                en->i.at(dst) = v.is_int && (size_t)k < v.i.size()
+                                    ? v.i[(size_t)k]
+                                    : (int)val(v.r[(size_t)k]);
             }
-            en->r.at(flatpos) = v.r.at(0);
-            if (en->is_int)
-              en->i.at(flatpos) =
-                  v.is_int && !v.i.empty() ? v.i[0] : (int)val(v.r.at(0));
             return;
           }
-        }
-        // Explicit row write X[i, :] = row_vector / array.
-        if (st.lhs_idx.size() == 2 && st.lhs_idx[0].name == "IndexSingle" &&
-            st.lhs_idx[1].name == "IndexAll" && en->dims.size() == 2) {
-          const long i = as_int(st.lhs_idx[0].args[0]);
-          const int64_t R = en->dims[0], C = en->dims[1];
-          if (i < 1 || i > R)
-            fail("matrix row assignment index out of bounds", st.raw);
-          if ((int64_t)v.r.size() != C)
-            fail("matrix row assignment size mismatch", st.raw);
-          for (int64_t j = 0; j < C; ++j) {
-            const size_t dst = (size_t)(j * R + i - 1);
-            en->r.at(dst) = v.r.at((size_t)j);
-            if (en->is_int)
-              en->i.at(dst) = v.is_int && (size_t)j < v.i.size()
-                                  ? v.i[(size_t)j]
-                                  : (int)val(v.r.at((size_t)j));
-          }
-          return;
-        }
-        // Column write Xc[:, j] = vector.
-        if (st.lhs_idx.size() == 2 && st.lhs_idx[0].name == "IndexAll" &&
-            st.lhs_idx[1].name == "IndexSingle" && en->dims.size() == 2) {
-          const long j = as_int(st.lhs_idx[1].args[0]);
-          const int64_t R = en->dims[0];
-          for (int64_t i = 0; i < R; ++i) en->r.at((j - 1) * R + i) = v.r.at(i);
-          return;
-        }
-        // Column-segment write X[a:b, j] = vector.
-        if (st.lhs_idx.size() == 2 && st.lhs_idx[0].name == "IndexBetween" &&
-            st.lhs_idx[1].name == "IndexSingle" && en->dims.size() == 2) {
-          const long a = as_int(st.lhs_idx[0].args[0]);
-          const long b = as_int(st.lhs_idx[0].args[1]);
-          const long j = as_int(st.lhs_idx[1].args[0]);
-          const int64_t R = en->dims[0];
-          const int64_t n = b >= a ? b - a + 1 : 0;
-          if (j < 1 || j > en->dims[1] || (n > 0 && (a < 1 || b > R)))
-            fail("matrix range assignment index out of bounds", st.raw);
-          if ((int64_t)v.r.size() != n)
-            fail("matrix range assignment size mismatch", st.raw);
-          for (int64_t k = 0; k < n; ++k) {
-            const size_t dst = static_cast<size_t>((j - 1) * R + (a - 1) + k);
-            en->r.at(dst) = v.r.at(static_cast<size_t>(k));
-            if (en->is_int)
-              en->i.at(dst) =
-                  v.is_int && static_cast<size_t>(k) < v.i.size()
-                      ? v.i[static_cast<size_t>(k)]
-                      : static_cast<int>(val(v.r.at(static_cast<size_t>(k))));
-          }
-          return;
-        }
-        // Row-segment write X[i, a:b] = row_vector / array.  The selected
-        // elements are strided in first-index-fast storage.
-        if (st.lhs_idx.size() == 2 && st.lhs_idx[0].name == "IndexSingle" &&
-            st.lhs_idx[1].name == "IndexBetween" && en->dims.size() == 2) {
-          const long i = as_int(st.lhs_idx[0].args[0]);
-          const long a = as_int(st.lhs_idx[1].args[0]);
-          const long b = as_int(st.lhs_idx[1].args[1]);
-          const int64_t R = en->dims[0];
-          const int64_t n = b >= a ? b - a + 1 : 0;
-          if (i < 1 || i > R || (n > 0 && (a < 1 || b > en->dims[1])))
-            fail("matrix range assignment index out of bounds", st.raw);
-          if ((int64_t)v.r.size() != n)
-            fail("matrix range assignment size mismatch", st.raw);
-          for (int64_t k = 0; k < n; ++k) {
-            const size_t dst = static_cast<size_t>((a - 1 + k) * R + (i - 1));
-            en->r.at(dst) = v.r.at(static_cast<size_t>(k));
-            if (en->is_int)
-              en->i.at(dst) =
-                  v.is_int && static_cast<size_t>(k) < v.i.size()
-                      ? v.i[static_cast<size_t>(k)]
-                      : static_cast<int>(val(v.r.at(static_cast<size_t>(k))));
-          }
-          return;
         }
         {
           std::string what = "unsupported indexed assignment: dims=" +
@@ -682,27 +572,21 @@ class MirInterp {
         // there rather than sampling from a model whose data is wrong.
         // Skipping it would mean stanli happily sampled a model CmdStan
         // refuses to build.
-        if (st.fn_name == "FnReject" || st.fn_name == "FnPrint") {
-          std::string msg;
-          for (const auto& a : st.fn_args) {
-            if (a.kind == mir::Expr::LitStr) {
-              msg += a.lit_s;
-              continue;
-            }
-            const Value v = eval(a);
-            if (v.r.size() == 1) {
-              msg += fmt_num(val(v.r[0]));
-            } else {
-              msg += '[';
-              for (size_t i = 0; i < v.r.size(); ++i) {
-                if (i) msg += ',';
-                msg += fmt_num(val(v.r[i]));
-              }
-              msg += ']';
-            }
-          }
-          if (st.fn_name == "FnReject") throw std::domain_error(msg);
-          emit_message(msg);
+        if (const auto action = message_action(st.fn_name)) {
+          std::vector<Value> values;
+          const MessageSpec spec = lower_message_arguments(
+              st.fn_args, [&](const mir::Expr& argument) {
+                values.push_back(eval(argument));
+              });
+          execute_message(*action,
+                          render_message(
+                              spec, values.size(),
+                              [&](size_t k) {
+                                return static_cast<int64_t>(values[k].r.size());
+                              },
+                              [&](size_t k, int64_t i) {
+                                return val(values[k].r[static_cast<size_t>(i)]);
+                              }));
           return;
         }
         if (st.fn_name == "FnCheck") {
@@ -740,14 +624,399 @@ class MirInterp {
   }
 
  private:
-  // How reject()/print() render a number. ostream's default formatting is
-  // what the OP_REJECT kernel uses on the graph side, so the two paths
-  // spell the same value the same way -- and it is also what stan-math's
-  // own reject produces.
-  static std::string fmt_num(double v) {
-    std::ostringstream os;
-    os << v;
-    return os.str();
+  FunctionArgumentShape function_argument_shape(const mir::Expr& source,
+                                                const Value& value) const {
+    const FunctionArgumentKind kind =
+        source.unsized.leaf == mir::UnsizedLeaf::Int || value.is_int
+            ? FunctionArgumentKind::Integer
+            : FunctionArgumentKind::Real;
+    FunctionContainerKind container = FunctionContainerKind::Scalar;
+    FunctionContainerKind leaf = FunctionContainerKind::Scalar;
+    std::vector<int64_t> dimensions = value.dims;
+    if (source.unsized.depth != 0) {
+      container = FunctionContainerKind::Array;
+      if (source.unsized.leaf == mir::UnsizedLeaf::Vector)
+        leaf = FunctionContainerKind::Vector;
+      else if (source.unsized.leaf == mir::UnsizedLeaf::RowVector)
+        leaf = FunctionContainerKind::RowVector;
+      else if (source.unsized.leaf == mir::UnsizedLeaf::Matrix)
+        leaf = FunctionContainerKind::Matrix;
+    } else if (source.unsized.leaf == mir::UnsizedLeaf::Vector) {
+      container = FunctionContainerKind::Vector;
+    } else if (source.unsized.leaf == mir::UnsizedLeaf::RowVector) {
+      container = FunctionContainerKind::RowVector;
+    } else if (source.unsized.leaf == mir::UnsizedLeaf::Matrix) {
+      container = FunctionContainerKind::Matrix;
+    } else {
+      // Legacy hand-built MIR may only carry the old string type; kind the
+      // container from the evaluated value where even that is missing, the
+      // way the metadata-free dispatch tail kinds integers.
+      if (source.type_ == "UVector")
+        container = FunctionContainerKind::Vector;
+      else if (source.type_ == "URowVector")
+        container = FunctionContainerKind::RowVector;
+      else if (source.type_ == "UMatrix" || value.dims.size() == 2)
+        container = FunctionContainerKind::Matrix;
+      else
+        container = value.dims.empty() && value.r.size() == 1
+                        ? FunctionContainerKind::Scalar
+                        : FunctionContainerKind::Vector;
+      if (container == FunctionContainerKind::Matrix && dimensions.size() != 2)
+        dimensions = value.dims;
+      if (container == FunctionContainerKind::Vector && dimensions.empty())
+        dimensions = {static_cast<int64_t>(value.r.size())};
+    }
+    return make_function_shape(kind, container, leaf, std::move(dimensions),
+                               static_cast<int64_t>(value.r.size()));
+  }
+
+  // Invoke a probability function through its registered policy. Most use
+  // the same graph-kernel CALL bridge as runtime-control programs; the
+  // all-integer policy instead calls the shared evaluator because there is no
+  // differentiable input on which to hang a graph operation.
+  Value density_eval(const mir::Expr& e, const DensitySpec& spec) {
+    if ((int)e.args.size() != spec.arity)
+      fail(e.name + ": wrong number of arguments", e.raw);
+    std::vector<Value> values;
+    values.reserve(e.args.size());
+    for (const mir::Expr& arg : e.args) values.push_back(eval(arg));
+    const auto ints = [&](size_t k) {
+      if (!values[k].is_int || values[k].i.empty())
+        fail(e.name + ": integer argument is not integer-valued", e.raw);
+      return values[k].i;
+    };
+    std::vector<DensityCallArgument> plan_arguments;
+    plan_arguments.reserve(values.size());
+    try {
+      for (size_t k = 0; k < values.size(); ++k) {
+        DensityCallArgument argument;
+        argument.shape = function_argument_shape(e.args[k], values[k]);
+        argument.scalar = e.args[k].unsized.depth == 0;
+        argument.data_only = e.args[k].data_only;
+        if constexpr (!std::is_same_v<T, double>)
+          argument.active = !e.args[k].data_only;
+        if (spec.evaluation == DensityEvaluationPolicy::AllInteger ||
+            k < static_cast<size_t>(spec.integer_args)) {
+          argument.integers = ints(k);
+          // Metadata-free MIR claims depth 0 everywhere; a multi-value
+          // integer group is a container whatever the source says.
+          if (argument.integers.size() > 1) argument.scalar = false;
+        }
+        plan_arguments.push_back(std::move(argument));
+      }
+    } catch (const std::exception& error) {
+      fail(e.name + ": " + error.what(), e.raw);
+    }
+    DensityCallPlan plan;
+    try {
+      plan =
+          density_call_plan(spec, plan_arguments, e.fn_propto && propto_ctx_);
+    } catch (const std::exception& error) {
+      fail(e.name + ": " + error.what(), e.raw);
+    }
+    if (spec.evaluation == DensityEvaluationPolicy::AllInteger) {
+      Value result;
+      result.r = {T(evaluate_packed_all_integer_density(
+          spec.all_integer, plan.idata.data(),
+          static_cast<int64_t>(plan.idata.size()),
+          (plan.variant & 0x80u) != 0))};
+      return result;
+    }
+    if (plan.empty_result) {
+      Value result;
+      result.r = {T(0.0)};
+      return result;
+    }
+
+    std::vector<std::vector<T>> inputs;
+    inputs.reserve(e.args.size() - (size_t)spec.integer_args);
+    for (size_t k = (size_t)spec.integer_args; k < e.args.size(); ++k) {
+      std::vector<T> input;
+      if (spec.shape == DensityShape::Categorical && k == 0) {
+        input.reserve(values[k].i.size());
+        for (int value : values[k].i) input.push_back(T((double)value));
+      } else {
+        input = values[k].r;
+      }
+      if (e.args[k].unsized.depth != 0 && values[k].dims.size() > 1)
+        input = graph_container_order(input, values[k].dims,
+                                      e.args[k].unsized.depth);
+      inputs.push_back(std::move(input));
+    }
+
+    Value result;
+    result.r = {run_kernel_call(e, spec.opcode, plan.variant,
+                                plan.activity_mask, std::move(plan.idata),
+                                std::move(inputs), 1)[0]};
+    return result;
+  }
+
+  // Bind and execute one graph-kernel CALL over materialized inputs. Shared
+  // by density_eval and builtin_kernel_eval: the double interpreter runs the
+  // kernel forward directly and the var interpreter replays it through the
+  // same nested-tape adapter the register machine uses.
+  std::vector<T> run_kernel_call(const mir::Expr& e, uint16_t opcode,
+                                 uint8_t variant, uint8_t adjoint_mask,
+                                 std::vector<int> idata,
+                                 std::vector<std::vector<T>> inputs,
+                                 int64_t out_len) {
+    Program::Call call;
+    call.opcode = opcode;
+    call.variant = variant;
+    call.input_adjoint_mask = adjoint_mask;
+    call.n_in = (int8_t)inputs.size();
+    int32_t next = 0;
+    for (size_t k = 0; k < inputs.size(); ++k) {
+      call.in[k] = next;
+      call.in_len[k] = (int32_t)inputs[k].size();
+      next += call.in_len[k];
+    }
+    call.out = next;
+    call.out_len = (int32_t)out_len;
+    next += (int32_t)out_len;
+    call.idata = std::move(idata);
+
+    const Kernel* kernel = find_kernel(opcode);
+    if (kernel == nullptr || !bind_call(call))
+      fail(e.name + ": graph kernel is unavailable", e.raw);
+    call.scratch_len = (int32_t)kernel_call_scratch(
+        kernel->scratch_size, opcode, call.variant, call.n_in, call.in_len,
+        call.out_len, call.idata.data(), (int64_t)call.idata.size(), nullptr);
+    call.scratch = next;
+    next += call.scratch_len;
+    std::vector<T> registers((size_t)next, T(0.0));
+    for (size_t k = 0; k < inputs.size(); ++k)
+      std::copy(inputs[k].begin(), inputs[k].end(),
+                registers.begin() + call.in[k]);
+    if constexpr (std::is_same_v<T, double>) {
+      run_call(call, registers.data());
+    } else {
+      run_call_var(call, registers.data());
+    }
+    return {registers.begin() + call.out,
+            registers.begin() + call.out + out_len};
+  }
+
+  // A registered real-result builtin executes through the same graph kernel
+  // every lowering backend dispatches to, so a registry entry plus a kernel
+  // is complete interpreter support; the named branches in eval_fun remain
+  // only as allocation-free fast paths. The interpreter stores every
+  // container column-major, arrays included, so unlike the graph layout
+  // there is no storage-order idata: an integer array and a real matrix
+  // already pair element for element.
+  Value builtin_kernel_eval(const mir::Expr& e, const BuiltinSpec& spec,
+                            std::vector<Value> values) {
+    BuiltinLayout layout;
+    try {
+      std::vector<BuiltinArgumentShape> shapes;
+      shapes.reserve(values.size());
+      for (size_t k = 0; k < values.size(); ++k)
+        shapes.push_back(function_argument_shape(e.args[k], values[k]));
+      layout = builtin_layout(spec, shapes);
+    } catch (const std::invalid_argument& error) {
+      fail(e.name + ": " + error.what(), e.raw);
+    }
+    std::vector<std::vector<T>> inputs;
+    inputs.reserve(values.size());
+    uint8_t activity = 0;
+    for (size_t k = 0; k < values.size(); ++k) {
+      Value& v = values[k];
+      if (v.is_int && v.r.size() != v.i.size()) {
+        v.r.clear();
+        v.r.reserve(v.i.size());
+        for (int value : v.i) v.r.push_back(T((double)value));
+      }
+      inputs.push_back(std::move(v.r));
+      if constexpr (!std::is_same_v<T, double>) {
+        if (!e.args[k].data_only) activity |= (uint8_t)(1u << k);
+      }
+    }
+    activity &= spec.activity_mask;
+    const uint8_t variant =
+        spec.opcode == OP_POW
+            ? mir::pow_zero_base_law(e.args[0], e.args[1], !e.args[1].data_only)
+            : 0;
+    Value o;
+    o.r = run_kernel_call(e, spec.opcode, variant, activity, {},
+                          std::move(inputs), layout.lanes);
+    if (spec.shape == BuiltinShapePolicy::Reduction) return o;
+    o.dims = values[layout.result_argument].dims;
+    if (spec.shape == BuiltinShapePolicy::WholeValue && o.dims.empty())
+      o.dims = {(int64_t)o.r.size()};
+    if (spec.arity == 2) {
+      if (builtin_argument_is_integer(spec, 0) !=
+          builtin_argument_is_integer(spec, 1)) {
+        // Only falling_factorial and rising_factorial have an int,int
+        // overload that answers int; everywhere else two int arguments
+        // still make a real, so stanc's own result type decides.
+        if (e.type_ == "UInt" && o.r.size() == 1) {
+          o.is_int = true;
+          o.i = {(int)val(o.r[0])};
+        }
+      } else if (values[0].is_int && values[1].is_int &&
+                 values[0].i.size() == 1 && values[1].i.size() == 1) {
+        // Two int scalars keep an int mirror, the rule the operator
+        // branches apply.
+        o.is_int = true;
+        o.i = {(int)val(o.r[0])};
+      }
+    }
+    return o;
+  }
+
+  // A registered constructor folds its data scalar arguments through the
+  // shared Stan Math evaluator, so extents, spacing rules, and domain errors
+  // are CmdStan's own. Arguments read as values: the underlying Stan Math
+  // builders take doubles, so there is no gradient to carry.
+  Value constructor_eval(const mir::Expr& e, const BuiltinSpec& spec) {
+    std::vector<double> arguments;
+    arguments.reserve(e.args.size());
+    for (const mir::Expr& argument : e.args) {
+      const Value v = eval(argument);
+      if (v.r.size() != 1) fail(e.name + ": argument must be a scalar", e.raw);
+      arguments.push_back(val(v.r[0]));
+    }
+    ConstructorValue built;
+    try {
+      built = evaluate_constructor_builtin(spec, arguments);
+    } catch (const std::domain_error&) {
+      // Stan Math's own validation (a negative extent, an out-of-range
+      // index): exactly the rejection CmdStan throws, so pass it through.
+      throw;
+    } catch (const std::invalid_argument& error) {
+      fail(e.name + ": " + error.what(), e.raw);
+    }
+    Value o;
+    o.dims = built.dimensions;
+    o.r.reserve(built.values.size());
+    for (const double value : built.values) o.r.push_back(T(value));
+    if (spec.result == FunctionArgumentKind::Integer) {
+      o.is_int = true;
+      o.i = std::move(built.integers);
+    }
+    return o;
+  }
+
+  // A registered paired reduction folds two equal-length containers (or one,
+  // paired with itself) to a scalar through the dot kernel; squared_distance
+  // subtracts first, the same two kernels the graph emits.
+  Value paired_reduction_eval(const mir::Expr& e, const BuiltinSpec& spec) {
+    Value a = eval(e.args[0]);
+    Value b = spec.arity == 2 ? eval(e.args[1]) : a;
+    {
+      std::vector<BuiltinArgumentShape> shapes;
+      try {
+        shapes.push_back(function_argument_shape(e.args[0], a));
+        if (spec.arity == 2)
+          shapes.push_back(function_argument_shape(e.args[1], b));
+        (void)builtin_layout(spec, shapes);
+      } catch (const std::invalid_argument& error) {
+        fail(e.name + ": " + error.what(), e.raw);
+      }
+    }
+    uint8_t activity = 0;
+    if constexpr (!std::is_same_v<T, double>) {
+      if (spec.arity == 2 && !spec.difference) {
+        if (!e.args[0].data_only) activity |= 0x1;
+        if (!e.args[1].data_only) activity |= 0x2;
+      } else {
+        for (const mir::Expr& argument : e.args)
+          if (!argument.data_only) activity = 0x3;
+      }
+    }
+    std::vector<T> lhs = a.r;
+    std::vector<T> rhs = spec.arity == 2 ? b.r : a.r;
+    if (spec.difference) {
+      for (size_t i = 0; i < lhs.size(); ++i) lhs[i] = lhs[i] - rhs[i];
+      rhs = lhs;
+    }
+    std::vector<std::vector<T>> inputs;
+    inputs.push_back(std::move(lhs));
+    inputs.push_back(std::move(rhs));
+    Value o;
+    o.r = run_kernel_call(e, OP_DOT, 0, activity, {}, std::move(inputs), 1);
+    return o;
+  }
+
+  // A registered grouped reduction folds each column or row through the
+  // shared grouped dot kernel: the same in-order accumulation the AoS
+  // reverse-mode overloads perform, and the same kernel every other backend
+  // dispatches to, so all three agree bitwise by construction.
+  Value grouped_dot_eval(const mir::Expr& e, const BuiltinSpec& spec) {
+    Value a = eval(e.args[0]);
+    Value b = spec.arity == 2 ? eval(e.args[1]) : a;
+    BuiltinGroupedDotMap map;
+    try {
+      map = builtin_grouped_dot_map(
+          spec, function_argument_shape(e.args[0], a),
+          function_argument_shape(e.args[spec.arity == 2 ? 1 : 0], b));
+    } catch (const std::invalid_argument& error) {
+      fail(e.name + ": " + error.what(), e.raw);
+    }
+    uint8_t activity = 0;
+    if constexpr (!std::is_same_v<T, double>) {
+      if (spec.arity == 2) {
+        if (!e.args[0].data_only) activity |= 0x1;
+        if (!e.args[1].data_only) activity |= 0x2;
+      } else if (!e.args[0].data_only) {
+        activity = 0x3;
+      }
+    }
+    std::vector<std::vector<T>> inputs;
+    inputs.push_back(a.r);
+    inputs.push_back(spec.arity == 2 ? std::move(b.r) : std::move(a.r));
+    Value o;
+    o.r = run_kernel_call(e, spec.opcode, 0, activity,
+                          {(int)map.groups, (int)map.width,
+                           (int)map.group_stride, (int)map.cell_stride},
+                          std::move(inputs), map.groups);
+    o.dims = {map.groups};
+    return o;
+  }
+
+  // A registered matrix operation executes the same dedicated kernel every
+  // other backend dispatches to. The active variant bit is per context: the
+  // double interpreter serves the prim instantiations (write_array,
+  // prepare_data) and the var interpreter the reverse-mode ones, which is
+  // the distinction the kernels' variant conventions encode.
+  Value matrix_op_eval(const mir::Expr& e, const BuiltinSpec& spec) {
+    std::vector<Value> values;
+    values.reserve(e.args.size());
+    for (const mir::Expr& argument : e.args) values.push_back(eval(argument));
+    BuiltinMatrixMap map;
+    try {
+      std::vector<BuiltinArgumentShape> shapes;
+      shapes.reserve(values.size());
+      for (size_t k = 0; k < values.size(); ++k)
+        shapes.push_back(function_argument_shape(e.args[k], values[k]));
+      map = builtin_matrix_map(spec, shapes);
+    } catch (const std::invalid_argument& error) {
+      fail(e.name + ": " + error.what(), e.raw);
+    }
+    uint8_t activity = 0;
+    bool active = false;
+    if constexpr (!std::is_same_v<T, double>) {
+      for (size_t k = 0; k < e.args.size(); ++k)
+        if (!e.args[k].data_only) {
+          activity |= (uint8_t)(1u << k);
+          active = true;
+        }
+    }
+    activity &= spec.activity_mask;
+    std::vector<std::vector<T>> inputs;
+    inputs.reserve(values.size());
+    for (Value& value : values) inputs.push_back(std::move(value.r));
+    std::vector<int> idata;
+    idata.reserve(map.idata.size());
+    for (const int64_t value : map.idata) idata.push_back((int)value);
+    Value o;
+    o.r = run_kernel_call(
+        e, spec.opcode,
+        (uint8_t)(map.variant | (active ? map.active_variant : 0u)), activity,
+        std::move(idata), std::move(inputs), map.result.storage_size);
+    if (map.result.container != FunctionContainerKind::Scalar)
+      o.dims = map.result.dimensions;
+    return o;
   }
 
   // Thrown by a Return statement inside an interpreted function body.
@@ -782,49 +1051,6 @@ class MirInterp {
   }
 
   static double val(const T& x) { return stan::math::value_of(x); }
-
-  // Arity of a bound transform called as a function, or 0 for any other
-  // name. The three directions of one transform share an arity, so the name
-  // alone decides how many arguments to expect.
-  static size_t bound_transform_arity(const std::string& name) {
-    static const std::pair<const char*, size_t> kStems[] = {
-        {"lower_bound_", 2},
-        {"upper_bound_", 2},
-        {"lower_upper_bound_", 3},
-        {"offset_multiplier_", 3}};
-    for (const auto& stem : kStems) {
-      const std::string prefix(stem.first);
-      if (name.compare(0, prefix.size(), prefix) != 0) continue;
-      const std::string tail = name.substr(prefix.size());
-      if (tail == "constrain" || tail == "jacobian" || tail == "unconstrain")
-        return stem.second;
-    }
-    return 0;
-  }
-
-  // One element of a bound transform, through stan-math's own scalar
-  // overloads: the free direction is stan-math's inverse rather than a
-  // hand-written one, so the two directions cannot drift apart here. `b2` is
-  // unread by the two-argument transforms.
-  static T bound_transform(const std::string& name, const T& x, const T& b1,
-                           const T& b2) {
-    if (name == "lower_bound_unconstrain") return stan::math::lb_free(x, b1);
-    if (name == "upper_bound_unconstrain") return stan::math::ub_free(x, b1);
-    if (name == "lower_upper_bound_unconstrain")
-      return stan::math::lub_free(x, b1, b2);
-    if (name == "offset_multiplier_unconstrain")
-      return stan::math::offset_multiplier_free(x, b1, b2);
-    // The constrain and jacobian directions differ only in a target
-    // increment, and this path has no target.
-    if (name == "lower_bound_constrain" || name == "lower_bound_jacobian")
-      return stan::math::lb_constrain(x, b1);
-    if (name == "upper_bound_constrain" || name == "upper_bound_jacobian")
-      return stan::math::ub_constrain(x, b1);
-    if (name == "lower_upper_bound_constrain" ||
-        name == "lower_upper_bound_jacobian")
-      return stan::math::lub_constrain(x, b1, b2);
-    return stan::math::offset_multiplier_constrain(x, b1, b2);
-  }
 
   static bool check_scalar_type(const mir::Expr& e) {
     return e.unsized.depth == 0 && (e.unsized.leaf == mir::UnsizedLeaf::Int ||
@@ -963,15 +1189,6 @@ class MirInterp {
 
   // max-shifted log-sum-exp over a buffer; -inf on an empty or all
   // -inf input rather than NaN.
-  static T lse(const std::vector<T>& xs) {
-    T m = T(-std::numeric_limits<double>::infinity());
-    for (const T& x : xs)
-      if (val(x) > val(m)) m = x;
-    if (!(val(m) > -std::numeric_limits<double>::infinity())) return m;
-    T s = T(0.0);
-    for (const T& x : xs) s += stan::math::exp(x - m);
-    return m + stan::math::log(s);
-  }
 
   static Value from_entry(const DataMap::Entry& d) {
     if constexpr (std::is_same_v<T, double>) {
@@ -1033,7 +1250,7 @@ class MirInterp {
         mir::reduce_sum_partial_name(e.args[0].name, &propto);
     const std::vector<mir::UnsizedView> views =
         mir::reduce_sum_partial_views(e);
-    const mir::FunDef* f = mir::resolve_reduce_sum_partial(funs_, base, views);
+    const mir::FunDef* f = mir::resolve_callback(funs_, base, views);
     if (f == nullptr)
       fail("reduce_sum: unknown partial-sum function " + base, e.raw);
     if (f->arg_names.size() != views.size())
@@ -1066,6 +1283,55 @@ class MirInterp {
       return std::move(r.v);
     }
     fail("reduce_sum: " + base + " returned no value", e.raw);
+  }
+
+  // Serial map_rect is structural, just like reduce_sum: each job is one
+  // ordinary callback invocation and the vector results are concatenated.
+  // Keeping it here gives transformed data, callback fallback, and
+  // interpreted write_array the same definition.
+  Value call_map_rect(const mir::Expr& e) {
+    if (e.args.size() != 5 || e.args[0].kind != mir::Expr::Var)
+      fail("map_rect: malformed call", e.raw);
+    Value shared = eval(e.args[1]);
+    Value jobs = eval(e.args[2]);
+    Value real_data = eval(e.args[3]);
+    Value int_data = eval(e.args[4]);
+    if (jobs.dims.empty()) fail("map_rect: jobs are not an array", e.raw);
+    const int64_t n = jobs.dims[0];
+    if (n < 0 || (n && jobs.r.size() % (size_t)n != 0) ||
+        (n && real_data.r.size() % (size_t)n != 0) ||
+        (n && int_data.i.size() % (size_t)n != 0))
+      fail("map_rect: job shapes disagree", e.raw);
+    const int64_t job_width = n ? (int64_t)jobs.r.size() / n : 0;
+    const int64_t real_width = n ? (int64_t)real_data.r.size() / n : 0;
+    const int64_t int_width = n ? (int64_t)int_data.i.size() / n : 0;
+    const std::vector<mir::UnsizedView> views{{0, mir::UnsizedLeaf::Vector},
+                                              {0, mir::UnsizedLeaf::Vector},
+                                              {1, mir::UnsizedLeaf::Real},
+                                              {1, mir::UnsizedLeaf::Int}};
+    const mir::FunDef* f = mir::resolve_callback(funs_, e.args[0].name, views);
+    if (!f) fail("map_rect: unknown callback " + e.args[0].name, e.raw);
+    Value result;
+    for (int64_t job = 0; job < n; ++job) {
+      Value job_arg, xr_arg, xi_arg;
+      job_arg.dims = {job_width};
+      xr_arg.dims = {real_width};
+      xi_arg.dims = {int_width};
+      xi_arg.is_int = true;
+      for (int64_t k = 0; k < job_width; ++k)
+        job_arg.r.push_back(jobs.r[(size_t)(job + k * n)]);
+      for (int64_t k = 0; k < real_width; ++k)
+        xr_arg.r.push_back(real_data.r[(size_t)(job + k * n)]);
+      for (int64_t k = 0; k < int_width; ++k) {
+        const int value = int_data.i[(size_t)(job + k * n)];
+        xi_arg.i.push_back(value);
+        xi_arg.r.push_back(T(value));
+      }
+      Value one = call(*f, {shared, job_arg, xr_arg, xi_arg});
+      result.r.insert(result.r.end(), one.r.begin(), one.r.end());
+    }
+    result.dims = {(int64_t)result.r.size()};
+    return result;
   }
 
   Value call_udf(const mir::Expr& e) {
@@ -1101,6 +1367,7 @@ class MirInterp {
       base_ptr = &base_storage;
     }
     const Value& base = *base_ptr;
+    if (e.args.size() == 1) return base;
     if (e.args.size() == 2 && e.args[1].name == "IndexSingle" &&
         base.dims.size() <= 1) {
       const long ix = as_int(e.args[1].args[0]);
@@ -1269,31 +1536,23 @@ class MirInterp {
     // the complete suffix. Iterating the last source dimension outermost
     // emits the selected value in the same first-index-fast layout.
     if (n_indices > 0 && n_indices <= base.dims.size()) {
-      std::vector<std::vector<int64_t>> selected(base.dims.size());
-      std::vector<int64_t> out_dims;
+      std::vector<std::vector<int64_t>> selected(n_indices);
+      std::vector<bool> drops(n_indices, false);
       bool supported = true;
-      for (size_t d = 0; d < base.dims.size(); ++d) {
+      for (size_t d = 0; d < n_indices; ++d) {
         const int64_t extent = base.dims[d];
-        if (d >= n_indices) {
-          out_dims.push_back(extent);
-          selected[d].reserve(static_cast<size_t>(extent));
-          for (int64_t i = 0; i < extent; ++i) selected[d].push_back(i);
-          continue;
-        }
-
         const mir::Expr& index = e.args[1 + d];
         if (index.name == "IndexSingle") {
           const long i = as_int(index.args[0]);
           bounds(i, extent, e);
           selected[d].push_back(i - 1);
+          drops[d] = true;
         } else if (index.name == "IndexAll") {
-          out_dims.push_back(extent);
           selected[d].reserve(static_cast<size_t>(extent));
           for (int64_t i = 0; i < extent; ++i) selected[d].push_back(i);
         } else if (index.name == "IndexMulti") {
           const Value positions = eval(index.args[0]);
           const size_t n = std::max(positions.i.size(), positions.r.size());
-          out_dims.push_back(static_cast<int64_t>(n));
           selected[d].reserve(n);
           for (size_t k = 0; k < n; ++k) {
             const long i = k < positions.i.size()
@@ -1309,16 +1568,12 @@ class MirInterp {
             bounds(lo, extent, e);
             bounds(hi, extent, e);
           }
-          const int64_t n = hi >= lo ? hi - lo + 1 : 0;
-          out_dims.push_back(n);
-          selected[d].reserve(static_cast<size_t>(n));
+          selected[d].reserve(static_cast<size_t>(hi >= lo ? hi - lo + 1 : 0));
           for (long i = lo; i <= hi; ++i) selected[d].push_back(i - 1);
         } else if (index.name == "IndexUpfrom") {
           const long lo = as_int(index.args[0]);
           bounds(lo, extent, e);
-          const int64_t n = extent - lo + 1;
-          out_dims.push_back(n);
-          selected[d].reserve(static_cast<size_t>(n));
+          selected[d].reserve(static_cast<size_t>(extent - lo + 1));
           for (long i = lo; i <= extent; ++i) selected[d].push_back(i - 1);
         } else {
           supported = false;
@@ -1326,23 +1581,23 @@ class MirInterp {
         }
       }
       if (supported) {
-        std::vector<int64_t> strides(base.dims.size(), 1);
-        for (size_t d = 1; d < base.dims.size(); ++d)
-          strides[d] = strides[d - 1] * base.dims[d - 1];
+        // The shared index geometry over the interpreter's first-index-fast
+        // storage; trailing axes keep their full extent inside the resolver.
+        const BuiltinIndexMap map = builtin_index_map(
+            base.dims, 0, selected, drops, SliceStorageOrder::FirstIndexFast);
         r.is_int = base.is_int;
-        r.dims = std::move(out_dims);
-        std::function<void(int64_t, int64_t)> gather = [&](int64_t d,
-                                                           int64_t flatpos) {
-          if (d < 0) {
-            r.r.push_back(base.r.at(static_cast<size_t>(flatpos)));
-            if (base.is_int)
-              r.i.push_back(base.i.at(static_cast<size_t>(flatpos)));
-            return;
-          }
-          for (int64_t i : selected[static_cast<size_t>(d)])
-            gather(d - 1, flatpos + i * strides[static_cast<size_t>(d)]);
-        };
-        gather(static_cast<int64_t>(base.dims.size()) - 1, 0);
+        r.dims = map.dimensions;
+        r.r.reserve(static_cast<size_t>(map.count));
+        if (base.is_int) r.i.reserve(static_cast<size_t>(map.count));
+        for (int64_t k = 0; k < map.count; ++k) {
+          const int64_t cell = map.kind == BuiltinSliceMap::Kind::Contiguous
+                                   ? map.offset + k
+                               : map.kind == BuiltinSliceMap::Kind::Strided
+                                   ? map.offset + k * map.stride
+                                   : map.gather[static_cast<size_t>(k)];
+          r.r.push_back(base.r.at(static_cast<size_t>(cell)));
+          if (base.is_int) r.i.push_back(base.i.at(static_cast<size_t>(cell)));
+        }
         return r;
       }
     }
@@ -1357,8 +1612,20 @@ class MirInterp {
 
   Value eval_fun(const mir::Expr& e) {
     Value r;
+    const FunctionSpec* registered = function_spec(e);
+    const BuiltinSpec* builtin =
+        registered != nullptr && registered->builtin() != nullptr
+            ? registered->builtin()
+            : nullptr;
+    if (mir::stateful_intrinsic_kind(e))
+      fail("target() is unavailable in this context", e.raw);
+    if (const auto value = mir::nullary_constant(e)) {
+      r.r = {T(*value)};
+      return r;
+    }
     if (e.fn_lib == mir::Expr::Lib::UserDefined) return call_udf(e);
     if (mir::is_reduce_sum(e)) return call_reduce_sum(e);
+    if (e.name == "map_rect") return call_map_rect(e);
     const auto is_scalar = [](const Value& v) {
       return v.dims.empty() && v.r.size() == 1;
     };
@@ -1378,66 +1645,106 @@ class MirInterp {
       return is_scalar(a) || is_scalar(b) ||
              (a.dims == b.dims && a.r.size() == b.r.size());
     };
+    const auto resolve_registered = [&](const std::vector<Value>& values) {
+      if (builtin == nullptr)
+        fail(e.name + ": missing builtin descriptor", e.raw);
+      std::vector<BuiltinArgumentShape> shapes;
+      shapes.reserve(values.size());
+      try {
+        for (size_t k = 0; k < values.size(); ++k)
+          shapes.push_back(function_argument_shape(e.args[k], values[k]));
+        return builtin_layout(*builtin, shapes);
+      } catch (const std::invalid_argument& error) {
+        fail(e.name + ": " + error.what(), e.raw);
+      }
+    };
     // Elementwise with scalar broadcasting; results of real math are real
     // even on int inputs, and binary int results stay int only when both
     // sides are int scalars.
     auto bin = [&](auto f) {
       Value a = eval(e.args[0]), b = eval(e.args[1]);
       Value o;
-      if (!shapes_match(a, b)) fail(e.name + ": incompatible shapes", e.raw);
-      const size_t n = broadcast_size(a, b);
+      size_t n;
+      size_t result_argument;
+      if (builtin != nullptr) {
+        const BuiltinLayout layout = resolve_registered({a, b});
+        n = (size_t)layout.lanes;
+        result_argument = layout.result_argument;
+      } else {
+        if (!shapes_match(a, b)) fail(e.name + ": incompatible shapes", e.raw);
+        n = broadcast_size(a, b);
+        result_argument = is_scalar(a) && !is_scalar(b) ? 1 : 0;
+      }
       o.r.resize(n);
       for (size_t i = 0; i < n; ++i)
         o.r[i] = f(a.r[a.r.size() == 1 ? 0 : i], b.r[b.r.size() == 1 ? 0 : i]);
-      o.dims = broadcast_dims(a, b);
+      o.dims = result_argument == 0 ? a.dims : b.dims;
       if (a.is_int && b.is_int && a.i.size() == 1 && b.i.size() == 1) {
         o.is_int = true;
         o.i = {(int)val(f(T((double)a.i[0]), T((double)b.i[0])))};
       }
       return o;
     };
-    // Two-argument scalar math with one int argument (bessel_first_kind
-    // and friends): bin's broadcast and shape rules, but the int side
-    // reaches stan-math as an int, which is what those overloads take.
-    // `int_first` says which position holds it. No layout correction like
-    // the graph kernel's -- every container here is column-major, arrays
-    // included, so a matrix and an int array of the same dims already pair
-    // element for element, which is the pairing stan-math makes.
-    auto bin_int = [&](bool int_first, auto f) {
-      Value a = eval(e.args[0]), b = eval(e.args[1]);
-      if (!shapes_match(a, b)) fail(e.name + ": incompatible shapes", e.raw);
-      const Value& re = int_first ? b : a;
-      const Value& iv = int_first ? a : b;
-      Value o;
-      const size_t n = broadcast_size(a, b);
-      o.r.resize(n);
-      o.dims = broadcast_dims(a, b);
-      const bool rs = re.r.size() == 1, is = iv.r.size() == 1;
-      for (size_t i = 0; i < n; ++i) {
-        const size_t k = is ? 0 : i;
-        const int q = iv.is_int && k < iv.i.size()
-                          ? iv.i[k]
-                          : (int)std::llround(val(iv.r[k]));
-        o.r[i] = f(re.r[rs ? 0 : i], q);
-      }
-      // Only falling_factorial and rising_factorial have an int,int
-      // overload that answers int; everywhere else two int arguments still
-      // make a real, so stanc's own result type decides rather than the
-      // arguments.
-      if (e.type_ == "UInt" && n == 1) {
-        o.is_int = true;
-        o.i = {(int)val(o.r[0])};
-      }
-      return o;
-    };
     auto un = [&](auto f) {
       Value a = eval(e.args[0]);
+      if (builtin != nullptr) (void)resolve_registered({a});
       Value o;
       o.dims = a.dims;
       o.r.resize(a.r.size());
       for (size_t i = 0; i < a.r.size(); ++i) o.r[i] = f(a.r[i]);
       return o;
     };
+    if (builtin != nullptr &&
+        builtin->shape == BuiltinShapePolicy::Elementwise &&
+        builtin->result == FunctionArgumentKind::Integer) {
+      Value a = eval(e.args[0]);
+      const auto restore_legacy_integer = [&](size_t index, Value* value) {
+        const mir::Expr& source = e.args[index];
+        const bool integer_type =
+            source.unsized.leaf == mir::UnsizedLeaf::Int ||
+            source.type_ == "UInt";
+        if (!value->is_int && integer_type) {
+          value->is_int = true;
+          value->i.reserve(value->r.size());
+          for (const T& lane : value->r)
+            value->i.push_back((int)std::llround(val(lane)));
+        }
+      };
+      restore_legacy_integer(0, &a);
+      if (!a.is_int) fail(e.name + ": expected integer arguments", e.raw);
+      if (builtin->arity == 1) {
+        (void)resolve_registered({a});
+        Value o;
+        o.is_int = true;
+        o.dims = a.dims;
+        o.i.resize(a.i.size());
+        o.r.resize(a.i.size());
+        for (size_t i = 0; i < a.i.size(); ++i) {
+          const int value = evaluate_integer_unary_builtin(*builtin, a.i[i]);
+          o.i[i] = value;
+          o.r[i] = T((double)value);
+        }
+        return o;
+      }
+      Value b = eval(e.args[1]);
+      restore_legacy_integer(1, &b);
+      if (!b.is_int) fail(e.name + ": expected integer arguments", e.raw);
+      const BuiltinLayout layout = resolve_registered({a, b});
+      Value o;
+      const size_t n = (size_t)layout.lanes;
+      o.is_int = true;
+      o.dims = layout.result_argument == 0 ? a.dims : b.dims;
+      o.i.resize(n);
+      o.r.resize(n);
+      for (size_t i = 0; i < n; ++i) {
+        const int value = evaluate_integer_binary_builtin(
+            *builtin, a.i[a.i.size() == 1 ? 0 : i],
+            b.i[b.i.size() == 1 ? 0 : i]);
+        o.i[i] = value;
+        o.r[i] = T((double)value);
+      }
+      return o;
+    }
     // The comparison operators: compare values, answer 1.0 or 0.0, and
     // otherwise take bin's broadcasting and int-scalar rules unchanged.
     auto cmp = [&](auto f) {
@@ -1445,72 +1752,90 @@ class MirInterp {
         return T(f(val(x), val(y)) ? 1.0 : 0.0);
       });
     };
-    // add/subtract/multiply/elt_multiply/divide/elt_divide are the named
-    // spellings of the binary operators, and they are taught here beside
-    // the operators rather than in a table of their own: the graph
-    // lowering knows them too, and teaching only one side is what let a
-    // vectorized log_sum_exp answer transformed data with the wrong value
-    // and no exception.
-    if (e.name == "Plus__" || e.name == "add")
-      return bin([](const T& x, const T& y) { return x + y; });
-    if (e.name == "Minus__" || e.name == "subtract")
-      return bin([](const T& x, const T& y) { return x - y; });
+    if ((e.name == "Plus__" || e.name == "Minus__") && e.type_ == "UInt") {
+      const long x = as_int(e.args[0]), y = as_int(e.args[1]);
+      const long q = e.name == "Plus__" ? x + y : x - y;
+      r.is_int = true;
+      r.i = {(int)q};
+      r.r = {T((double)q)};
+      return r;
+    }
     if (e.name == "Times__" || e.name == "multiply") {
       // Times on shaped operands is linear algebra, not elementwise; only
-      // a scalar operand (either side) scales elementwise.
+      // a scalar operand (either side) scales elementwise. The shared
+      // product resolver owns the classification and the inner-dimension
+      // check; interpreter values carry no orientation, so a one-axis
+      // operand takes the orientation its position implies -- a row before
+      // a matrix, a column after one, and the result type splits the
+      // one-axis pair into outer product against dot product.
       Value a = eval(e.args[0]), b = eval(e.args[1]);
       const bool a_mat = a.dims.size() == 2, b_mat = b.dims.size() == 2;
-      if (!is_scalar(a) && !is_scalar(b) && (a_mat || b_mat)) {
-        const int64_t Ra = a_mat ? a.dims[0] : 1;
-        const int64_t Ca = a_mat ? a.dims[1] : (int64_t)a.r.size();
-        const int64_t Rb = b_mat ? b.dims[0] : (int64_t)b.r.size();
-        const int64_t Cb = b_mat ? b.dims[1] : 1;
-        if (Ca != Rb) fail(e.name + ": inner dimension mismatch", e.raw);
-        // Matrix * matrix must use Eigen's product evaluator, just as the
-        // graph GEMM and generated Stan do. A hand-written scalar loop has
-        // a measurably different association for a one-column product.
-        if (a_mat && b_mat) {
-          using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-          r.r.resize((size_t)(Ra * Cb));
-          Eigen::Map<const Mat> am(a.r.data(), Ra, Ca);
-          Eigen::Map<const Mat> bm(b.r.data(), Rb, Cb);
-          Eigen::Map<Mat>(r.r.data(), Ra, Cb) = am * bm;
-          r.dims = {Ra, Cb};
-          return r;
+      const bool outer_pair = !a_mat && !b_mat && e.type_ == "UMatrix";
+      const bool inner_pair =
+          !a_mat && !b_mat && (e.type_ == "UReal" || e.type_ == "UInt");
+      if (!is_scalar(a) && !is_scalar(b) &&
+          (a_mat || b_mat || outer_pair || inner_pair)) {
+        using Kind = FunctionContainerKind;
+        const auto oriented = [](const Value& v, Kind fallback) {
+          return make_function_shape(
+              FunctionArgumentKind::Real,
+              v.dims.size() == 2 ? Kind::Matrix : fallback, Kind::Scalar,
+              v.dims.size() == 2 ? v.dims
+                                 : std::vector<int64_t>{(int64_t)v.r.size()},
+              (int64_t)v.r.size());
+        };
+        BuiltinProductMap map;
+        try {
+          map = builtin_product_map(
+              oriented(a, outer_pair ? Kind::Vector : Kind::RowVector),
+              oriented(b, outer_pair ? Kind::RowVector : Kind::Vector));
+        } catch (const std::invalid_argument& error) {
+          fail(e.name + ": " + error.what(), e.raw);
         }
-        // Col-major storage on both sides.
-        r.r.assign((size_t)(Ra * Cb), T(0.0));
-        for (int64_t j = 0; j < Cb; ++j)
-          for (int64_t k = 0; k < Ca; ++k) {
-            const T& bv = b.r.at((size_t)(j * Rb + k));
-            for (int64_t i = 0; i < Ra; ++i)
-              r.r[(size_t)(j * Ra + i)] +=
-                  a.r.at((size_t)(a_mat ? k * Ra + i : k)) * bv;
+        switch (map.kind) {
+          case BuiltinProductMap::Kind::Gemm:
+            // Matrix * matrix must use Eigen's product evaluator, just as
+            // the graph GEMM and generated Stan do. A hand-written scalar
+            // loop has a measurably different association for a one-column
+            // product.
+            if (a_mat && b_mat) {
+              using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+              r.r.resize((size_t)(map.m * map.n));
+              Eigen::Map<const Mat> am(a.r.data(), map.m, map.k);
+              Eigen::Map<const Mat> bm(b.r.data(), map.k, map.n);
+              Eigen::Map<Mat>(r.r.data(), map.m, map.n) = am * bm;
+              r.dims = {map.m, map.n};
+              return r;
+            }
+            [[fallthrough]];
+          case BuiltinProductMap::Kind::MatVec: {
+            // Col-major storage on both sides.
+            r.r.assign((size_t)(map.m * map.n), T(0.0));
+            for (int64_t j = 0; j < map.n; ++j)
+              for (int64_t k = 0; k < map.k; ++k) {
+                const T& bv = b.r.at((size_t)(b_mat ? j * map.k + k : k));
+                for (int64_t i = 0; i < map.m; ++i)
+                  r.r[(size_t)(j * map.m + i)] +=
+                      a.r.at((size_t)(a_mat ? k * map.m + i : k)) * bv;
+              }
+            r.dims = {(int64_t)r.r.size()};
+            return r;
           }
-        if (a_mat && b_mat)
-          r.dims = {Ra, Cb};
-        else
-          r.dims = {(int64_t)r.r.size()};
-        return r;
-      }
-      if (!is_scalar(a) && !is_scalar(b) && !a_mat && !b_mat) {
-        // vector * row_vector is an outer product when the result is a
-        // matrix; row_vector * vector is a dot product when it is a scalar.
-        if (e.type_ == "UMatrix") {
-          const int64_t nr = (int64_t)a.r.size(), nc = (int64_t)b.r.size();
-          r.dims = {nr, nc};
-          for (int64_t j = 0; j < nc; ++j)
-            for (int64_t i = 0; i < nr; ++i)
-              r.r.push_back(a.r[(size_t)i] * b.r[(size_t)j]);
-          return r;
-        }
-        if (e.type_ == "UReal" || e.type_ == "UInt") {
-          if (a.r.size() != b.r.size())
-            fail(e.name + ": dot product length mismatch", e.raw);
-          T s = T(0.0);
-          for (size_t i = 0; i < a.r.size(); ++i) s += a.r[i] * b.r[i];
-          r.r = {s};
-          return r;
+          case BuiltinProductMap::Kind::Outer: {
+            r.dims = {map.m, map.n};
+            for (int64_t j = 0; j < map.n; ++j)
+              for (int64_t i = 0; i < map.m; ++i)
+                r.r.push_back(a.r[(size_t)i] * b.r[(size_t)j]);
+            return r;
+          }
+          case BuiltinProductMap::Kind::Inner: {
+            T s = T(0.0);
+            for (size_t i = 0; i < a.r.size(); ++i) s += a.r[i] * b.r[i];
+            r.r = {s};
+            return r;
+          }
+          case BuiltinProductMap::Kind::ScalarScale:
+            break;
         }
       }
       // Scalar scale, elementwise on the already-evaluated operands (an
@@ -1528,8 +1853,6 @@ class MirInterp {
       }
       return r;
     }
-    if (e.name == "EltTimes__" || e.name == "elt_multiply")
-      return bin([](const T& x, const T& y) { return x * y; });
     // `A \ v` and `rv / A` are linear solves. stanc spells them with the
     // ordinary division operators, so the divisor's type is what tells a
     // solve from elementwise division by a scalar; `./` is never a solve.
@@ -1537,29 +1860,15 @@ class MirInterp {
     // use, and pick a factorisation family with them: the plain solve, the
     // LLT of a symmetric positive definite matrix, or a triangular solve
     // that reads only the lower triangle.
-    enum class SolveKind { Plain, Spd, TriLow };
-    SolveKind kind = SolveKind::Plain;
-    bool named_left = false;
-    bool named_solve = false;
-    if (e.args.size() == 2 && e.name.rfind("mdivide_", 0) == 0) {
-      const std::string tail = e.name.substr(8);
-      if (tail.rfind("left", 0) == 0 || tail.rfind("right", 0) == 0) {
-        named_left = tail.rfind("left", 0) == 0;
-        const std::string family = tail.substr(named_left ? 4 : 5);
-        if (family.empty()) {
-          named_solve = true;
-        } else if (family == "_spd") {
-          named_solve = true;
-          kind = SolveKind::Spd;
-        } else if (family == "_tri_low") {
-          named_solve = true;
-          kind = SolveKind::TriLow;
-        }
-      }
-    }
-    if (named_solve || e.name == "LDivide__" ||
-        (e.name == "Divide__" && e.args.at(1).type_ == "UMatrix")) {
-      const bool left = named_solve ? named_left : e.name == "LDivide__";
+    const BuiltinSpec* solve_spec =
+        shaped_builtin_spec(e.name, e.args.size(), BuiltinShapePolicy::Solve);
+    if (solve_spec == nullptr && e.name == "Divide__" && e.args.size() == 2 &&
+        e.args.at(1).type_ == "UMatrix")
+      solve_spec =
+          shaped_builtin_spec("mdivide_right", 2, BuiltinShapePolicy::Solve);
+    if (solve_spec != nullptr) {
+      const bool left = solve_spec->solve_left;
+      const BuiltinSolveKind kind = solve_spec->solve;
       Value a = eval(e.args[0]), b = eval(e.args[1]);
       const Value& divisor = left ? a : b;
       const Value& dividend = left ? b : a;
@@ -1592,9 +1901,9 @@ class MirInterp {
       // std::invalid_argument CmdStan would.
       const auto left_solve = [&](const auto& x) {
         switch (kind) {
-          case SolveKind::Spd:
+          case BuiltinSolveKind::Spd:
             return Mat(stan::math::mdivide_left_spd(d, x));
-          case SolveKind::TriLow:
+          case BuiltinSolveKind::TriLow:
             return Mat(stan::math::mdivide_left_tri_low(d, x));
           default:
             return Mat(stan::math::mdivide_left(d, x));
@@ -1602,9 +1911,9 @@ class MirInterp {
       };
       const auto right_solve = [&](const auto& x) {
         switch (kind) {
-          case SolveKind::Spd:
+          case BuiltinSolveKind::Spd:
             return Mat(stan::math::mdivide_right_spd(x, d));
-          case SolveKind::TriLow:
+          case BuiltinSolveKind::TriLow:
             return Mat(stan::math::mdivide_right_tri_low(x, d));
           default:
             return Mat(stan::math::mdivide_right(x, d));
@@ -1635,141 +1944,22 @@ class MirInterp {
         r.dims = {(int64_t)r.r.size()};
       return r;
     }
-    // `divide` reaches here and never the solve above: stan::math::divide
-    // divides by a scalar or divides a scalar elementwise, and has no
-    // matrix-divisor overload at all.
-    //
-    // Its int,int overload is the exception to that elementwise reading:
-    // it truncates and refuses a zero denominator, where the real
-    // division below would answer 3.5 for `divide(7, 2)`. The value the
-    // caller sees is `r`, not `i` -- lower.cpp's fold_const takes r[0]
-    // for a UInt result -- so the truncation has to land in both.
-    if ((e.name == "divide" || e.name == "elt_divide") && e.type_ == "UInt") {
-      const int x = (int)as_int(e.args[0]), y = (int)as_int(e.args[1]);
-      // divide is the one with the zero check; elt_divide is a bare `/`,
-      // so a zero denominator there is undefined behavior and refused.
-      if (e.name == "elt_divide" && y == 0)
-        fail("integer division by zero", e.raw);
-      const int q = e.name == "divide" ? stan::math::divide(x, y) : x / y;
-      r.is_int = true;
-      r.i = {q};
-      r.r = {T((double)q)};
-      return r;
-    }
-    if (e.name == "Divide__" || e.name == "EltDivide__" || e.name == "divide" ||
-        e.name == "elt_divide")
-      return bin([](const T& x, const T& y) { return x / y; });
-    // `%` and `%/%`. Both operands are int by stanc's typing, so these are
-    // C++ integer operators -- truncated toward zero -- and not fmod and
-    // real division rounded afterwards, which disagree on negatives.
-    // stan::math::modulus is what CmdStan calls, down to the exception it
-    // throws on a zero divisor; `%/%` becomes a bare C++ `/`, where a zero
-    // divisor is undefined behavior, so this refuses it instead.
-    if (e.name == "Modulo__" || e.name == "IntDivide__") {
+    if (e.name == "Modulo__") {
       const long x = as_int(e.args[0]), y = as_int(e.args[1]);
-      long q;
-      if (e.name == "Modulo__") {
-        q = stan::math::modulus((int)x, (int)y);
-      } else {
-        if (y == 0) fail("integer division by zero", e.raw);
-        q = x / y;
-      }
+      const long q = stan::math::modulus((int)x, (int)y);
       r.is_int = true;
       r.i = {(int)q};
       r.r = {T((double)q)};
       return r;
     }
-    if (e.name == "Pow__" || e.name == "EltPow__" || e.name == "pow")
-      return bin([](const T& x, const T& y) { return stan::math::pow(x, y); });
-    if (e.name == "fmax")
-      return bin([](const T& x, const T& y) { return stan::math::fmax(x, y); });
-    if (e.name == "fmin")
-      return bin([](const T& x, const T& y) { return stan::math::fmin(x, y); });
-    if (e.name == "atan2")
-      return bin(
-          [](const T& x, const T& y) { return stan::math::atan2(x, y); });
-    if (e.name == "beta" && e.args.size() == 2)
-      return bin([](const T& x, const T& y) { return stan::math::beta(x, y); });
-    if (e.name == "fdim")
-      return bin([](const T& x, const T& y) { return stan::math::fdim(x, y); });
-    if (e.name == "fmod")
-      return bin([](const T& x, const T& y) { return stan::math::fmod(x, y); });
-    if (e.name == "gamma_p")
-      return bin(
-          [](const T& x, const T& y) { return stan::math::gamma_p(x, y); });
-    if (e.name == "gamma_q")
-      return bin(
-          [](const T& x, const T& y) { return stan::math::gamma_q(x, y); });
-    if (e.name == "hypot")
-      return bin(
-          [](const T& x, const T& y) { return stan::math::hypot(x, y); });
-    if (e.name == "lbeta")
-      return bin(
-          [](const T& x, const T& y) { return stan::math::lbeta(x, y); });
-    if (e.name == "lchoose" || e.name == "binomial_coefficient_log")
-      return bin([](const T& x, const T& y) {
-        return stan::math::binomial_coefficient_log(x, y);
-      });
-    if (e.name == "log_falling_factorial")
-      return bin([](const T& x, const T& y) {
-        return stan::math::log_falling_factorial(x, y);
-      });
-    if (e.name == "log_inv_logit_diff")
-      return bin([](const T& x, const T& y) {
-        return stan::math::log_inv_logit_diff(x, y);
-      });
-    if (e.name == "log_modified_bessel_first_kind")
-      return bin([](const T& x, const T& y) {
-        return stan::math::log_modified_bessel_first_kind(x, y);
-      });
-    if (e.name == "log_rising_factorial")
-      return bin([](const T& x, const T& y) {
-        return stan::math::log_rising_factorial(x, y);
-      });
-    if (e.name == "owens_t")
-      return bin(
-          [](const T& x, const T& y) { return stan::math::owens_t(x, y); });
-    if (e.name == "bessel_first_kind")
-      return bin_int(true, [](const T& x, int k) {
-        return stan::math::bessel_first_kind(k, x);
-      });
-    if (e.name == "bessel_second_kind")
-      return bin_int(true, [](const T& x, int k) {
-        return stan::math::bessel_second_kind(k, x);
-      });
-    if (e.name == "modified_bessel_first_kind")
-      return bin_int(true, [](const T& x, int k) {
-        return stan::math::modified_bessel_first_kind(k, x);
-      });
-    if (e.name == "modified_bessel_second_kind")
-      return bin_int(true, [](const T& x, int k) {
-        return stan::math::modified_bessel_second_kind(k, x);
-      });
-    if (e.name == "binary_log_loss")
-      return bin_int(true, [](const T& x, int k) {
-        return stan::math::binary_log_loss(k, x);
-      });
-    if (e.name == "lmgamma")
-      return bin_int(
-          true, [](const T& x, int k) { return stan::math::lmgamma(k, x); });
-    if (e.name == "falling_factorial")
-      return bin_int(false, [](const T& x, int k) {
-        return stan::math::falling_factorial(x, k);
-      });
-    if (e.name == "rising_factorial")
-      return bin_int(false, [](const T& x, int k) {
-        return stan::math::rising_factorial(x, k);
-      });
-    if (e.name == "ldexp")
-      return bin_int(false,
-                     [](const T& x, int k) { return stan::math::ldexp(x, k); });
-    // --O1 partial evaluation rewrites `x * log(y)` to lmultiply(x, y);
-    // multiply_log computes exactly x * log(y), so the value is bitwise
-    // what the unoptimized form produced.
-    if (e.name == "lmultiply" || e.name == "multiply_log")
-      return bin([](const T& x, const T& y) {
-        return stan::math::multiply_log(x, y);
-      });
+    if (e.name == "choose" && e.args.size() == 2) {
+      const int q =
+          stan::math::choose((int)as_int(e.args[0]), (int)as_int(e.args[1]));
+      r.is_int = true;
+      r.i = {q};
+      r.r = {T((double)q)};
+      return r;
+    }
     // fma from --O1 partial evaluation (`c + a*b`) or written explicitly:
     // fused like stan-math's, elementwise with scalar broadcast.
     if (e.name == "fma" && e.args.size() == 3) {
@@ -1792,67 +1982,121 @@ class MirInterp {
                                  c.r[c.r.size() == 1 ? 0 : i]);
       return o;
     }
-    // Stan's bound transforms, callable as functions rather than written on
-    // a declaration: elementwise over every container shape, with each bound
-    // either one value for the whole container or one value per element.
-    // The interpreter serves transformed data and the interpreted
-    // write_array, both of which the generated model instantiates with
-    // `jacobian__ = false`, so the `_jacobian` direction is the constrained
-    // value and nothing else -- there is no target here to increment.
-    const size_t bound_arity = bound_transform_arity(e.name);
-    if (bound_arity != 0 && bound_arity == e.args.size()) {
+    // Callable transforms share their name/arity dispatch and their typed
+    // execution with graph lowering and runtime-control Programs. The
+    // interpreter is used for write_array with jacobian__ false, so it keeps
+    // the constrained value and deliberately discards the auxiliary lp.
+    CallableTransformSpec transform;
+    if (callable_transform(e.name, &transform) &&
+        transform.arity == e.args.size()) {
+      if (transform.structured &&
+          transform.direction == TransformDirection::Unconstrain)
+        fail(e.name + ": structured inverse is unsupported", e.raw);
       std::vector<Value> a;
       a.reserve(e.args.size());
       for (const mir::Expr& arg : e.args) a.push_back(eval(arg));
-      const auto at = [&](size_t k, size_t i) {
-        return a[k].r[a[k].r.size() == 1 ? 0 : i];
-      };
+      Program::Transform tr;
+      tr.kind = transform.kind;
+      tr.direction = transform.direction;
+      tr.n_in = transform.structured ? 1 : (int8_t)transform.arity;
       Value o;
       o.dims = a[0].dims;
-      o.r.resize(a[0].r.size());
-      for (size_t i = 0; i < o.r.size(); ++i)
-        o.r[i] = bound_transform(e.name, at(0, i), at(1, i),
-                                 a.size() > 2 ? at(2, i) : T(0));
+      size_t outer_rank = 0;
+      if (!transform.structured) {
+        for (int k = 1; k < tr.n_in; ++k) {
+          const size_t n = a[(size_t)k].r.size();
+          if (n != 1 && n != a[0].r.size())
+            fail(e.name + ": bound has incompatible size", e.raw);
+        }
+        tr.out_len = (int32_t)a[0].r.size();
+        tr.inner_raw = tr.out_len;
+      } else {
+        outer_rank = e.args[0].unsized.depth;
+        const bool input_matrix =
+            e.args[0].unsized.leaf == mir::UnsizedLeaf::Matrix;
+        if (o.dims.size() < outer_rank + (input_matrix ? 2u : 1u))
+          fail(e.name + ": incomplete input dimensions", e.raw);
+        int64_t batch = 1;
+        for (size_t i = 0; i < outer_rank; ++i) batch *= o.dims[i];
+        const int64_t raw_rows =
+            input_matrix ? o.dims[outer_rank] : o.dims.back();
+        const int64_t raw_cols = input_matrix ? o.dims[outer_rank + 1] : 0;
+        int64_t rows = 0, cols = 0;
+        switch (transform.kind) {
+          case CallableTransformKind::Ordered:
+          case CallableTransformKind::PositiveOrdered:
+          case CallableTransformKind::UnitVector:
+            rows = raw_rows;
+            break;
+          case CallableTransformKind::Simplex:
+            rows = raw_rows + 1;
+            break;
+          case CallableTransformKind::SumToZero:
+            rows = raw_rows + 1;
+            if (input_matrix) cols = raw_cols + 1;
+            break;
+          case CallableTransformKind::StochasticColumn:
+            rows = raw_rows + 1;
+            cols = raw_cols;
+            break;
+          case CallableTransformKind::StochasticRow:
+            rows = raw_rows;
+            cols = raw_cols + 1;
+            break;
+          case CallableTransformKind::CholeskyFactorCorr:
+          case CallableTransformKind::CorrMatrix:
+          case CallableTransformKind::CovMatrix:
+            rows = cols = as_int(e.args[1]);
+            break;
+          case CallableTransformKind::CholeskyFactorCov:
+            rows = as_int(e.args[1]);
+            cols = as_int(e.args[2]);
+            break;
+          default:
+            fail(e.name + ": invalid structured transform", e.raw);
+        }
+        tr.batch = (int32_t)batch;
+        tr.inner_raw =
+            input_matrix ? (int32_t)(raw_rows * raw_cols) : (int32_t)raw_rows;
+        tr.out_rows = (int32_t)rows;
+        tr.out_cols = (int32_t)cols;
+        const bool output_matrix = e.unsized.leaf == mir::UnsizedLeaf::Matrix;
+        const int64_t inner_con = output_matrix ? rows * cols : rows;
+        tr.out_len = (int32_t)(batch * inner_con);
+        o.dims.resize(outer_rank);
+        o.dims.push_back(rows);
+        if (output_matrix) o.dims.push_back(cols);
+      }
+      std::vector<T> reg;
+      for (int k = 0; k < tr.n_in; ++k) {
+        tr.in[k] = (int32_t)reg.size();
+        std::vector<T> input =
+            transform.structured && k == 0 && outer_rank > 0
+                ? graph_container_order(a[0].r, a[0].dims, outer_rank)
+                : a[(size_t)k].r;
+        tr.in_len[k] = (int32_t)input.size();
+        reg.insert(reg.end(), input.begin(), input.end());
+      }
+      tr.out = (int32_t)reg.size();
+      reg.resize(reg.size() + (size_t)tr.out_len);
+      tr.jac = (int32_t)reg.size();
+      reg.emplace_back(T(0));
+      run_program_transform(tr, reg.data());
+      o.r.assign(reg.begin() + tr.out, reg.begin() + tr.out + tr.out_len);
+      if (transform.structured && outer_rank > 0)
+        o.r = serialized_container_order(o.r, o.dims, outer_rank);
       return o;
     }
-    // minus and plus are the named spellings of the unary operators, so
-    // they are the same identity and the same negation over the same
-    // shapes. The graph lowering knows them too; teaching only one side is
-    // what let a vectorized log_sum_exp leave elements uninitialized here.
-    if (e.name == "PMinus__" || (e.name == "minus" && e.args.size() == 1))
-      return un([](const T& x) { return -x; });
+    if ((e.name == "PMinus__" || e.name == "minus") && e.args.size() == 1 &&
+        e.type_ == "UInt") {
+      const long x = as_int(e.args[0]);
+      r.is_int = true;
+      r.i = {(int)(-x)};
+      r.r = {T((double)(-x))};
+      return r;
+    }
     if (e.name == "PPlus__" || (e.name == "plus" && e.args.size() == 1))
       return un([](const T& x) { return x; });
-    if (e.name == "exp")
-      return un([](const T& x) { return stan::math::exp(x); });
-    if (e.name == "log")
-      return un([](const T& x) { return stan::math::log(x); });
-    if (e.name == "sqrt")
-      return un([](const T& x) { return stan::math::sqrt(x); });
-    if (e.name == "ceil")
-      return un([](const T& x) { return stan::math::ceil(x); });
-    if (e.name == "square")
-      return un([](const T& x) { return stan::math::square(x); });
-    if (e.name == "inv_logit")
-      return un([](const T& x) { return stan::math::inv_logit(x); });
-    if (e.name == "logit")
-      return un([](const T& x) { return stan::math::logit(x); });
-    if (e.name == "log1m")
-      return un([](const T& x) { return stan::math::log1m(x); });
-    if (e.name == "tanh")
-      return un([](const T& x) { return stan::math::tanh(x); });
-    if (e.name == "cumulative_sum") {
-      Value a = eval(e.args[0]);
-      Value o;
-      o.dims =
-          a.dims.empty() ? std::vector<int64_t>{(int64_t)a.r.size()} : a.dims;
-      T s = T(0.0);
-      for (const T& x : a.r) {
-        s += x;
-        o.r.push_back(s);
-      }
-      return o;
-    }
     if (e.name == "quad_form_diag" && e.args.size() == 2) {
       // diag(v) * M * diag(v): elementwise row and column scaling.
       Value m = eval(e.args[0]);
@@ -1867,146 +2111,6 @@ class MirInterp {
           o.r[(size_t)(j * R + i)] = v.r.at((size_t)i) *
                                      m.r.at((size_t)(j * R + i)) *
                                      v.r.at((size_t)j);
-      return o;
-    }
-    if (e.name == "matrix_exp" && e.args.size() == 1) {
-      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-      Value a = eval(e.args[0]);
-      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
-        fail("matrix_exp: needs a square matrix", e.raw);
-      const int64_t n = a.dims[0];
-      if (n < 0 || (n != 0 && n > std::numeric_limits<int64_t>::max() / n) ||
-          n * n != static_cast<int64_t>(a.r.size()))
-        fail("matrix_exp: matrix shape does not match storage", e.raw);
-      Mat A(n, n);
-      for (int64_t j = 0; j < n; ++j)
-        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r[(size_t)(j * n + i)];
-      const Mat c = stan::math::matrix_exp(A);
-      Value o;
-      o.dims = {n, n};
-      o.r.resize((size_t)(n * n));
-      for (int64_t j = 0; j < n; ++j)
-        for (int64_t i = 0; i < n; ++i) o.r[(size_t)(j * n + i)] = c(i, j);
-      return o;
-    }
-    if ((e.name == "inverse" || e.name == "inverse_spd") &&
-        e.args.size() == 1) {
-      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-      Value a = eval(e.args[0]);
-      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
-        fail(e.name + ": needs a square matrix", e.raw);
-      const int64_t n = a.dims[0];
-      Mat A(n, n);
-      for (int64_t j = 0; j < n; ++j)
-        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r.at((size_t)(j * n + i));
-      const Mat c = e.name == "inverse" ? stan::math::inverse(A)
-                                        : stan::math::inverse_spd(A);
-      Value o;
-      o.dims = {n, n};
-      o.r.resize((size_t)(n * n));
-      for (int64_t j = 0; j < n; ++j)
-        for (int64_t i = 0; i < n; ++i) o.r[(size_t)(j * n + i)] = c(i, j);
-      return o;
-    }
-    if (e.name == "log_determinant" && e.args.size() == 1) {
-      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-      Value a = eval(e.args[0]);
-      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
-        fail("log_determinant: needs a square matrix", e.raw);
-      const int64_t n = a.dims[0];
-      Mat A(n, n);
-      for (int64_t j = 0; j < n; ++j)
-        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r.at((size_t)(j * n + i));
-      r.r = {stan::math::log_determinant(A)};
-      return r;
-    }
-    if (e.name == "quad_form" && e.args.size() == 2) {
-      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-      Value a = eval(e.args[0]);
-      Value b = eval(e.args[1]);
-      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
-        fail("quad_form: needs a square matrix", e.raw);
-      const int64_t n = a.dims[0];
-      Mat A(n, n);
-      for (int64_t j = 0; j < n; ++j)
-        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r.at((size_t)(j * n + i));
-      Value o;
-      if (b.dims.size() != 2) {
-        Eigen::Matrix<T, Eigen::Dynamic, 1> B((Eigen::Index)b.r.size());
-        for (size_t i = 0; i < b.r.size(); ++i) B((Eigen::Index)i) = b.r[i];
-        o.r = {stan::math::quad_form(A, B)};
-        return o;
-      }
-      const int64_t rb = b.dims[0], m = b.dims[1];
-      Mat B(rb, m);
-      for (int64_t j = 0; j < m; ++j)
-        for (int64_t i = 0; i < rb; ++i) B(i, j) = b.r.at((size_t)(j * rb + i));
-      const Mat c = stan::math::quad_form(A, B);
-      o.dims = {m, m};
-      o.r.resize((size_t)(m * m));
-      for (int64_t j = 0; j < m; ++j)
-        for (int64_t i = 0; i < m; ++i) o.r[(size_t)(j * m + i)] = c(i, j);
-      return o;
-    }
-    if (e.name == "add_diag" && e.args.size() == 2) {
-      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-      Value a = eval(e.args[0]);
-      Value d = eval(e.args[1]);
-      if (a.dims.size() != 2) fail("add_diag: needs a matrix", e.raw);
-      const int64_t rows = a.dims[0], cols = a.dims[1];
-      Mat A(rows, cols);
-      for (int64_t j = 0; j < cols; ++j)
-        for (int64_t i = 0; i < rows; ++i)
-          A(i, j) = a.r.at((size_t)(j * rows + i));
-      Mat c;
-      if (d.r.size() == 1 && d.dims.empty()) {
-        c = stan::math::add_diag(A, d.r[0]);
-      } else {
-        Eigen::Matrix<T, Eigen::Dynamic, 1> D((Eigen::Index)d.r.size());
-        for (size_t i = 0; i < d.r.size(); ++i) D((Eigen::Index)i) = d.r[i];
-        c = stan::math::add_diag(A, D);
-      }
-      Value o;
-      o.dims = {rows, cols};
-      o.r.resize((size_t)(rows * cols));
-      for (int64_t j = 0; j < cols; ++j)
-        for (int64_t i = 0; i < rows; ++i)
-          o.r[(size_t)(j * rows + i)] = c(i, j);
-      return o;
-    }
-    if (e.name == "quad_form_sym" && e.args.size() == 2) {
-      // B' A B, symmetrised. Overload resolution on T reaches the same
-      // stan-math call the graph kernel makes -- prim's B.dot(A * B) at
-      // double, quad_form_vari's B' * A * B at var -- so the two paths
-      // group the arithmetic the same way. stan-math checks A for symmetry
-      // and throws the std::domain_error CmdStan would.
-      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-      Value a = eval(e.args[0]);
-      Value b = eval(e.args[1]);
-      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
-        fail("quad_form_sym: needs a square matrix", e.raw);
-      const int64_t n = a.dims[0];
-      Mat A(n, n);
-      for (int64_t j = 0; j < n; ++j)
-        for (int64_t i = 0; i < n; ++i) A(i, j) = a.r.at((size_t)(j * n + i));
-      Value o;
-      if (b.dims.size() != 2) {
-        // A vector goes in as a vector: the one-column matrix would take
-        // Eigen's matrix paths and associate the product differently.
-        Eigen::Matrix<T, Eigen::Dynamic, 1> B((Eigen::Index)b.r.size());
-        for (size_t i = 0; i < b.r.size(); ++i) B((Eigen::Index)i) = b.r[i];
-        o.r = {stan::math::quad_form_sym(A, B)};
-        return o;
-      }
-      const int64_t rb = b.dims[0], m = b.dims[1];
-      Mat B(rb, m);
-      for (int64_t j = 0; j < m; ++j)
-        for (int64_t i = 0; i < rb; ++i) B(i, j) = b.r.at((size_t)(j * rb + i));
-      const Mat c = stan::math::quad_form_sym(A, B);
-      o.dims = {m, m};
-      o.r.resize((size_t)(m * m));
-      for (int64_t j = 0; j < m; ++j)
-        for (int64_t i = 0; i < m; ++i) o.r[(size_t)(j * m + i)] = c(i, j);
       return o;
     }
     if (e.name == "gp_exp_quad_cov" && e.args.size() == 3) {
@@ -2034,46 +2138,36 @@ class MirInterp {
         }
       return o;
     }
-    if (e.name == "fabs")
-      return un([](const T& x) { return stan::math::fabs(x); });
-    if (e.name == "mean") {
-      Value a = eval(e.args[0]);
-      T m = T(0.0);
-      for (const T& v : a.r) m += v;
-      r.r = {m / (double)a.r.size()};
-      return r;
+    if (const std::optional<GpCov> gp = gp_cov_family(e.name);
+        gp && e.args.size() == 3) {
+      Value x = eval(e.args[0]);
+      const T sigma = eval(e.args[1]).r.at(0);
+      const T length_scale = eval(e.args[2]).r.at(0);
+      const int64_t N = x.dims.size() == 2 ? x.dims[0] : (int64_t)x.r.size();
+      const int64_t D = x.dims.size() == 2 ? x.dims[1] : 1;
+      using Vec = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+      std::vector<Vec> pts((size_t)N, Vec((Eigen::Index)D));
+      for (int64_t n = 0; n < N; ++n)
+        for (int64_t d = 0; d < D; ++d)
+          pts[(size_t)n]((Eigen::Index)d) = x.r.at((size_t)(n + N * d));
+      Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> c;
+      if (*gp == kGpMatern32)
+        c = stan::math::gp_matern32_cov(pts, sigma, length_scale);
+      else if (*gp == kGpMatern52)
+        c = stan::math::gp_matern52_cov(pts, sigma, length_scale);
+      else
+        c = stan::math::gp_exponential_cov(pts, sigma, length_scale);
+      Value o;
+      o.dims = {N, N};
+      o.r.resize((size_t)(N * N));
+      for (int64_t j = 0; j < N; ++j)
+        for (int64_t i = 0; i < N; ++i) o.r[(size_t)(j * N + i)] = c(i, j);
+      return o;
     }
-    if (e.name == "sd") {
-      Value a = eval(e.args[0]);
-      if (a.r.empty()) fail("sd: input must have a positive size", e.raw);
-      if (a.r.size() == 1) {
-        r.r = {T(0.0)};
-        return r;
-      }
-      T m = T(0.0);
-      for (const T& v : a.r) m += v;
-      m /= (double)a.r.size();
-      T s2 = T(0.0);
-      for (const T& v : a.r) s2 += (v - m) * (v - m);
-      r.r = {stan::math::sqrt(s2 / (double)(a.r.size() - 1))};
-      return r;
-    }
-    if (e.name == "variance") {
-      Value a = eval(e.args[0]);
-      if (a.r.empty()) fail("variance: input must have a positive size", e.raw);
-      if (a.r.size() == 1) {
-        r.r = {T(0.0)};
-        return r;
-      }
-      T m = T(0.0);
-      for (const T& v : a.r) m += v;
-      m /= (double)a.r.size();
-      T s2 = T(0.0);
-      for (const T& v : a.r) s2 += (v - m) * (v - m);
-      r.r = {s2 / (double)(a.r.size() - 1)};
-      return r;
-    }
-    if (e.name == "sum") {
+    // Integer sums keep their int mirror for downstream size and index use;
+    // real sums, like mean/sd/variance and the unary log_sum_exp reduction,
+    // ride the registered reduction kernel through the shared CALL bridge.
+    if (e.name == "sum" && e.args.size() == 1) {
       Value a = eval(e.args[0]);
       if (a.is_int && a.i.size() == a.r.size()) {
         int total = 0;
@@ -2081,135 +2175,79 @@ class MirInterp {
         r.is_int = true;
         r.i = {total};
         r.r = {T((double)total)};
-      } else {
-        T total = T(0.0);
-        for (const T& x : a.r) total += x;
-        r.r = {total};
+        return r;
       }
-      return r;
+      const BuiltinSpec* reduction = reduction_builtin_spec(e.name, 1);
+      if (reduction == nullptr)
+        fail("sum: missing reduction descriptor", e.raw);
+      std::vector<Value> values;
+      values.push_back(std::move(a));
+      return builtin_kernel_eval(e, *reduction, std::move(values));
     }
-    // The matrix slice family, all on col-major storage.
-    if (e.name == "sub_col" && e.args.size() == 4) {
-      Value m = eval(e.args[0]);
-      if (m.dims.size() != 2) fail("sub_col: needs a matrix", e.raw);
-      const long i = as_int(e.args[1]), j = as_int(e.args[2]),
-                 n = as_int(e.args[3]);
-      const int64_t R = m.dims[0];
-      r.dims = {n};
-      for (long k = 0; k < n; ++k)
-        r.r.push_back(m.r.at((size_t)((j - 1) * R + (i - 1) + k)));
-      return r;
-    }
-    if (e.name == "block" && e.args.size() == 5) {
-      Value m = eval(e.args[0]);
-      if (m.dims.size() != 2) fail("block: needs a matrix", e.raw);
-      const long i = as_int(e.args[1]), j = as_int(e.args[2]),
-                 nr = as_int(e.args[3]), nc = as_int(e.args[4]);
-      const int64_t R = m.dims[0];
-      check_block_shape(R, m.dims[1], i, j, nr, nc);
-      r.dims = {nr, nc};
-      r.r.reserve((size_t)(nr * nc));
-      // Source and result are both column-major, so filling the result in
-      // storage order walks one source column at a time, R apart.
-      for (long c = 0; c < nc; ++c)
-        for (long k = 0; k < nr; ++k)
-          r.r.push_back(m.r.at((size_t)((j - 1 + c) * R + (i - 1 + k))));
-      return r;
-    }
-    if (e.name == "col" && e.args.size() == 2) {
-      Value m = eval(e.args[0]);
-      if (m.dims.size() != 2) fail("col: needs a matrix", e.raw);
-      const long j = as_int(e.args[1]);
-      const int64_t R = m.dims[0];
-      r.dims = {R};
-      r.r.assign(m.r.begin() + (j - 1) * R, m.r.begin() + j * R);
-      return r;
-    }
-    if (e.name == "row" && e.args.size() == 2) {
-      Value m = eval(e.args[0]);
-      if (m.dims.size() != 2) fail("row: needs a matrix", e.raw);
-      const long i = as_int(e.args[1]);
-      const int64_t R = m.dims[0], C = m.dims[1];
-      r.dims = {C};
-      for (int64_t j = 0; j < C; ++j)
-        r.r.push_back(m.r.at((size_t)(j * R + (i - 1))));
-      return r;
-    }
-    if (e.name == "segment" && e.args.size() == 3) {
+    // Registered slice/view selections: the shared resolver maps result
+    // cells to source cells over this interpreter's first-index-fast
+    // storage, with Stan Math's own index checks (out_of_range and
+    // domain_error propagate as CmdStan's rejections). Copying a `var` lane
+    // shares its node, so adjoints accumulate on the source exactly as the
+    // graph's slice kernels scatter-add.
+    if (const BuiltinSpec* slice = shaped_builtin_spec(
+            e.name, e.args.size(), BuiltinShapePolicy::SliceView)) {
       Value a = eval(e.args[0]);
-      const long from = as_int(e.args[1]), cnt = as_int(e.args[2]);
-      r.is_int = a.is_int;
-      r.dims = {cnt};
-      for (long k = 0; k < cnt; ++k) {
-        r.r.push_back(a.r.at((size_t)(from - 1 + k)));
-        if (a.is_int) r.i.push_back(a.i.at((size_t)(from - 1 + k)));
-      }
-      return r;
-    }
-    if ((e.name == "head" || e.name == "tail") && e.args.size() == 2) {
-      Value a = eval(e.args[0]);
-      const long n = as_int(e.args[1]);
-      const long off = e.name == "head" ? 0 : (long)a.r.size() - n;
-      r.is_int = a.is_int;
-      r.dims = {n};
-      for (long k = 0; k < n; ++k) {
-        r.r.push_back(a.r.at((size_t)(off + k)));
-        if (a.is_int) r.i.push_back(a.i.at((size_t)(off + k)));
-      }
-      return r;
-    }
-    if (e.name == "reverse" && e.args.size() == 1) {
-      Value a = eval(e.args[0]);
-      r = a;
-      const auto reverse_outer = [&](auto* values) {
-        // Vectors and row-vectors have one logical axis and one flat buffer.
-        // Arrays use DataMap's first-index-fast storage, so reversing an
-        // array means reversing dimension zero once for every suffix lane,
-        // not reversing the complete buffer (which would also reverse each
-        // container-valued element).
-        if (e.args[0].unsized.depth == 0) {
-          std::reverse(values->begin(), values->end());
-          return;
+      Value b;
+      BuiltinSliceMap map;
+      try {
+        if (builtin_slice_is_append(slice->slice)) {
+          // Appends map result cells over both operands' concatenated
+          // storage; a source cell at or past the left run reads the right.
+          b = eval(e.args[1]);
+          map =
+              builtin_append_map(*slice, function_argument_shape(e.args[0], a),
+                                 function_argument_shape(e.args[1], b),
+                                 SliceStorageOrder::FirstIndexFast);
+        } else {
+          std::vector<int64_t> indexes;
+          indexes.reserve(e.args.size() - 1);
+          for (size_t k = 1; k < e.args.size(); ++k)
+            indexes.push_back(as_int(e.args[k]));
+          map = builtin_slice_map(*slice, function_argument_shape(e.args[0], a),
+                                  indexes, SliceStorageOrder::FirstIndexFast);
         }
-        if (a.dims.empty()) fail("reverse: array has no dimensions", e.raw);
-        const int64_t outer = a.dims.front();
-        if (outer < 0 || (outer != 0 && values->size() % (size_t)outer != 0))
-          fail("reverse: array shape does not match storage", e.raw);
-        if (outer == 0) return;
-        for (size_t offset = 0; offset < values->size();
-             offset += (size_t)outer)
-          std::reverse(values->begin() + offset,
-                       values->begin() + offset + outer);
-      };
-      reverse_outer(&r.r);
-      if (r.is_int) reverse_outer(&r.i);
-      return r;
-    }
-    // squared_distance is dot_self of the difference, which is how the
-    // graph lowers it too (lower.cpp); the two spellings agreeing keeps
-    // transformed data and the log density on the same summation order.
-    // A vector may be paired with a row_vector, and neither view carries
-    // anything but a length, so there is nothing to reorder. No
-    // broadcasting: the language has no scalar-against-container overload.
-    if (e.name == "squared_distance" && e.args.size() == 2) {
-      Value a = eval(e.args[0]), b = eval(e.args[1]);
-      if (a.r.size() != b.r.size())
-        fail("squared_distance: length mismatch", e.raw);
-      T s = T(0.0);
-      for (size_t i = 0; i < a.r.size(); ++i) {
-        const T d = a.r[i] - b.r[i];
-        s += d * d;
+      } catch (const std::invalid_argument& error) {
+        fail(e.name + ": " + error.what(), e.raw);
       }
-      r.r = {s};
-      return r;
-    }
-    if ((e.name == "dot_product" || e.name == "dot_self")) {
-      Value a = eval(e.args[0]);
-      Value b = e.name == "dot_self" ? a : eval(e.args[1]);
-      if (a.r.size() != b.r.size()) fail("dot_product: length mismatch", e.raw);
-      T s = T(0.0);
-      for (size_t i = 0; i < a.r.size(); ++i) s += a.r[i] * b.r[i];
-      r.r = {s};
+      const bool integer = a.is_int &&
+                           map.result.value == FunctionArgumentKind::Integer &&
+                           (!builtin_slice_is_append(slice->slice) || b.is_int);
+      const int64_t split = (int64_t)a.r.size();
+      r.dims = map.result.dimensions;
+      r.is_int = integer;
+      r.r.reserve((size_t)map.count);
+      if (integer) r.i.reserve((size_t)map.count);
+      const auto emit_cell = [&](int64_t cell) {
+        const Value& source = cell < split ? a : b;
+        const size_t index = (size_t)(cell < split ? cell : cell - split);
+        r.r.push_back(source.r.at(index));
+        if (integer) r.i.push_back(source.i.at(index));
+      };
+      switch (map.kind) {
+        case BuiltinSliceMap::Kind::Contiguous:
+          for (int64_t k = 0; k < map.count; ++k) emit_cell(map.offset + k);
+          break;
+        case BuiltinSliceMap::Kind::Strided:
+          for (int64_t k = 0; k < map.count; ++k)
+            emit_cell(map.offset + k * map.stride);
+          break;
+        case BuiltinSliceMap::Kind::Transpose: {
+          const int64_t rows = map.result.dimensions[0];
+          const int64_t columns = map.result.dimensions[1];
+          for (int64_t k = 0; k < map.count; ++k)
+            emit_cell(k / rows + columns * (k % rows));
+          break;
+        }
+        case BuiltinSliceMap::Kind::Gather:
+          for (const int64_t source : map.gather) emit_cell(source);
+          break;
+      }
       return r;
     }
     if (e.name == "tcrossprod" && e.args.size() == 1) {
@@ -2225,86 +2263,6 @@ class MirInterp {
             r.r[(size_t)(j * rows + i)] += a.r.at((size_t)(k * rows + i)) * rhs;
         }
       return r;
-    }
-    if ((e.name == "crossprod" ||
-         e.name == "multiply_lower_tri_self_transpose") &&
-        e.args.size() == 1) {
-      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-      Value a = eval(e.args[0]);
-      if (a.dims.size() != 2) fail(e.name + ": needs a matrix", e.raw);
-      const int64_t rows = a.dims[0], cols = a.dims[1];
-      if (rows < 0 || cols < 0 ||
-          (rows != 0 && cols > std::numeric_limits<int64_t>::max() / rows) ||
-          rows * cols != static_cast<int64_t>(a.r.size()))
-        fail(e.name + ": matrix shape does not match storage", e.raw);
-      Mat matrix(rows, cols);
-      for (int64_t j = 0; j < cols; ++j)
-        for (int64_t i = 0; i < rows; ++i)
-          matrix(i, j) = a.r[(size_t)(j * rows + i)];
-      // crossprod is A' A (cols x cols); multiply_lower_tri_self_transpose
-      // takes the lower triangle of A and forms L L' (rows x rows).
-      const Mat product =
-          e.name == "crossprod"
-              ? Mat(stan::math::crossprod(matrix))
-              : Mat(stan::math::multiply_lower_tri_self_transpose(matrix));
-      const int64_t out = e.name == "crossprod" ? cols : rows;
-      r.dims = {out, out};
-      r.r.resize((size_t)(out * out));
-      for (int64_t j = 0; j < out; ++j)
-        for (int64_t i = 0; i < out; ++i)
-          r.r[(size_t)(j * out + i)] = product(i, j);
-      return r;
-    }
-    if (e.name == "diag_matrix" && e.args.size() == 1) {
-      Value diagonal = eval(e.args[0]);
-      const int64_t n = (int64_t)diagonal.r.size();
-      r.dims = {n, n};
-      r.r.assign((size_t)(n * n), T(0.0));
-      for (int64_t i = 0; i < n; ++i)
-        r.r[(size_t)(i * n + i)] = diagonal.r[(size_t)i];
-      return r;
-    }
-    if (e.name == "diagonal") {
-      if (e.args.size() != 1)
-        fail("diagonal: needs exactly one argument", e.raw);
-      Value matrix = eval(e.args[0]);
-      if (matrix.dims.size() != 2) fail("diagonal: needs a matrix", e.raw);
-      const int64_t rows = matrix.dims[0], cols = matrix.dims[1];
-      const int64_t n = std::min(rows, cols);
-      const int64_t stride = rows + 1;
-      r.dims = {n};
-      r.r.reserve((size_t)n);
-      for (int64_t i = 0; i < n; ++i)
-        r.r.push_back(matrix.r.at((size_t)(i * stride)));
-      return r;
-    }
-    if (e.name == "cholesky_decompose" && e.args.size() == 1) {
-      // Standard column-oriented Cholesky on the templated scalar.
-      Value a = eval(e.args[0]);
-      if (a.dims.size() != 2 || a.dims[0] != a.dims[1])
-        fail("cholesky_decompose: needs a square matrix", e.raw);
-      const int64_t K = a.dims[0];
-      Value o;
-      o.dims = {K, K};
-      o.r.assign((size_t)(K * K), T(0.0));
-      for (int64_t j = 0; j < K; ++j) {
-        T d = a.r.at((size_t)(j * K + j));
-        for (int64_t k = 0; k < j; ++k) {
-          const T& l = o.r[(size_t)(k * K + j)];
-          d -= l * l;
-        }
-        if (!(val(d) > 0.0))
-          fail("cholesky_decompose: matrix is not positive definite", e.raw);
-        const T dj = stan::math::sqrt(d);
-        o.r[(size_t)(j * K + j)] = dj;
-        for (int64_t i = j + 1; i < K; ++i) {
-          T s = a.r.at((size_t)(j * K + i));
-          for (int64_t k = 0; k < j; ++k)
-            s -= o.r[(size_t)(k * K + i)] * o.r[(size_t)(k * K + j)];
-          o.r[(size_t)(j * K + i)] = s / dj;
-        }
-      }
-      return o;
     }
     if (e.name == "prod") {
       Value a = eval(e.args[0]);
@@ -2353,68 +2311,6 @@ class MirInterp {
           input.unaryExpr(Eigen::internal::core_cast_op<T, T>()))};
       return r;
     }
-    if ((e.name == "columns_dot_product" || e.name == "rows_dot_product") &&
-        e.args.size() == 2) {
-      Value a = eval(e.args[0]), b = eval(e.args[1]);
-      if (a.dims.size() != 2 || a.dims != b.dims || a.r.size() != b.r.size())
-        fail(e.name + ": arguments must be matrices of the same size", e.raw);
-      const int64_t rows = a.dims[0], cols = a.dims[1];
-      const bool by_columns = e.name == "columns_dot_product";
-      const int64_t groups = by_columns ? cols : rows;
-      const int64_t width = by_columns ? rows : cols;
-      r.dims = {groups};
-      r.r.assign((size_t)groups, T(0.0));
-      for (int64_t group = 0; group < groups; ++group)
-        for (int64_t k = 0; k < width; ++k) {
-          const int64_t at = by_columns ? group * rows + k : k * rows + group;
-          r.r[(size_t)group] += a.r.at((size_t)at) * b.r.at((size_t)at);
-        }
-      return r;
-    }
-    if ((e.name == "columns_dot_self" || e.name == "rows_dot_self") &&
-        e.args.size() == 1) {
-      Value a = eval(e.args[0]);
-      if (a.dims.size() != 2)
-        fail(e.name + ": argument must be a matrix", e.raw);
-      const int64_t rows = a.dims[0], cols = a.dims[1];
-      const bool by_columns = e.name == "columns_dot_self";
-      const int64_t groups = by_columns ? cols : rows;
-      const int64_t width = by_columns ? rows : cols;
-      r.dims = {groups};
-      r.r.assign((size_t)groups, T(0.0));
-      for (int64_t group = 0; group < groups; ++group)
-        for (int64_t k = 0; k < width; ++k) {
-          const int64_t at = by_columns ? group * rows + k : k * rows + group;
-          r.r[(size_t)group] += a.r.at((size_t)at) * a.r.at((size_t)at);
-        }
-      return r;
-    }
-    // Two arguments is the elementwise form, which Stan vectorizes over
-    // every container shape with scalar broadcast, so it belongs with the
-    // binaries above; only one-argument log_sum_exp is a reduction, and
-    // log_diff_exp has no reduction form at all.
-    if (e.name == "log_sum_exp" && e.args.size() == 2)
-      return bin(
-          [](const T& x, const T& y) { return stan::math::log_sum_exp(x, y); });
-    if (e.name == "log_diff_exp" && e.args.size() == 2)
-      return bin([](const T& x, const T& y) {
-        return stan::math::log_diff_exp(x, y);
-      });
-    if (e.name == "log_sum_exp") {
-      Value a = eval(e.args[0]);
-      r.r = {lse(a.r)};
-      return r;
-    }
-    if (e.name == "softmax" || e.name == "log_softmax") {
-      Value a = eval(e.args[0]);
-      const T m = lse(a.r);
-      Value o;
-      o.dims =
-          a.dims.empty() ? std::vector<int64_t>{(int64_t)a.r.size()} : a.dims;
-      for (const T& x : a.r)
-        o.r.push_back(e.name == "softmax" ? stan::math::exp(x - m) : x - m);
-      return o;
-    }
     if ((e.name == "diag_pre_multiply" || e.name == "diag_post_multiply") &&
         e.args.size() == 2) {
       const bool pre = e.name.find("_pre_") != std::string::npos;
@@ -2431,96 +2327,23 @@ class MirInterp {
               m.r.at((size_t)(j * R + i)) * v.r.at((size_t)(pre ? i : j));
       return o;
     }
-    if (e.name == "rep_vector" || e.name == "rep_row_vector") {
-      Value a = eval(e.args[0]);
-      const long n = as_int(e.args[1]);
-      r.r.assign(n, a.r.at(0));
-      r.dims = {n};
-      return r;
-    }
-    // The zeros_*/ones_* constructors are rep_vector with a fixed fill.
-    // Only zeros_int_array carries integer provenance; ones_array is real.
-    if ((e.name == "zeros_vector" || e.name == "zeros_row_vector" ||
-         e.name == "ones_vector" || e.name == "ones_row_vector" ||
-         e.name == "zeros_int_array" || e.name == "ones_array") &&
-        e.args.size() == 1) {
-      const long n = as_int(e.args[0]);
-      const bool is_ones = e.name.rfind("ones", 0) == 0;
-      (void)checked_container_size({n}, e.name);
-      r.r.assign(n, T(is_ones ? 1.0 : 0.0));
-      r.dims = {n};
-      if (e.name == "zeros_int_array") {
-        r.is_int = true;
-        r.i.assign(n, is_ones ? 1 : 0);
-      }
-      return r;
-    }
-    if (e.name == "identity_matrix" && e.args.size() == 1) {
-      const long n = as_int(e.args[0]);
-      r.r.assign((size_t)checked_container_size({n, n}, e.name), T(0.0));
-      for (long k = 0; k < n; ++k) r.r[(size_t)(k * n + k)] = T(1.0);
-      r.dims = {n, n};
-      return r;
-    }
-    // The linspaced_* family is data-only -- stanc's signatures reject
-    // AutoDiffable bounds -- so every use is a constant the interpreter can
-    // fold, and no graph opcode is needed. Delegate to stan-math instead of
-    // open-coding the spacing: the integer overload inherits Eigen's rule
-    // that `high` is lowered until the range divides evenly, which is easy
-    // to reproduce subtly wrong, and each overload names itself in the
-    // domain errors CmdStan reports for a negative size or high < low.
-    if (e.name == "linspaced_int_array" && e.args.size() == 3) {
-      const std::vector<int> values = stan::math::linspaced_int_array(
-          (int)as_int(e.args[0]), (int)as_int(e.args[1]),
-          (int)as_int(e.args[2]));
-      r.is_int = true;
-      r.dims = {(int64_t)values.size()};
-      r.i.assign(values.begin(), values.end());
-      r.r.reserve(values.size());
-      for (const int x : values) r.r.push_back(T((double)x));
-      return r;
-    }
-    if ((e.name == "linspaced_array" || e.name == "linspaced_vector" ||
-         e.name == "linspaced_row_vector") &&
-        e.args.size() == 3) {
-      const int n = (int)as_int(e.args[0]);
-      const double lo = val(eval(e.args[1]).r.at(0));
-      const double hi = val(eval(e.args[2]).r.at(0));
-      const auto emit = [&](const auto& values) {
-        const int64_t len = (int64_t)values.size();
-        r.dims = {len};
-        r.r.reserve((size_t)len);
-        for (int64_t k = 0; k < len; ++k) r.r.push_back(T(values[k]));
-      };
-      if (e.name == "linspaced_array") {
-        emit(stan::math::linspaced_array(n, lo, hi));
-      } else if (e.name == "linspaced_vector") {
-        emit(Eigen::VectorXd(stan::math::linspaced_vector(n, lo, hi)));
-      } else {
-        emit(Eigen::RowVectorXd(stan::math::linspaced_row_vector(n, lo, hi)));
-      }
-      return r;
-    }
-    if (e.name == "Equals__")
-      return cmp([](double x, double y) { return x == y; });
-    if (e.name == "NEquals__")
-      return cmp([](double x, double y) { return x != y; });
-    if (e.name == "Greater__")
-      return cmp([](double x, double y) { return x > y; });
-    if (e.name == "Geq__")
-      return cmp([](double x, double y) { return x >= y; });
-    if (e.name == "Less__")
-      return cmp([](double x, double y) { return x < y; });
-    if (e.name == "Leq__")
-      return cmp([](double x, double y) { return x <= y; });
-    if (e.name == "PNot__" || e.name == "logical_negation")
-      return un([](const T& x) { return T(val(x) == 0.0 ? 1.0 : 0.0); });
-    if (e.name == "is_nan" || e.name == "is_inf") {
+    // Registered predicates: the shared evaluator answers the operator
+    // spellings and their logical_* library names identically. Comparisons
+    // keep cmp's broadcasting and int-scalar rules; negation maps
+    // elementwise as before; the IEEE classifications stay scalar.
+    if (const BuiltinSpec* pred = shaped_builtin_spec(
+            e.name, e.args.size(), BuiltinShapePolicy::Predicate)) {
+      if (pred->arity == 2)
+        return cmp([pred](double x, double y) {
+          return evaluate_predicate_builtin(*pred, x, y) != 0;
+        });
+      if (pred->predicate == BuiltinPredicate::Negation)
+        return un([pred](const T& x) {
+          return T((double)evaluate_predicate_builtin(*pred, val(x)));
+        });
       Value a = eval(e.args[0]);
       if (a.r.size() != 1) fail(e.name + ": needs a scalar", e.raw);
-      const double value = val(a.r[0]);
-      const int answer =
-          e.name == "is_nan" ? std::isnan(value) : std::isinf(value);
+      const int answer = evaluate_predicate_builtin(*pred, val(a.r[0]));
       r.is_int = true;
       r.i = {answer};
       r.r = {T((double)answer)};
@@ -2666,7 +2489,11 @@ class MirInterp {
       std::vector<int64_t> elem_dims;  // shape of one element, once known
       for (const auto& a : e.args) {
         Value v2 = eval(a);
-        if (v2.r.size() > 1 || rows_mode) {
+        // Container identity is independent of storage width. In particular,
+        // nested singleton arrays and length-one Eigen leaves still add a
+        // logical axis; treating them as scalars collapses the dimensions
+        // later consumed by graph and register-program lowering.
+        if (!is_scalar(v2) || rows_mode) {
           // Row-vector elements: build a matrix, row-major.
           rows_mode = true;
           row_len = (int64_t)v2.r.size();
@@ -2726,131 +2553,47 @@ class MirInterp {
       }
       return o;
     }
-    if (e.name == "Transpose__" || e.name == "transpose") {
+    // Registered shape queries answer through the shared resolver, with
+    // vector orientation from the MIR type -- the same source the graph
+    // reads, so the two paths cannot drift. FnLength stays outside the
+    // registry: the compiler internal stanc3 emits for the observation
+    // count in a vectorized `T[,]` normalizer spells stan::math::size,
+    // which counts every element, so it answers as num_elements does
+    // rather than as size does.
+    if (const BuiltinSpec* query =
+            e.args.size() == 1
+                ? shaped_builtin_spec(e.name, 1, BuiltinShapePolicy::ShapeQuery)
+                : nullptr) {
       Value a = eval(e.args[0]);
-      if (a.dims.size() < 2) return a;  // vector transpose: same storage
-      Value o;
-      o.dims = {a.dims[1], a.dims[0]};
-      o.r.resize(a.r.size());
-      // col-major: o(j,i) = a(i,j)
-      for (int64_t i = 0; i < a.dims[0]; ++i)
-        for (int64_t j = 0; j < a.dims[1]; ++j)
-          o.r[i * a.dims[1] + j] = a.r[j * a.dims[0] + i];
-      return o;
-    }
-    if (e.name == "to_vector" || e.name == "to_row_vector") {
-      Value a = eval(e.args[0]);
-      a.dims = {(int64_t)a.r.size()};
-      a.is_int = false;
-      return a;
-    }
-    if (e.name == "to_matrix" && (e.args.size() == 1 || e.args.size() == 3)) {
-      Value a = eval(e.args[0]);
-      a.is_int = false;
-      a.i.clear();
-      // First-index-fast array storage is already column-major over the
-      // resulting matrix axes. Unlike the graph's outer-major arrays, this
-      // interpreter must not transpose it. Stan Math infers zero columns
-      // when the outer array is empty, regardless of its declared suffix.
-      const bool from_2d_array =
-          e.args.size() == 1 && a.dims.size() == 2 && e.args[0].unsized.depth;
-      if (from_2d_array) {
-        if (a.dims[0] == 0) a.dims[1] = 0;
-        return a;
+      if (a.is_int && a.r.size() != a.i.size()) {
+        // Integer values may carry only the int mirror; the shape helper
+        // reads storage off the real side.
+        a.r.clear();
+        a.r.reserve(a.i.size());
+        for (int value : a.i) a.r.push_back(T((double)value));
       }
-      if (e.args.size() == 3) {
-        const int64_t rows = as_int(e.args[1]), cols = as_int(e.args[2]);
-        if (checked_container_size({rows, cols}, e.name) != (int64_t)a.r.size())
-          fail("to_matrix: requested shape does not match source length",
-               e.raw);
-        a.dims = {rows, cols};
-      } else if (a.dims.size() == 2) {
-        // to_matrix(matrix) is the identity.
-      } else if (e.args[0].unsized.leaf == mir::UnsizedLeaf::RowVector) {
-        a.dims = {1, (int64_t)a.r.size()};
-      } else {
-        a.dims = {(int64_t)a.r.size(), 1};
+      std::vector<int64_t> answer;
+      try {
+        answer =
+            builtin_shape_query(*query, function_argument_shape(e.args[0], a));
+      } catch (const std::invalid_argument& error) {
+        fail(e.name + ": " + error.what(), e.raw);
       }
-      return a;
+      r.is_int = true;
+      if (query->shape_query == BuiltinShapeQueryKind::Dims)
+        r.dims = {(int64_t)answer.size()};
+      for (int64_t v : answer) {
+        r.i.push_back((int)v);
+        r.r.push_back(T((double)v));
+      }
+      return r;
     }
-    if (e.name == "to_array_1d") {
-      // Flattening is the identity on this storage.
+    if (e.name == "FnLength" && e.args.size() == 1) {
       Value a = eval(e.args[0]);
-      a.dims = {(int64_t)std::max(a.r.size(), a.i.size())};
-      return a;
-    }
-    // FnLength is the compiler-internal stanc3 emits for the observation
-    // count in a vectorized `T[,]` normalizer. Its backend spelling is
-    // stan::math::size, which counts every element, so it answers as
-    // num_elements does rather than as size does.
-    if (e.name == "rows" || e.name == "cols" || e.name == "size" ||
-        e.name == "num_elements" || e.name == "FnLength") {
-      Value a = eval(e.args[0]);
-      long v = 0;
-      if (e.name == "rows" || e.name == "cols") {
-        // A vector's orientation is type-level, not storage-level: both
-        // kinds are stored rank-1, so dims cannot say which way one points.
-        // The MIR type can, and it is where the graph keeps orientation too
-        // -- lower.cpp stamps ViewKind::RowVector from this same string and
-        // its logical_dims answers {1, len} off the view, never off dims.
-        // This restates that function, so the two paths cannot drift.
-        // Reading rows() off the storage rank alone made every row_vector an
-        // n-by-1 column, and through a transformed-data `int r = rows(rv)`
-        // that is a silently wrong log density.
-        const long n = (long)a.r.size();
-        std::pair<long, long> rc =
-            a.dims.size() == 2
-                ? std::pair<long, long>{(long)a.dims[0], (long)a.dims[1]}
-                : std::pair<long, long>{n, 1};
-        if (e.args[0].type_ == "URowVector")
-          rc = {1, n};
-        else if (e.args[0].type_ == "UVector")
-          rc = {n, 1};
-        v = e.name == "rows" ? rc.first : rc.second;
-      } else
-        v = a.dims.empty() ? (long)std::max(a.r.size(), a.i.size())
-                           : (long)a.dims[0];
-      if (e.name == "num_elements" || e.name == "FnLength")
-        v = (long)std::max(a.r.size(), a.i.size());
+      const long v = (long)std::max(a.r.size(), a.i.size());
       r.is_int = true;
       r.i = {(int)v};
       r.r = {T((double)v)};
-      return r;
-    }
-    if (e.name == "dims" && e.args.size() == 1) {
-      Value a = eval(e.args[0]);
-      r.is_int = true;
-      std::vector<int64_t> ds = a.dims;
-      if (ds.empty()) ds = {(int64_t)std::max(a.r.size(), a.i.size())};
-      r.dims = {(int64_t)ds.size()};
-      for (int64_t d : ds) {
-        r.i.push_back((int)d);
-        r.r.push_back(T((double)d));
-      }
-      return r;
-    }
-    if (e.name == "pi" && e.args.empty()) {
-      r.r = {T(stan::math::pi())};
-      return r;
-    }
-    if (e.name == "e" && e.args.empty()) {
-      r.r = {T(stan::math::e())};
-      return r;
-    }
-    if (e.name == "machine_precision" && e.args.empty()) {
-      r.r = {T(std::numeric_limits<double>::epsilon())};
-      return r;
-    }
-    if (e.name == "negative_infinity") {
-      r.r = {T(-std::numeric_limits<double>::infinity())};
-      return r;
-    }
-    if (e.name == "positive_infinity") {
-      r.r = {T(std::numeric_limits<double>::infinity())};
-      return r;
-    }
-    if (e.name == "not_a_number") {
-      r.r = {T(std::numeric_limits<double>::quiet_NaN())};
       return r;
     }
     if (e.name == "student_t_lccdf" && e.args.size() == 4) {
@@ -2870,7 +2613,7 @@ class MirInterp {
     // same ordered pullback without selecting a second implementation. Keep
     // `x`, `y`, and the callback's `seed` visible to that shared expression.
 #define STANLI_INTERP_UNARY(code, ufn, VAL, DELTA, TOPOLOGY)              \
-  if (e.name == #ufn && e.args.size() == 1) {                             \
+  if (builtin != nullptr && builtin->opcode == code) {                    \
     return un([](const T& arg) {                                          \
       const double x = val(arg);                                          \
       const double y = VAL;                                               \
@@ -2890,253 +2633,79 @@ class MirInterp {
     STANLI_SCALAR_UNARY_LIST(STANLI_INTERP_UNARY)
 #undef STANLI_INTERP_UNARY
 
-    // The two unaries the shared list cannot generate. std_normal_qf is
-    // stanc3's alias for inv_Phi (Lower_expr.ml maps it onto
-    // stan::math::inv_Phi), and trigamma's derivative is the derivative of
-    // AS121's recurrence rather than a formula, so both take Math's own
-    // overload: on doubles that is the prim call, on var it is the tape the
-    // graph kernel replays.
-    if (e.name == "std_normal_qf" && e.args.size() == 1)
-      return un([](const T& x) { return stan::math::inv_Phi(x); });
-    if (e.name == "trigamma" && e.args.size() == 1)
-      return un([](const T& x) { return stan::math::trigamma(x); });
-
-    // Categorical arguments are containers as a whole, not elementwise
-    // broadcasts. Preserve scalar-vs-array outcome overloads and the
-    // caller's propto instantiation exactly as the graph kernel does.
-    if ((e.name == "categorical_lpmf" || e.name == "categorical_logit_lpmf") &&
-        e.args.size() == 2) {
-      Value outcome = eval(e.args[0]);
-      Value value = eval(e.args[1]);
-      std::vector<int> outcomes = outcome.i;
-      if (outcomes.empty() && !outcome.r.empty()) {
-        outcomes.reserve(outcome.r.size());
-        for (const T& x : outcome.r) {
-          const double v = val(x);
-          if (!std::isfinite(v) || std::trunc(v) != v ||
-              v < std::numeric_limits<int>::min() ||
-              v > std::numeric_limits<int>::max())
-            fail("malformed integer categorical outcome", e.raw);
-          outcomes.push_back(static_cast<int>(v));
-        }
+    // Every remaining registered real-result builtin executes through its
+    // graph kernel: a registry entry plus a kernel is complete interpreter
+    // support for a new function, with no branch here. The named branches
+    // above are only allocation-free fast paths for the hot operators and
+    // unaries; integer results were answered by the shared integer
+    // evaluators earlier. Policy-shaped builtins resolve by name and arity
+    // so that hand-built MIR without numeric metadata still dispatches.
+    if (const BuiltinSpec* ctor = shaped_builtin_spec(
+            e.name, e.args.size(), BuiltinShapePolicy::Constructor))
+      return constructor_eval(e, *ctor);
+    if (const BuiltinSpec* paired = shaped_builtin_spec(
+            e.name, e.args.size(), BuiltinShapePolicy::PairedReduction))
+      return paired_reduction_eval(e, *paired);
+    if (const BuiltinSpec* grouped = shaped_builtin_spec(
+            e.name, e.args.size(), BuiltinShapePolicy::GroupedReduction))
+      return grouped_dot_eval(e, *grouped);
+    if (const BuiltinSpec* matrix = shaped_builtin_spec(
+            e.name, e.args.size(), BuiltinShapePolicy::MatrixOp))
+      return matrix_op_eval(e, *matrix);
+    // An RNG descriptor never reaches the pure-kernel bridge: draws carry
+    // stream state the host hook owns, and outside a hook-equipped context
+    // the call stays unsupported rather than invoking OP_RNG bare.
+    const auto pure_kernel_shape = [](const BuiltinSpec& spec) {
+      return spec.shape != BuiltinShapePolicy::Rng &&
+             spec.shape != BuiltinShapePolicy::Product &&
+             spec.shape != BuiltinShapePolicy::Solve;
+    };
+    const BuiltinSpec* kernel_builtin =
+        builtin != nullptr && builtin->result == FunctionArgumentKind::Real &&
+                pure_kernel_shape(*builtin)
+            ? builtin
+            : reduction_builtin_spec(e.name, e.args.size());
+    const bool named_builtin =
+        kernel_builtin == nullptr &&
+        function_spec(e.name, e.args.size(), FunctionFamily::Builtin) !=
+            nullptr;
+    if (kernel_builtin != nullptr || named_builtin) {
+      std::vector<Value> values;
+      values.reserve(e.args.size());
+      for (const mir::Expr& arg : e.args) values.push_back(eval(arg));
+      if (kernel_builtin == nullptr) {
+        // Hand-built MIR may carry no numeric metadata, so the typed
+        // resolution above found nothing. Kind each argument from its
+        // evaluated value and select the overload the metadata-carrying
+        // path would have picked.
+        uint64_t integer_arguments = 0;
+        for (size_t k = 0; k < values.size(); ++k)
+          if (values[k].is_int ||
+              e.args[k].unsized.leaf == mir::UnsizedLeaf::Int)
+            integer_arguments |= uint64_t{1} << k;
+        const FunctionSpec* named =
+            function_spec(e.name, e.args.size(), integer_arguments,
+                          FunctionArgumentKind::Real);
+        if (named != nullptr && named->builtin() != nullptr &&
+            named->builtin()->result == FunctionArgumentKind::Real &&
+            pure_kernel_shape(*named->builtin()))
+          kernel_builtin = named->builtin();
       }
-      const bool scalar = e.args[0].unsized.depth == 0;
-      if (scalar && outcomes.size() != 1)
-        fail("categorical scalar outcome has wrong width", e.raw);
-      if (value.dims.size() != 1)
-        fail("categorical probability argument is not a vector", e.raw);
-      Eigen::Matrix<T, Eigen::Dynamic, 1> arg(value.r.size());
-      for (size_t k = 0; k < value.r.size(); ++k)
-        arg((Eigen::Index)k) = value.r[k];
-      const bool propto = e.fn_propto && propto_ctx_;
-      const auto density = [&](const auto& n) -> T {
-        if (e.name == "categorical_logit_lpmf")
-          return propto ? stan::math::categorical_logit_lpmf<true>(n, arg)
-                        : stan::math::categorical_logit_lpmf<false>(n, arg);
-        return propto ? stan::math::categorical_lpmf<true>(n, arg)
-                      : stan::math::categorical_lpmf<false>(n, arg);
-      };
-      r.r = {scalar ? density(outcomes[0]) : density(outcomes)};
-      return r;
+      if (kernel_builtin != nullptr)
+        return builtin_kernel_eval(e, *kernel_builtin, std::move(values));
     }
 
-    // A multivariate density consumes its vector and matrix arguments as
-    // whole containers, so the scalar-density broadcaster below cannot
-    // represent it.  ctsem uses both a single vector and array[N] vector[K]
-    // observations, with shared or vectorized locations and one Cholesky
-    // factor. Interpreter storage is first-index-fast: the N array elements
-    // are the fast axis and each observation must therefore be gathered with
-    // stride N before it is handed to Stan Math.
-    if ((e.name == "multi_normal_cholesky_lpdf" ||
-         e.name == "multi_normal_lpdf") &&
-        e.args.size() == 3) {
-      // multi_normal takes a covariance matrix where the cholesky form
-      // takes its factor; both are width x width and enter the same way.
-      const bool cholesky = e.name == "multi_normal_cholesky_lpdf";
-      Value y = eval(e.args[0]), mu_value = eval(e.args[1]),
-            factor = eval(e.args[2]);
-      const auto vector_shape = [&](const mir::Expr& expression,
-                                    const Value& value, const char* role) {
-        const bool vector_leaf =
-            expression.unsized.leaf == mir::UnsizedLeaf::Vector ||
-            expression.unsized.leaf == mir::UnsizedLeaf::RowVector;
-        const size_t rank = (size_t)expression.unsized.depth + 1;
-        if (!vector_leaf || value.dims.size() != rank)
-          fail(e.name + ": " + role + " is not a vector or array of vectors",
-               e.raw);
-        int64_t repetitions = 1;
-        for (size_t d = 0; d < expression.unsized.depth; ++d) {
-          if (value.dims[d] < 0 ||
-              (value.dims[d] != 0 &&
-               repetitions >
-                   std::numeric_limits<int64_t>::max() / value.dims[d]))
-            fail(e.name + ": invalid or overflowing array extent", e.raw);
-          repetitions *= value.dims[d];
-        }
-        const int64_t width = value.dims.back();
-        if (width < 0 ||
-            (repetitions != 0 &&
-             width > std::numeric_limits<int64_t>::max() / repetitions) ||
-            repetitions * width != (int64_t)value.r.size())
-          fail(e.name + ": malformed " + role + " shape", e.raw);
-        return std::pair<int64_t, int64_t>{repetitions, width};
-      };
-      const auto [observations, width] =
-          vector_shape(e.args[0], y, "random variable");
-      const auto [locations, location_width] =
-          vector_shape(e.args[1], mu_value, "location");
-      if (location_width != width)
-        fail(e.name + ": random variable and location sizes differ", e.raw);
-      if (observations != locations && observations != 1 && locations != 1)
-        fail(e.name + ": vectorized argument sizes differ", e.raw);
-      const char* mrole = cholesky ? "Cholesky factor" : "covariance matrix";
-      if (e.args[2].unsized.depth != 0 ||
-          e.args[2].unsized.leaf != mir::UnsizedLeaf::Matrix ||
-          factor.dims.size() != 2)
-        fail(e.name + ": " + mrole + " is not a matrix", e.raw);
-      if (width != 0 && width > std::numeric_limits<int64_t>::max() / width)
-        fail(e.name + ": " + mrole + " extent overflows", e.raw);
-      const int64_t factor_size = width * width;
-      if (factor.dims[0] != width || factor.dims[1] != width ||
-          (int64_t)factor.r.size() != factor_size)
-        fail(e.name + ": " + mrole + " has the wrong shape", e.raw);
+    if (registered != nullptr && registered->density() != nullptr)
+      return density_eval(e, *registered->density());
+    // Hand-built MIR without numeric metadata resolves densities by name
+    // and arity, the way the builtin tail above does; density_eval kinds
+    // each argument from its evaluated value.
+    if (registered == nullptr)
+      if (const FunctionSpec* named_density =
+              function_spec(e.name, e.args.size(), FunctionFamily::Density);
+          named_density != nullptr && named_density->density() != nullptr)
+        return density_eval(e, *named_density->density());
 
-      using Vec = Eigen::Matrix<T, Eigen::Dynamic, 1>;
-      using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-      std::vector<Vec> ys((size_t)observations, Vec((Eigen::Index)width));
-      for (int64_t k = 0; k < observations; ++k)
-        for (int64_t i = 0; i < width; ++i)
-          ys[(size_t)k]((Eigen::Index)i) =
-              y.r.at((size_t)(i * observations + k));
-      std::vector<Vec> mus((size_t)locations, Vec((Eigen::Index)width));
-      for (int64_t k = 0; k < locations; ++k)
-        for (int64_t i = 0; i < width; ++i)
-          mus[(size_t)k]((Eigen::Index)i) =
-              mu_value.r.at((size_t)(i * locations + k));
-      Mat M((Eigen::Index)width, (Eigen::Index)width);
-      for (int64_t j = 0; j < width; ++j)
-        for (int64_t i = 0; i < width; ++i)
-          M((Eigen::Index)i, (Eigen::Index)j) =
-              factor.r[(size_t)(j * width + i)];
-      const bool propto = e.fn_propto && propto_ctx_;
-      const auto density = [&](const auto& yy, const auto& mm) -> T {
-        if (cholesky)
-          return propto
-                     ? stan::math::multi_normal_cholesky_lpdf<true>(yy, mm, M)
-                     : stan::math::multi_normal_cholesky_lpdf<false>(yy, mm, M);
-        return propto ? stan::math::multi_normal_lpdf<true>(yy, mm, M)
-                      : stan::math::multi_normal_lpdf<false>(yy, mm, M);
-      };
-      if (observations == 1 && locations == 1)
-        r.r = {density(ys[0], mus[0])};
-      else if (locations == 1)
-        r.r = {density(ys, mus[0])};
-      else if (observations == 1)
-        r.r = {density(ys[0], mus)};
-      else
-        r.r = {density(ys, mus)};
-      return r;
-    }
-
-    // The continuous scalar ones come from the shared list, so this can
-    // never be narrower than what the register-machine compiler accepts
-    // -- the compiled path falls back here when compilation fails, and a
-    // narrower fallback turns a slow path into an error. The discrete
-    // ones are the interpreter's alone: the register file has nowhere to
-    // put an integer outcome.
-    const int shared_id = program_density_id_by_name(e.name);
-    if (shared_id >= 0 || e.name == "bernoulli_lpmf" ||
-        e.name == "binomial_lpmf" || e.name == "poisson_lpmf" ||
-        e.name == "poisson_log_lpmf" || e.name == "bernoulli_logit_lpmf" ||
-        e.name == "binomial_logit_lpmf" || e.name == "hypergeometric_lpmf" ||
-        e.name == "discrete_range_lpmf" || e.name == "neg_binomial_2_lpmf" ||
-        e.name == "neg_binomial_2_log_lpmf") {
-      if (shared_id >= 0 &&
-          e.args.size() != (size_t)program_density_arity(shared_id))
-        fail(e.name + " takes " +
-                 std::to_string(program_density_arity(shared_id)) +
-                 " arguments in the interpreter",
-             e.raw);
-      std::vector<Value> av;
-      for (const auto& a : e.args) av.push_back(eval(a));
-      size_t n = 1;
-      for (const auto& a : av) n = std::max(n, a.r.size());
-      const auto sc = [&](size_t k, size_t i) -> const T& {
-        const auto& rr = av[k].r;
-        return rr.size() == 1 ? rr[0] : rr.at(i);
-      };
-      const auto ic = [&](size_t k, size_t i) -> int {
-        const auto& a = av[k];
-        if (!a.i.empty()) return a.i.size() == 1 ? a.i[0] : a.i.at(i);
-        return (int)val(sc(k, i));
-      };
-      T acc = T(0.0);
-      for (size_t i = 0; i < n; ++i) {
-        // The continuous ones go through the shared dispatch, so this
-        // cannot be narrower than what the register machine accepts and
-        // costs one shared set of probability-function instantiations rather
-        // than one set per translation unit that interprets MIR.
-        if (shared_id >= 0) {
-          T argbuf[kMaxDensityArgs];
-          const int arity = program_density_arity(shared_id);
-          for (int k = 0; k < arity; ++k) argbuf[k] = sc((size_t)k, i);
-          acc += program_density<T>(shared_id, argbuf);
-          continue;
-        }
-        if (e.name == "bernoulli_lpmf")
-          acc += stan::math::bernoulli_lpmf(ic(0, i), sc(1, i));
-        else if (e.name == "bernoulli_logit_lpmf")
-          acc += stan::math::bernoulli_logit_lpmf(ic(0, i), sc(1, i));
-        else if (e.name == "binomial_lpmf")
-          acc += stan::math::binomial_lpmf(ic(0, i), ic(1, i), sc(2, i));
-        else if (e.name == "binomial_logit_lpmf")
-          acc += stan::math::binomial_logit_lpmf(ic(0, i), ic(1, i), sc(2, i));
-        else if (e.name == "poisson_lpmf")
-          acc += stan::math::poisson_lpmf(ic(0, i), sc(1, i));
-        else if (e.name == "poisson_log_lpmf")
-          acc += stan::math::poisson_log_lpmf(ic(0, i), sc(1, i));
-        else if (e.name == "hypergeometric_lpmf")
-          acc += stan::math::hypergeometric_lpmf(ic(0, i), ic(1, i), ic(2, i),
-                                                 ic(3, i));
-        else if (e.name == "discrete_range_lpmf")
-          acc += stan::math::discrete_range_lpmf(ic(0, i), ic(1, i), ic(2, i));
-        else if (e.name == "neg_binomial_2_lpmf")
-          acc += stan::math::neg_binomial_2_lpmf(ic(0, i), sc(1, i), sc(2, i));
-        else if (e.name == "neg_binomial_2_log_lpmf")
-          acc +=
-              stan::math::neg_binomial_2_log_lpmf(ic(0, i), sc(1, i), sc(2, i));
-        else if (e.name == "student_t_lpdf")
-          acc += stan::math::student_t_lpdf(sc(0, i), sc(1, i), sc(2, i),
-                                            sc(3, i));
-        else
-          fail("unsupported density " + e.name, e.raw);
-      }
-      r.r = {acc};
-      return r;
-    }
-    if (e.name == "rep_array" && e.args.size() >= 2 && e.args.size() <= 4) {
-      Value v = eval(e.args[0]);
-      for (size_t k = 1; k < e.args.size(); ++k)
-        r.dims.push_back(as_int(e.args[k]));
-      // The element keeps its own shape; rep_array only prepends the new
-      // outer dimension(s). Interpreter storage is first-index-fast, so the
-      // prepended axes vary fastest: element cell k lands at stride `copies`
-      // across the result, not as a contiguous block.
-      const int64_t copies = checked_container_size(r.dims, e.name);
-      r.is_int = v.is_int;
-      for (const int64_t d : v.dims) r.dims.push_back(d);
-      const size_t width = std::max(v.r.size(), v.i.size());
-      const int64_t size =
-          checked_container_size({copies, (int64_t)width}, e.name);
-      r.r.assign((size_t)size, T(0.0));
-      if (v.is_int) r.i.assign((size_t)size, 0);
-      for (size_t k = 0; k < width; ++k)
-        for (long c = 0; c < copies; ++c) {
-          r.r[k * (size_t)copies + (size_t)c] = v.r.at(k);
-          if (v.is_int) r.i[k * (size_t)copies + (size_t)c] = v.i.at(k);
-        }
-      return r;
-    }
     if (e.name == "csr_extract_w" && e.args.size() == 1) {
       Value a = eval(e.args[0]);
       if (a.dims.size() != 2)
@@ -3168,135 +2737,6 @@ class MirInterp {
       r.i.assign(idx.begin(), idx.end());
       r.r.reserve(idx.size());
       for (const int x : idx) r.r.push_back(T((double)x));
-      return r;
-    }
-    if (e.name == "append_array" && e.args.size() == 2) {
-      Value a = eval(e.args[0]), b = eval(e.args[1]);
-      if (a.dims.empty() || b.dims.empty() || a.dims.size() != b.dims.size())
-        fail("append_array: arguments must be arrays of the same rank", e.raw);
-      const int64_t a_outer = a.dims[0], b_outer = b.dims[0];
-      if (a_outer < 0 || b_outer < 0 ||
-          a_outer > std::numeric_limits<int64_t>::max() - b_outer)
-        fail("append_array: invalid or overflowing outer extent", e.raw);
-      if (a_outer != 0 && b_outer != 0 &&
-          !std::equal(a.dims.begin() + 1, a.dims.end(), b.dims.begin() + 1,
-                      b.dims.end()))
-        fail("append_array: element shapes must match", e.raw);
-
-      const auto checked_product = [&](const std::vector<int64_t>& dims,
-                                       size_t begin,
-                                       const char* what) -> int64_t {
-        int64_t n = 1;
-        for (size_t k = begin; k < dims.size(); ++k) {
-          const int64_t d = dims[k];
-          if (d < 0 || (d != 0 && n > std::numeric_limits<int64_t>::max() / d))
-            fail(std::string("append_array: invalid or overflowing ") + what,
-                 e.raw);
-          n *= d;
-        }
-        return n;
-      };
-      const int64_t a_count = checked_product(a.dims, 0, "left shape");
-      const int64_t b_count = checked_product(b.dims, 0, "right shape");
-      if (a_count != static_cast<int64_t>(a.r.size()) ||
-          b_count != static_cast<int64_t>(b.r.size()))
-        fail("append_array: argument shape does not match storage", e.raw);
-
-      r.dims = a_outer == 0 && b_outer != 0 ? b.dims : a.dims;
-      r.dims[0] = a_outer + b_outer;
-      const int64_t suffix_count = checked_product(r.dims, 1, "element shape");
-      if (a_count > std::numeric_limits<int64_t>::max() - b_count ||
-          (a_outer + b_outer != 0 &&
-           suffix_count >
-               std::numeric_limits<int64_t>::max() / (a_outer + b_outer)) ||
-          (a_outer + b_outer) * suffix_count != a_count + b_count)
-        fail("append_array: storage length overflows", e.raw);
-
-      const auto append_first_axis = [&](const auto& av, const auto& bv,
-                                         auto* out) {
-        using Size = typename std::decay_t<decltype(av)>::size_type;
-        const Size aw = static_cast<Size>(a_outer);
-        const Size bw = static_cast<Size>(b_outer);
-        out->reserve(av.size() + bv.size());
-        const int64_t lanes = a_outer + b_outer == 0 ? 0 : suffix_count;
-        for (int64_t lane = 0; lane < lanes; ++lane) {
-          const Size ai = static_cast<Size>(lane) * aw;
-          const Size bi = static_cast<Size>(lane) * bw;
-          out->insert(out->end(), av.begin() + ai, av.begin() + ai + aw);
-          out->insert(out->end(), bv.begin() + bi, bv.begin() + bi + bw);
-        }
-      };
-      append_first_axis(a.r, b.r, &r.r);
-      r.is_int = a.is_int && b.is_int;
-      if (r.is_int) {
-        if (a.i.size() != a.r.size() || b.i.size() != b.r.size())
-          fail("append_array: integer mirror does not match storage", e.raw);
-        append_first_axis(a.i, b.i, &r.i);
-      }
-      return r;
-    }
-    if (e.name == "rep_matrix" && e.args.size() == 3) {
-      Value v = eval(e.args[0]);
-      const long R = as_int(e.args[1]), C = as_int(e.args[2]);
-      r.dims = {R, C};
-      r.r.assign(R * C, v.r.at(0));
-      return r;
-    }
-    if (e.name == "rep_matrix" && e.args.size() == 2) {
-      // rep_matrix(vector, C) tiles columns; rep_matrix(row_vector, R)
-      // tiles rows. Col-major storage either way.
-      Value v = eval(e.args[0]);
-      const long n = as_int(e.args[1]);
-      const bool rowvec = e.args[0].type_ == "URowVector";
-      const int64_t len = (int64_t)v.r.size();
-      if (rowvec) {
-        r.dims = {n, len};
-        for (int64_t j = 0; j < len; ++j)
-          for (int64_t i = 0; i < n; ++i) r.r.push_back(v.r[(size_t)j]);
-      } else {
-        r.dims = {len, n};
-        for (int64_t j = 0; j < n; ++j)
-          r.r.insert(r.r.end(), v.r.begin(), v.r.end());
-      }
-      return r;
-    }
-    if (e.name == "append_row" && e.args.size() == 2) {
-      Value a = eval(e.args[0]), b = eval(e.args[1]);
-      if (a.dims.size() <= 1 && b.dims.size() <= 1) {
-        // Vectors/scalars: vertical concatenation.
-        r.dims = {(int64_t)(a.r.size() + b.r.size())};
-        r.r = a.r;
-        r.r.insert(r.r.end(), b.r.begin(), b.r.end());
-        return r;
-      }
-      if (a.dims.size() == 2 && b.dims.size() == 2 && a.dims[1] == b.dims[1]) {
-        // Matrices: stack rows, col-major storage interleaves columns.
-        const int64_t Ra = a.dims[0], Rb = b.dims[0], C = a.dims[1];
-        r.dims = {Ra + Rb, C};
-        r.r.reserve((Ra + Rb) * C);
-        for (int64_t j = 0; j < C; ++j) {
-          r.r.insert(r.r.end(), a.r.begin() + j * Ra,
-                     a.r.begin() + (j + 1) * Ra);
-          r.r.insert(r.r.end(), b.r.begin() + j * Rb,
-                     b.r.begin() + (j + 1) * Rb);
-        }
-        return r;
-      }
-      fail("append_row shape mismatch", e.raw);
-    }
-    if (e.name == "append_col" && e.args.size() == 2) {
-      Value a = eval(e.args[0]), b = eval(e.args[1]);
-      // Column-major storage makes column appends a concatenation.
-      // A vector argument is a one-column block.
-      const int64_t Ra = a.dims.size() == 2 ? a.dims[0] : (int64_t)a.r.size();
-      const int64_t Rb = b.dims.size() == 2 ? b.dims[0] : (int64_t)b.r.size();
-      const int64_t Ca = a.dims.size() == 2 ? a.dims[1] : 1;
-      const int64_t Cb = b.dims.size() == 2 ? b.dims[1] : 1;
-      if (Ra != Rb) fail("append_col row mismatch", e.raw);
-      r.dims = {Ra, Ca + Cb};
-      r.r = a.r;
-      r.r.insert(r.r.end(), b.r.begin(), b.r.end());
-      r.is_int = false;
       return r;
     }
     if constexpr (std::is_same_v<T, double>) {

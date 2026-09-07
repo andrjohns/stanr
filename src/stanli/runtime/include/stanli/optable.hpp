@@ -4,171 +4,190 @@
 
 #include <stanli/kernel_types.hpp>
 
+#include <cmath>
 #include <limits>
+#include <optional>
+#include <string_view>
 
 namespace stanli {
 
 // One list, two uses: the enum and the name table are generated from it,
 // so a new op cannot be added to one and forgotten in the other.
-#define STANLI_OPCODE_LIST(X)       \
-  X(OP_EXP)                         \
-  X(OP_ADD_N)                       \
-  X(OP_BCAST_FMA)                   \
-  X(OP_MATVEC)                      \
-  X(OP_POISSON_LOG_LPMF)            \
-  X(OP_BERNOULLI_LOGIT_LPMF)        \
-  X(OP_BERNOULLI_LPMF)              \
-  X(OP_POISSON_LPMF)                \
-  X(OP_NEG_BINOMIAL_2_LPMF)         \
-  X(OP_BINOMIAL_LPMF)               \
-  X(OP_BINOMIAL_LOGIT_LPMF)         \
-  X(OP_BERNOULLI_LOGIT_GLM_LPMF)    \
-  X(OP_POISSON_LOG_GLM_LPMF)        \
-  X(OP_NEG_BINOMIAL_2_LOG_GLM_LPMF) \
-  X(OP_BETA_BINOMIAL_LPMF)          \
-  X(OP_LOGIT)                       \
-  X(OP_MEAN)                        \
-  X(OP_SD)                          \
-  X(OP_VARIANCE)                    \
-  X(OP_REP_VEC)                     \
-  X(OP_INDEX)                       \
-  X(OP_SET_INDEX)                   \
-  X(OP_SET_INDEX_INPLACE)           \
-  X(OP_SLICE)                       \
-  X(OP_SET_SLICE)                   \
-  X(OP_SET_SLICE_INPLACE)           \
-  X(OP_SET_SLICE_STRIDED)           \
-  X(OP_SET_SLICE_STRIDED_INPLACE)   \
-  X(OP_SLICE_STRIDED)               \
-  X(OP_GATHER)                      \
-  X(OP_CONCAT2)                     \
-  X(OP_REP_MAT)                     \
-  X(OP_GP_EXP_QUAD_COV)             \
-  X(OP_DIAG_MATRIX)                 \
-  X(OP_CHOLESKY)                    \
-  X(OP_MULTI_NORMAL_CHOL_LPDF)      \
-  X(OP_MULTI_NORMAL_LPDF)           \
-  X(OP_MULTI_NORMAL_PREC_LPDF)      \
-  X(OP_GEMM)                        \
-  X(OP_MDIVIDE_LEFT)                \
-  X(OP_MDIVIDE_RIGHT)               \
-  X(OP_MDIVIDE_LEFT_SPD)            \
-  X(OP_MDIVIDE_RIGHT_SPD)           \
-  X(OP_MDIVIDE_LEFT_TRI_LOW)        \
-  X(OP_MDIVIDE_RIGHT_TRI_LOW)       \
-  X(OP_LOG_SOFTMAX)                 \
-  X(OP_CONSTRAIN_CHOL_CORR)         \
-  X(OP_LKJ_CORR_CHOL_LPDF)          \
-  X(OP_LKJ_CORR_LPDF)               \
-  X(OP_WISHART_LPDF)                \
-  X(OP_INV_WISHART_LPDF)            \
-  X(OP_WISHART_CHOL_LPDF)           \
-  X(OP_INV_WISHART_CHOL_LPDF)       \
-  X(OP_MULTI_GP_LPDF)               \
-  X(OP_MULTI_GP_CHOL_LPDF)          \
-  X(OP_MULTI_STUDENT_T_LPDF)        \
-  X(OP_MULTI_STUDENT_T_CHOL_LPDF)   \
-  X(OP_MULTINOMIAL_LPMF)            \
-  X(OP_MULTINOMIAL_LOGIT_LPMF)      \
-  X(OP_DIRICHLET_MULTINOMIAL_LPMF)  \
-  X(OP_ORDERED_PROBIT_LPMF)         \
-  X(OP_WIENER_LPDF)                 \
-  X(OP_LKJ_COV_LPDF)                \
-  X(OP_BINOMIAL_LOGIT_GLM_LPMF)     \
-  X(OP_CATEGORICAL_LOGIT_GLM_LPMF)  \
-  X(OP_ORDERED_LOGISTIC_GLM_LPMF)   \
-  X(OP_NORMAL_ID_GLM_LPDF)          \
-  X(OP_TRANSPOSE)                   \
-  X(OP_ALGEBRA_SOLVER)              \
-  X(OP_ODE)                         \
-  X(OP_RNG)                         \
-  X(OP_ISLAND)                      \
-  X(OP_EIGENVALUES_SYM)             \
-  X(OP_EIGENVECTORS_SYM)            \
-  X(OP_LOG_SUM_EXP)                 \
-  X(OP_LOG_SUM_EXP_ROWS)            \
-  X(OP_SUM_ROWS)                    \
-  X(OP_LSE2)                        \
-  X(OP_LOG_DIFF_EXP)                \
-  X(OP_LOG_MIX)                     \
-  X(OP_SOFTMAX)                     \
-  X(OP_SUM_VEC)                     \
-  X(OP_ADD)                         \
-  X(OP_SUB)                         \
-  X(OP_MUL)                         \
-  X(OP_DIV)                         \
-  X(OP_POW)                         \
-  X(OP_DOT)                         \
-  X(OP_NEG)                         \
-  X(OP_EXPV)                        \
-  X(OP_LOGV)                        \
-  X(OP_INV_LOGIT)                   \
-  X(OP_SQRT)                        \
-  X(OP_SQUARE)                      \
-  X(OP_LOG1M)                       \
-  X(OP_TANHV)                       \
-  X(OP_TRIGAMMA)                    \
-  X(OP_CUMSUM)                      \
-  X(OP_FMA)                         \
-  X(OP_ATAN2)                       \
-  X(OP_BETA_FN)                     \
-  X(OP_FDIM)                        \
-  X(OP_FMAX)                        \
-  X(OP_FMIN)                        \
-  X(OP_FMOD)                        \
-  X(OP_GAMMA_P)                     \
-  X(OP_GAMMA_Q)                     \
-  X(OP_HYPOT)                       \
-  X(OP_LBETA)                       \
-  X(OP_LCHOOSE)                     \
-  X(OP_LMULTIPLY)                   \
-  X(OP_LOG_FALLING_FACTORIAL)       \
-  X(OP_LOG_INV_LOGIT_DIFF)          \
-  X(OP_LOG_MODIFIED_BESSEL_1)       \
-  X(OP_LOG_RISING_FACTORIAL)        \
-  X(OP_OWENS_T)                     \
-  X(OP_BESSEL_1)                    \
-  X(OP_BESSEL_2)                    \
-  X(OP_MODIFIED_BESSEL_1)           \
-  X(OP_MODIFIED_BESSEL_2)           \
-  X(OP_BINARY_LOG_LOSS)             \
-  X(OP_LMGAMMA)                     \
-  X(OP_FALLING_FACTORIAL)           \
-  X(OP_RISING_FACTORIAL)            \
-  X(OP_LDEXP)                       \
-  X(OP_CONSTRAIN_LOWER)             \
-  X(OP_CONSTRAIN_UPPER)             \
-  X(OP_CONSTRAIN_LU)                \
-  X(OP_CONSTRAIN_SIMPLEX)           \
-  X(OP_CONSTRAIN_ORDERED)           \
-  X(OP_CONSTRAIN_POS_ORDERED)       \
-  X(OP_CONSTRAIN_OFFSET_MULT)       \
-  X(OP_CONSTRAIN_UNIT_VECTOR)       \
-  X(OP_CONSTRAIN_SUM_TO_ZERO)       \
-  X(OP_CONSTRAIN_SUM_TO_ZERO_MAT)   \
-  X(OP_CONSTRAIN_CORR_MATRIX)       \
-  X(OP_CONSTRAIN_COV_MATRIX)        \
-  X(OP_CONSTRAIN_CHOL_COV)          \
-  X(OP_CHECK_STRUCTURED)            \
-  X(OP_CHECK_MATCHING_DIMS)         \
-  X(OP_CHECK_LOWER)                 \
-  X(OP_CHECK_UPPER)                 \
-  X(OP_CATEGORICAL)                 \
-  X(OP_REJECT)                      \
-  X(OP_PRINT)                       \
-  X(OP_DIRICHLET_LPDF)              \
-  X(OP_PROD_VEC)                    \
-  X(OP_EXTREMA_VEC)                 \
-  X(OP_DYNAMIC_SLICE)               \
-  X(OP_MATRIX_EXP)                  \
-  X(OP_QUAD_FORM_SYM)               \
-  X(OP_INVERSE)                     \
-  X(OP_INVERSE_SPD)                 \
-  X(OP_LOG_DETERMINANT)             \
-  X(OP_QUAD_FORM)                   \
-  X(OP_ADD_DIAG)                    \
-  X(OP_CROSSPROD)                   \
-  X(OP_MULT_LOWER_TRI_SELF_TRANSPOSE)
+#define STANLI_OPCODE_LIST(X)         \
+  X(OP_EXP)                           \
+  X(OP_ADD_N)                         \
+  X(OP_BCAST_FMA)                     \
+  X(OP_MATVEC)                        \
+  X(OP_POISSON_LOG_LPMF)              \
+  X(OP_BERNOULLI_LOGIT_LPMF)          \
+  X(OP_BERNOULLI_LPMF)                \
+  X(OP_POISSON_LPMF)                  \
+  X(OP_NEG_BINOMIAL_2_LPMF)           \
+  X(OP_BINOMIAL_LPMF)                 \
+  X(OP_BINOMIAL_LOGIT_LPMF)           \
+  X(OP_BERNOULLI_LOGIT_GLM_LPMF)      \
+  X(OP_POISSON_LOG_GLM_LPMF)          \
+  X(OP_NEG_BINOMIAL_2_LOG_GLM_LPMF)   \
+  X(OP_BETA_BINOMIAL_LPMF)            \
+  X(OP_LOGIT)                         \
+  X(OP_MEAN)                          \
+  X(OP_SD)                            \
+  X(OP_VARIANCE)                      \
+  X(OP_REP_VEC)                       \
+  X(OP_INDEX)                         \
+  X(OP_SET_INDEX)                     \
+  X(OP_SET_INDEX_INPLACE)             \
+  X(OP_SLICE)                         \
+  X(OP_SET_SLICE)                     \
+  X(OP_SET_SLICE_INPLACE)             \
+  X(OP_SET_SLICE_STRIDED)             \
+  X(OP_SET_SLICE_STRIDED_INPLACE)     \
+  X(OP_SLICE_STRIDED)                 \
+  X(OP_GATHER)                        \
+  X(OP_CONCAT2)                       \
+  X(OP_REP_MAT)                       \
+  X(OP_GP_COV)                        \
+  X(OP_DIAG_MATRIX)                   \
+  X(OP_CHOLESKY)                      \
+  X(OP_MULTI_NORMAL_CHOL_LPDF)        \
+  X(OP_MULTI_NORMAL_LPDF)             \
+  X(OP_MULTI_NORMAL_PREC_LPDF)        \
+  X(OP_GEMM)                          \
+  X(OP_MDIVIDE_LEFT)                  \
+  X(OP_MDIVIDE_RIGHT)                 \
+  X(OP_MDIVIDE_LEFT_SPD)              \
+  X(OP_MDIVIDE_RIGHT_SPD)             \
+  X(OP_MDIVIDE_LEFT_TRI_LOW)          \
+  X(OP_MDIVIDE_RIGHT_TRI_LOW)         \
+  X(OP_LOG_SOFTMAX)                   \
+  X(OP_CONSTRAIN_CHOL_CORR)           \
+  X(OP_LKJ_CORR_CHOL_LPDF)            \
+  X(OP_LKJ_CORR_LPDF)                 \
+  X(OP_WISHART_LPDF)                  \
+  X(OP_INV_WISHART_LPDF)              \
+  X(OP_WISHART_CHOL_LPDF)             \
+  X(OP_INV_WISHART_CHOL_LPDF)         \
+  X(OP_MULTI_GP_LPDF)                 \
+  X(OP_MULTI_GP_CHOL_LPDF)            \
+  X(OP_MULTI_STUDENT_T_LPDF)          \
+  X(OP_MULTI_STUDENT_T_CHOL_LPDF)     \
+  X(OP_MULTINOMIAL_LPMF)              \
+  X(OP_MULTINOMIAL_LOGIT_LPMF)        \
+  X(OP_DIRICHLET_MULTINOMIAL_LPMF)    \
+  X(OP_ORDERED_PROBIT_LPMF)           \
+  X(OP_ORDERED_LOGISTIC_LPMF)         \
+  X(OP_WIENER_LPDF)                   \
+  X(OP_LKJ_COV_LPDF)                  \
+  X(OP_BINOMIAL_LOGIT_GLM_LPMF)       \
+  X(OP_CATEGORICAL_LOGIT_GLM_LPMF)    \
+  X(OP_ORDERED_LOGISTIC_GLM_LPMF)     \
+  X(OP_NORMAL_ID_GLM_LPDF)            \
+  X(OP_TRANSPOSE)                     \
+  X(OP_ALGEBRA_SOLVER)                \
+  X(OP_QUADRATURE)                    \
+  X(OP_ODE)                           \
+  X(OP_RNG)                           \
+  X(OP_ISLAND)                        \
+  X(OP_LOOP)                          \
+  X(OP_COMPARE)                       \
+  X(OP_INT_ARITH)                     \
+  X(OP_REP_VEC_DYNAMIC)               \
+  X(OP_INDEX_DYNAMIC)                 \
+  X(OP_SET_INDEX_DYNAMIC)             \
+  X(OP_MATRIX_EXP_DYNAMIC)            \
+  X(OP_EIGENVALUES_SYM)               \
+  X(OP_EIGENVECTORS_SYM)              \
+  X(OP_LOG_SUM_EXP)                   \
+  X(OP_LOG_SUM_EXP_ROWS)              \
+  X(OP_SUM_ROWS)                      \
+  X(OP_LSE2)                          \
+  X(OP_LOG_DIFF_EXP)                  \
+  X(OP_LOG_MIX)                       \
+  X(OP_SOFTMAX)                       \
+  X(OP_SUM_VEC)                       \
+  X(OP_ADD)                           \
+  X(OP_SUB)                           \
+  X(OP_MUL)                           \
+  X(OP_DIV)                           \
+  X(OP_POW)                           \
+  X(OP_DOT)                           \
+  X(OP_GROUP_DOT)                     \
+  X(OP_NEG)                           \
+  X(OP_EXPV)                          \
+  X(OP_LOGV)                          \
+  X(OP_INV_LOGIT)                     \
+  X(OP_SQRT)                          \
+  X(OP_SQUARE)                        \
+  X(OP_LOG1M)                         \
+  X(OP_TANHV)                         \
+  X(OP_TRIGAMMA)                      \
+  X(OP_CUMSUM)                        \
+  X(OP_FMA)                           \
+  X(OP_ATAN2)                         \
+  X(OP_BETA_FN)                       \
+  X(OP_FDIM)                          \
+  X(OP_FMAX)                          \
+  X(OP_FMIN)                          \
+  X(OP_FMOD)                          \
+  X(OP_GAMMA_P)                       \
+  X(OP_GAMMA_Q)                       \
+  X(OP_HYPOT)                         \
+  X(OP_LBETA)                         \
+  X(OP_LCHOOSE)                       \
+  X(OP_LMULTIPLY)                     \
+  X(OP_LOG_FALLING_FACTORIAL)         \
+  X(OP_LOG_INV_LOGIT_DIFF)            \
+  X(OP_LOG_MODIFIED_BESSEL_1)         \
+  X(OP_LOG_RISING_FACTORIAL)          \
+  X(OP_OWENS_T)                       \
+  X(OP_CHOOSE)                        \
+  X(OP_BESSEL_1)                      \
+  X(OP_BESSEL_2)                      \
+  X(OP_MODIFIED_BESSEL_1)             \
+  X(OP_MODIFIED_BESSEL_2)             \
+  X(OP_BINARY_LOG_LOSS)               \
+  X(OP_LMGAMMA)                       \
+  X(OP_FALLING_FACTORIAL)             \
+  X(OP_RISING_FACTORIAL)              \
+  X(OP_LDEXP)                         \
+  X(OP_CONSTRAIN_LOWER)               \
+  X(OP_CONSTRAIN_UPPER)               \
+  X(OP_CONSTRAIN_LU)                  \
+  X(OP_CONSTRAIN_SIMPLEX)             \
+  X(OP_CONSTRAIN_ORDERED)             \
+  X(OP_CONSTRAIN_POS_ORDERED)         \
+  X(OP_CONSTRAIN_OFFSET_MULT)         \
+  X(OP_CONSTRAIN_UNIT_VECTOR)         \
+  X(OP_CONSTRAIN_SUM_TO_ZERO)         \
+  X(OP_CONSTRAIN_SUM_TO_ZERO_MAT)     \
+  X(OP_CONSTRAIN_CORR_MATRIX)         \
+  X(OP_CONSTRAIN_COV_MATRIX)          \
+  X(OP_CONSTRAIN_CHOL_COV)            \
+  X(OP_CONSTRAIN_STOCHASTIC_COLUMN)   \
+  X(OP_CONSTRAIN_STOCHASTIC_ROW)      \
+  X(OP_CHECK_STRUCTURED)              \
+  X(OP_CHECK_MATCHING_DIMS)           \
+  X(OP_CHECK_LOWER)                   \
+  X(OP_CHECK_UPPER)                   \
+  X(OP_CATEGORICAL)                   \
+  X(OP_ALL_INTEGER_DENSITY)           \
+  X(OP_REJECT)                        \
+  X(OP_PRINT)                         \
+  X(OP_DIRICHLET_LPDF)                \
+  X(OP_PROD_VEC)                      \
+  X(OP_EXTREMA_VEC)                   \
+  X(OP_DYNAMIC_SLICE)                 \
+  X(OP_MATRIX_EXP)                    \
+  X(OP_QUAD_FORM_SYM)                 \
+  X(OP_INVERSE)                       \
+  X(OP_INVERSE_SPD)                   \
+  X(OP_LOG_DETERMINANT)               \
+  X(OP_QUAD_FORM)                     \
+  X(OP_ADD_DIAG)                      \
+  X(OP_CROSSPROD)                     \
+  X(OP_MULT_LOWER_TRI_SELF_TRANSPOSE) \
+  X(OP_DAE)                           \
+  X(OP_ODE_ADJOINT)
 
 // Scalar densities, one line each: this list generates the opcode, the
 // name, the kernel, its registration, and the lowering table entry
@@ -455,20 +474,6 @@ namespace stanli {
   X(OP_NEG_BINOMIAL_2_LCCDF, neg_binomial_2_lccdf, 2, 0) \
   X(OP_NEG_BINOMIAL_2_LCDF, neg_binomial_2_lcdf, 2, 0)
 
-// Ordinal regression. Two things make these different from the list
-// above, and both are expressed in the kernel rather than here: the
-// cutpoint argument is a whole vector whatever its length (field 4 is
-// the VecMask that says so, since a one-element cutpoint set is a
-// one-element vector and NOT a scalar), and the integer outcome has to
-// reach stan-math as a std::vector<int> -- ordered_logistic asks
-// scalar_seq_view for a mutable data() pointer, which an
-// Eigen::Map<const VectorXi> cannot give it.
-//
-// reroll.cpp must never fuse these: element n of a shared cutpoint
-// vector is not observation n's cutpoints. They opt in to neither re-roll
-// density trait, which is the whole guard.
-#define STANLI_ORDERED_DENSITY_LIST(X) \
-  X(OP_ORDERED_LOGISTIC_LPMF, ordered_logistic_lpmf, 2, 0x2)
 // A unary may either always chain, chain only away from zero (abs), or be
 // disconnected.  Disconnected is not the same as multiplying by a zero
 // derivative: an infinite upstream adjoint must not turn 0 into NaN.
@@ -484,6 +489,26 @@ constexpr bool unary_has_pullback(UnaryTopology topology, double x) {
       return false;
   }
   return false;
+}
+
+// Which of stan-math's pow overloads a call resolves to, decided from the
+// static C++ types stanc3 emits and carried on the op.
+enum PowZeroBaseLaw : uint8_t {
+  kPowZeroBaseGuarded = 0,
+  kPowZeroBaseScalar = 1,
+  kPowZeroBaseMatrix = 2,
+};
+
+inline double pow_zero_base_partial(uint8_t law, double seed, double base,
+                                    double exponent) {
+  if (law == kPowZeroBaseGuarded) return 0.0;
+  if (exponent == 1.0) return seed;
+  if (exponent == -1.0) return -seed / (base * base);
+  if (exponent == -2.0)
+    return law == kPowZeroBaseMatrix ? std::numeric_limits<double>::quiet_NaN()
+                                     : -2.0 * seed / (base * base * base);
+  if (exponent == -0.5) return -0.5 * seed / (base * std::sqrt(base));
+  return 0.0;
 }
 
 // Scalar unary math, one line each: opcode, kernel, registration, lowering
@@ -642,6 +667,11 @@ constexpr bool unary_has_pullback(UnaryTopology topology, double x) {
   X(OP_RISING_FACTORIAL, rising_factorial, rising_factorial)    \
   X(OP_LDEXP, ldexp, ldexp)
 
+// Two integer arguments and an integer result. Values still travel through
+// graph/register double slots, but the kernel converts both operands back to
+// their declared integer type and has no reverse pass.
+#define STANLI_SCALAR_BINARY_INTEGER_LIST(X) X(OP_CHOOSE, choose, choose)
+
 // The tier a density is actually built at. STANLI_LITE_LP drops the
 // propto family from every one of them: about half the library, at the
 // cost of an lp__ that differs from CmdStan's by a per-model constant on
@@ -681,7 +711,6 @@ constexpr bool exact_lp_build() {
   STANLI_TWO_INT_CDF_LIST(DENSITY)                \
   STANLI_TAIL_CDF_LIST(DENSITY)                   \
   STANLI_TAIL_INT_CDF_LIST(DENSITY)               \
-  STANLI_ORDERED_DENSITY_LIST(DENSITY)            \
   STANLI_SCALAR_UNARY_LIST(UNARY)
 
 enum Opcode : uint16_t {
@@ -712,6 +741,7 @@ constexpr uint8_t kRerollAnyDensity = kRerollDensity | kRerollIdataDensity;
 constexpr uint8_t kRerollWidenable = 1 << 2;
 // Backward reads adjoints/scratch only, never input or output value buffers.
 constexpr uint8_t kBackwardValueFree = 1 << 3;
+constexpr uint8_t kVariantGrouped = 1 << 4;
 }  // namespace op_trait
 
 constexpr uint8_t op_traits(uint16_t opcode) {
@@ -766,8 +796,13 @@ constexpr uint8_t op_traits(uint16_t opcode) {
     case OP_SQUARE:
     case OP_LOG1M:
     case OP_TANHV:
-    case OP_LOG_INV_LOGIT:
-    case OP_LOG1M_INV_LOGIT:
+#define STANLI_SCALAR_UNARY_WIDENABLE(code, fn, value, delta, topology) \
+  case code:
+      STANLI_SCALAR_UNARY_LIST(STANLI_SCALAR_UNARY_WIDENABLE)
+#undef STANLI_SCALAR_UNARY_WIDENABLE
+#define STANLI_SCALAR_BINARY_WIDENABLE(code, fn, name) case code:
+      STANLI_SCALAR_BINARY_LIST(STANLI_SCALAR_BINARY_WIDENABLE)
+#undef STANLI_SCALAR_BINARY_WIDENABLE
       return op_trait::kRerollWidenable;
 
     // Backward routes adjoints without rereading input OR output values. This
@@ -787,6 +822,10 @@ constexpr uint8_t op_traits(uint16_t opcode) {
     case OP_LOG_SUM_EXP_ROWS:
     case OP_SUM_ROWS:
       return op_trait::kBackwardValueFree;
+
+    case OP_PROD_VEC:
+    case OP_EXTREMA_VEC:
+      return op_trait::kVariantGrouped;
     default:
       return 0;
   }
@@ -797,10 +836,10 @@ constexpr bool has_op_trait(uint16_t opcode, uint8_t trait) {
 }
 
 // Ops no rewrite may run a different number of times than the graph says.
-// Most are effects -- a merged print prints once, a hoisted draw returns the
-// same number twice, a folded check throws at compile time -- and
-// OP_CATEGORICAL rides along because its per-op spec payload is not
-// comparable, so two of them are never known to be the same computation.
+// A merged print prints once, a hoisted draw returns the same number twice,
+// and a folded check throws at compile time. OP_CATEGORICAL remains a boundary
+// because its runtime outcome/check topology is consumed by lane partitioning;
+// its call contract itself is now comparable in the variant byte.
 constexpr bool is_effectful_op(uint16_t opcode) {
   switch (opcode) {
     case OP_CHECK_STRUCTURED:
@@ -808,9 +847,11 @@ constexpr bool is_effectful_op(uint16_t opcode) {
     case OP_CHECK_LOWER:
     case OP_CHECK_UPPER:
     case OP_CATEGORICAL:
+    case OP_ALL_INTEGER_DENSITY:
     case OP_RNG:
     case OP_PRINT:
     case OP_REJECT:
+    case OP_LOOP:
       return true;
     default:
       return false;
@@ -821,6 +862,22 @@ constexpr bool is_effectful_op(uint16_t opcode) {
 // tooling only; never on a hot path.
 const char* opcode_name(uint16_t opcode);
 
+// OP_GP_COV's variant selects the covariance function.
+enum GpCov : uint8_t {
+  kGpExpQuad,
+  kGpMatern32,
+  kGpMatern52,
+  kGpExponential,
+};
+
+inline std::optional<GpCov> gp_cov_family(std::string_view name) {
+  if (name == "gp_exp_quad_cov") return kGpExpQuad;
+  if (name == "gp_matern32_cov") return kGpMatern32;
+  if (name == "gp_matern52_cov") return kGpMatern52;
+  if (name == "gp_exponential_cov") return kGpExponential;
+  return std::nullopt;
+}
+
 struct Kernel {
   // Reads ctx.in values, writes ctx.out, may stash partials in ctx.scratch.
   void (*forward)(KernelCtx&) = nullptr;
@@ -829,6 +886,9 @@ struct Kernel {
   void (*backward)(KernelCtx&) = nullptr;
   // Scratch doubles needed, given bound slot shapes. Null means zero.
   int64_t (*scratch_size)(const Op&, const Slot* slots) = nullptr;
+  // Optional mutable state, created once per bound Executor/op. Graph udata
+  // remains immutable and safely shared by executor copies.
+  KernelState* (*make_state)(const Op&, const Slot* slots) = nullptr;
 };
 
 // The most common Kernel::scratch_size shape: one scratch double per

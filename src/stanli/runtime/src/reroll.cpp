@@ -37,6 +37,7 @@
 #include <stanli/optable.hpp>
 #include <stanli/reroll.hpp>
 
+#include "pass_util.hpp"
 #include "reroll_profile.hpp"
 
 #include <algorithm>
@@ -80,17 +81,12 @@ struct Pos {
   std::vector<int> outcome_idata;    // lpmf: per-lane integer outcomes
 };
 
-bool is_element_store(const Op& op) {
-  return (op.opcode == OP_SET_INDEX || op.opcode == OP_SET_INDEX_INPLACE) &&
-         op.n_in == 2 && op.n_idata == 1 && op.out == op.in[0];
-}
-
 // Structural template match; idata may differ across lanes only for
 // OP_INDEX (checked as a progression during classification).
 bool ops_match(const Graph& g, const Op& a, const Op& b) {
   if (a.opcode != b.opcode || a.variant != b.variant || a.n_in != b.n_in ||
       a.out2 >= 0 || b.out2 >= 0 || is_effectful_op(a.opcode) ||
-      a.opcode == OP_PROD_VEC || a.opcode == OP_EXTREMA_VEC)
+      has_op_trait(a.opcode, op_trait::kVariantGrouped))
     return false;
   for (int j = 0; j < a.n_in; ++j)
     if (g.slots[a.in[j]].len != g.slots[b.in[j]].len) return false;
@@ -516,10 +512,7 @@ static RerollStats reroll_impl(
   // allocating dense reader/writer lists.
   if (next_candidate[0] == no_candidate) return st;
 
-  // The dedup'd constant pool: slot -> value, for len-1 fills.
-  std::unordered_map<int, double> const_val;
-  for (const auto& f : fills)
-    if (f.second.size() == 1) const_val.emplace(f.first, f.second[0]);
+  const std::unordered_map<int, double> const_val = scalar_constants(fills);
 
   // Consumers of each slot, by original op index. Ops only read slots
   // produced earlier, so indices stay valid as the scan rewrites disjoint
@@ -559,31 +552,16 @@ static RerollStats reroll_impl(
   // that count is what the scaling test asserts on: it is an exact
   // integer for a given graph, so it says the same thing on a laptop and
   // on a shared CI runner, which a wall-clock reading does not.
-  const auto first_at_or_after = [&](const std::vector<size_t>& v, size_t x) {
-    size_t lo = 0, hi = v.size();
-    while (lo < hi) {
-      const size_t mid = lo + (hi - lo) / 2;
-      ++st.list_steps;
-      if (v[mid] < x)
-        lo = mid + 1;
-      else
-        hi = mid;
-    }
-    return v.begin() + (ptrdiff_t)lo;
-  };
   // Is any entry of `v` in [lo, hi) not accepted by `ours`? `ours` names
   // the region's own ops, which are allowed to touch the slot.
   const auto any_in_range_but = [&](const std::vector<size_t>& v, size_t lo,
                                     size_t hi, auto&& ours) {
-    for (auto it = first_at_or_after(v, lo); it != v.end() && *it < hi; ++it) {
+    for (auto it = first_at_or_after(v, lo, st.list_steps);
+         it != v.end() && *it < hi; ++it) {
       ++st.list_steps;
       if (!ours(*it)) return true;
     }
     return false;
-  };
-  // Is any entry of `v` at or after `x`?
-  const auto any_at_or_after = [&](const std::vector<size_t>& v, size_t x) {
-    return first_at_or_after(v, x) != v.end();
   };
 
   // Write-fusion renaming, done lazily. When a store region is fused, every
@@ -737,7 +715,8 @@ static RerollStats reroll_impl(
             // So "escapes the lane" is exactly "used at or past the lane
             // end", which is one binary search instead of a whole scan.
             if (br_internal == Luse &&
-                any_at_or_after(uses[(size_t)o], i + ((size_t)l + 1) * P))
+                any_at_or_after(uses[(size_t)o], i + ((size_t)l + 1) * P,
+                                st.list_steps))
               br_internal = l;
           }
 
@@ -826,7 +805,8 @@ static RerollStats reroll_impl(
               const Pos& prod = pos[(size_t)ap.ins[1].producer_pos];
               if (prod.index_elision) {
                 const int base = op_at(ap.ins[1].producer_pos, 0).in[0];
-                if (any_at_or_after(writers[(size_t)base], region_end))
+                if (any_at_or_after(writers[(size_t)base], region_end,
+                                    st.list_steps))
                   written_after = true;
               }
             }
@@ -842,7 +822,7 @@ static RerollStats reroll_impl(
               if (any_in_range_but(vec_uses, i, region_end, in_region_write) ||
                   any_in_range_but(vec_writers, i, region_end, in_region_write))
                 clean = false;
-              if (any_at_or_after(vec_writers, region_end))
+              if (any_at_or_after(vec_writers, region_end, st.list_steps))
                 written_after = true;
             }
             if (!clean || br_run < Luse) {

@@ -4,11 +4,20 @@
 #ifndef STANLI_KERNEL_TYPES_HPP
 #define STANLI_KERNEL_TYPES_HPP
 
+#include <cassert>
+#include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace stanli {
 
 class WaRng;
+
+// Mutable state owned by one bound Executor and one operation. Most kernels
+// need none; the retained loop keeps its tape here.
+struct KernelState {
+  virtual ~KernelState() = default;
+};
 
 // Per-evaluation resources that are neither graph structure nor arena state.
 // The caller owns every pointed-to resource. In particular, an RNG stream
@@ -46,7 +55,18 @@ struct Op {
   // Opaque per-op payload for kernels that need compile-time structure the
   // integer immediates cannot carry (ODEs, messages, declaration checks).
   const void* udata = nullptr;
+  // Operands that are logical views into a fixed capacity. dyn_extent_in
+  // names the input holding the live length; dyn_lengths names the operands
+  // it applies to. Storage stays at dyn_capacity throughout.
+  int64_t dyn_capacity = 0;
+  int8_t dyn_extent_in = -1;
+  uint8_t dyn_lengths = 0;
 };
+
+// Bit 6 of a dynamic-length mask names the output; bits 0..5 name inputs.
+inline constexpr uint8_t kDynamicLengthOutput = 1u << 6;
+static_assert(sizeof(Op::in) / sizeof(Op::in[0]) == 6,
+              "a dynamic-length mask has one bit per input");
 
 // Per-call view handed to kernels. Assembled by the executor; kernels never
 // see slots or arenas directly.
@@ -60,13 +80,36 @@ struct KernelCtx {
   int64_t n_idata = 0;
   const void* udata = nullptr;
   EvalState* eval_state = nullptr;
+  KernelState* state = nullptr;
   Desc out2{nullptr, 0};  // second output value (scalar), if any
   // Backward only. Data inputs get {nullptr, len}: kernels skip them.
   Desc in_adj[6];
   double out_adj = 0;            // scalar-output ops
   Desc out_adj_vec{nullptr, 0};  // vector-output ops
   double out2_adj = 0;           // adjoint of the second output
+  int64_t dyn_capacity = 0;
+  int8_t dyn_extent_in = -1;
+  uint8_t dyn_lengths = 0;
 };
+
+inline void apply_dynamic_length(KernelCtx& c) {
+  assert(c.in[c.dyn_extent_in].len == 1);
+  const double raw = c.in[c.dyn_extent_in].data[0];
+  const int64_t live = static_cast<int64_t>(raw);
+  if (!(raw >= 0) || raw > static_cast<double>(c.dyn_capacity) ||
+      static_cast<double>(live) != raw)
+    throw std::domain_error("logical extent exceeds graph capacity");
+  for (size_t k = 0; k < sizeof(c.in) / sizeof(c.in[0]); ++k)
+    if (c.dyn_lengths & (1u << k)) {
+      c.in[k].len = live;
+      c.in_adj[k].len = live;
+    }
+  if (c.dyn_lengths & kDynamicLengthOutput) {
+    c.out.len = live;
+    c.out_adj_vec.len = live;
+  }
+  c.n_in = c.dyn_extent_in;
+}
 
 }  // namespace stanli
 

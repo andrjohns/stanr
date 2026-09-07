@@ -5,6 +5,7 @@
 #define STANLI_GRAPH_HPP
 
 #include <stanli/kernel_types.hpp>
+#include <stanli/message.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -135,30 +136,11 @@ struct Graph {
   std::shared_ptr<const std::vector<int>> compact_idata_;
 };
 
-// Payload for OP_REJECT and OP_PRINT: the literal chunks of the message,
-// interleaved with the op's inputs at forward time. Chunk k precedes
-// input k; a trailing chunk with no input after it is just appended.
-struct MessageSpec {
-  std::vector<std::string> chunks;
-};
-
 // Payload for generated runtime bound and dimension checks.
 struct BoundCheckSpec {
   std::string name;
   bool bound_is_scalar = false;
   bool shapes_match = false;
-};
-
-// The two categorical families share one exact value/check/pullback op.
-// `scalar_outcome` is a language type distinction: array[1] int must select
-// Stan Math's vector overload even though its flat slot also has length one.
-struct CategoricalSpec {
-  bool logit = false;
-  bool scalar_outcome = false;
-  // These are independent: write_array values depend on q but instantiate on
-  // double, while a graph-constant AutoDiffable local instantiates on var.
-  bool arg_autodiff = false;
-  bool propto = true;  // template flag; Stan Math decides what it can drop
 };
 
 class Executor {
@@ -248,6 +230,10 @@ class Executor {
   std::vector<double> adjoints_;
   int64_t result_adjoint_offset_ = -1;
   std::vector<double> scratch_;
+  // Only stateful kernels are represented here; ordinary graph operations do
+  // not pay for a parallel null unique_ptr. KernelCtx retains stable raw views
+  // into these heap-owned objects.
+  std::vector<std::unique_ptr<KernelState>> kernel_states_;
   // One context per op, assembled once at bind. Every field in it is a
   // pointer into an arena that never moves after binding, or an immediate
   // copied from the op, so the only per-evaluation work is refreshing the
