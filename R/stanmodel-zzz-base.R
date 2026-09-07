@@ -86,7 +86,7 @@ StanModel <- R6Class(
       external_cpp = NULL,
       use_opencl = FALSE,
       compile_standalone = FALSE,
-      backend = "compiled"
+      backend = .stanr_default_backend()
     ) {
       compile <- .stanr_flag(compile, "compile")
       force_recompile <- .stanr_flag(force_recompile, "force_recompile")

@@ -2,6 +2,12 @@ local_test_context()
 
 init_test_cache("tuple-data")
 
+# Every test here feeds tuple/complex data or parameters through a model.
+skip_if_backend(
+  "stanli",
+  "stanli does not support tuple or complex data and parameters"
+)
+
 # Coverage for the tuple/complex data & init interop: the native flattening
 # and windowed-complex storage in `src/r_data_context.cpp`, and its wiring
 # into `.stanr_run_service()` / `fit$unconstrain_variables()`.

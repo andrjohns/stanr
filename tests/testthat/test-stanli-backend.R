@@ -16,11 +16,77 @@ test_that("stan_model(backend = \"stanli\") compiles and reports its backend", {
 })
 
 test_that("the default backend is \"compiled\"", {
+  # With neither override set, this is the package's own default (the test
+  # suite itself sets STANR_BACKEND for the pass it is running).
+  withr::local_options(stanr_backend = NULL)
+  withr::local_envvar(STANR_BACKEND = NA)
   mod <- stan_model(
     code = "parameters { real theta; } model { theta ~ normal(0, 1); }",
     compile = FALSE
   )
   expect_equal(mod$backend(), "compiled")
+})
+
+test_that("the STANR_BACKEND environment variable sets the default backend", {
+  withr::local_options(stanr_backend = NULL)
+  withr::local_envvar(STANR_BACKEND = "stanli")
+  mod <- stan_model(
+    code = "parameters { real theta; } model { theta ~ normal(0, 1); }",
+    compile = FALSE
+  )
+  expect_equal(mod$backend(), "stanli")
+
+  # An empty value is the same as unset.
+  withr::local_envvar(STANR_BACKEND = "")
+  mod <- stan_model(
+    code = "parameters { real theta; } model { theta ~ normal(0, 1); }",
+    compile = FALSE
+  )
+  expect_equal(mod$backend(), "compiled")
+})
+
+test_that("the stanr_backend option takes precedence over STANR_BACKEND", {
+  withr::local_envvar(STANR_BACKEND = "stanli")
+  withr::local_options(stanr_backend = "compiled")
+  mod <- stan_model(
+    code = "parameters { real theta; } model { theta ~ normal(0, 1); }",
+    compile = FALSE
+  )
+  expect_equal(mod$backend(), "compiled")
+
+  withr::local_envvar(STANR_BACKEND = "compiled")
+  withr::local_options(stanr_backend = "stanli")
+  mod <- stan_model(
+    code = "parameters { real theta; } model { theta ~ normal(0, 1); }",
+    compile = FALSE
+  )
+  expect_equal(mod$backend(), "stanli")
+})
+
+test_that("an explicit backend argument overrides both defaults", {
+  withr::local_envvar(STANR_BACKEND = "stanli")
+  withr::local_options(stanr_backend = "stanli")
+  mod <- stan_model(
+    code = "parameters { real theta; } model { theta ~ normal(0, 1); }",
+    compile = FALSE,
+    backend = "compiled"
+  )
+  expect_equal(mod$backend(), "compiled")
+})
+
+test_that("an invalid default backend errors like an invalid argument", {
+  withr::local_options(stanr_backend = "nope")
+  expect_error(
+    stan_model(code = "parameters { real x; }", compile = FALSE),
+    "should be one of"
+  )
+
+  withr::local_options(stanr_backend = NULL)
+  withr::local_envvar(STANR_BACKEND = "nope")
+  expect_error(
+    stan_model(code = "parameters { real x; }", compile = FALSE),
+    "should be one of"
+  )
 })
 
 test_that("an unknown backend value errors", {

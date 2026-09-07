@@ -19,7 +19,7 @@ stan_model(
   external_cpp = NULL,
   use_opencl = FALSE,
   compile_standalone = FALSE,
-  backend = "compiled"
+  backend = .stanr_default_backend()
 )
 }
 \arguments{
@@ -100,9 +100,11 @@ immediately after, but without a second compile. See
 \code{\link[=model-method-expose-stan-functions]{$expose_stan_functions()}} for
 what gets exposed and how.}
 
-\item{backend}{(string) Either \code{"compiled"} (the default), which compiles
-the model to a native shared library, or \code{"stanli"}, which interprets
-the model instead of compiling it. The \code{"stanli"} backend supports
+\item{backend}{(string) Either \code{"compiled"}, which compiles the model to a
+native shared library, or \code{"stanli"}, which interprets the model instead
+of compiling it. The default is the \code{stanr_backend} option if set,
+otherwise the \code{STANR_BACKEND} environment variable if set, otherwise
+\code{"compiled"}. The \code{"stanli"} backend supports
 constrained-scale initialization, but not \code{use_opencl}, \code{external_cpp},
 or non-empty \code{cpp_options}. Its exposed-function backend supports
 deterministic integer/real scalar and container functions, but not RNG,

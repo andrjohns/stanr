@@ -78,6 +78,7 @@ test_that("stanc prepends external C++ and permits declared C++ functions", {
 })
 
 test_that("stan_model compiles a model using external C++", {
+  skip_if_backend("stanli", "external_cpp is a compiled-backend feature")
   code <- paste(
     "functions { real external_mean(real x); }",
     "data { real x; }",
@@ -315,6 +316,7 @@ test_that("stanc(warn_uninitialized = TRUE) compiles without error", {
 })
 
 test_that("StanModel$variables() works with external_cpp", {
+  skip_if_backend("stanli", "external_cpp is a compiled-backend feature")
   code <- paste(
     "functions { real external_mean(real x); }",
     "parameters { real mu; }",

@@ -601,6 +601,20 @@
   env
 }
 
+# Default for the `backend` argument of stan_model() / StanModel$new(): the
+# `stanr_backend` option, then the STANR_BACKEND environment variable, then
+# "compiled". match.arg() at construction validates whatever this returns.
+.stanr_default_backend <- function() {
+  backend <- getOption("stanr_backend")
+  if (is.null(backend)) {
+    backend <- Sys.getenv("STANR_BACKEND", "compiled")
+    if (!nzchar(backend)) {
+      backend <- "compiled"
+    }
+  }
+  backend
+}
+
 #' Create a Stan model object
 #'
 #' @description Create a new [`StanModel`] object from a Stan program file or
@@ -672,9 +686,11 @@
 #'   is simply never called, so the platform/device baked in at compile time
 #'   (0/0) is used. The default OpenCL link flags are `"-framework OpenCL"`
 #'   on macOS and `"-lOpenCL"` elsewhere.
-#' @param backend (string) Either `"compiled"` (the default), which compiles
-#'   the model to a native shared library, or `"stanli"`, which interprets
-#'   the model instead of compiling it. The `"stanli"` backend supports
+#' @param backend (string) Either `"compiled"`, which compiles the model to a
+#'   native shared library, or `"stanli"`, which interprets the model instead
+#'   of compiling it. The default is the `stanr_backend` option if set,
+#'   otherwise the `STANR_BACKEND` environment variable if set, otherwise
+#'   `"compiled"`. The `"stanli"` backend supports
 #'   constrained-scale initialization, but not `use_opencl`, `external_cpp`,
 #'   or non-empty `cpp_options`. Its exposed-function backend supports
 #'   deterministic integer/real scalar and container functions, but not RNG,
@@ -735,7 +751,7 @@ stan_model <- function(
   external_cpp = NULL,
   use_opencl = FALSE,
   compile_standalone = FALSE,
-  backend = "compiled"
+  backend = .stanr_default_backend()
 ) {
   StanModel$new(
     stan_file = stan_file,

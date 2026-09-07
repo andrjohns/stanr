@@ -66,6 +66,13 @@ test_that("stan_model validates the cpp_options argument", {
     ),
     "single non-missing string, number, or logical"
   )
+})
+
+test_that("stan_model accepts a name repeated across cpp_options entries", {
+  skip_if_backend(
+    "stanli",
+    "non-empty cpp_options are a compiled-backend feature"
+  )
   # The same name may legitimately appear more than once (e.g. an
   # overriding assignment followed by an appending one), so this must not
   # error.
@@ -79,6 +86,10 @@ test_that("stan_model validates the cpp_options argument", {
 })
 
 test_that("stan_model stores and reports cpp_options via $cpp_options()", {
+  skip_if_backend(
+    "stanli",
+    "non-empty cpp_options are a compiled-backend feature"
+  )
   mod <- stan_model(
     code = "parameters { real x; }",
     cpp_options = list(CXXFLAGS = "-O3", STAN_THREADS = TRUE),
@@ -91,6 +102,10 @@ test_that("stan_model stores and reports cpp_options via $cpp_options()", {
 })
 
 test_that("a named cpp_options entry compiles successfully (overrides, doesn't break the build)", {
+  skip_if_backend(
+    "stanli",
+    "non-empty cpp_options are a compiled-backend feature"
+  )
   # Overriding CXXFLAGS drops stanr's own -O3 -g0 optimization flags, but
   # must not break the build: Makeconf's own CXXFLAGS still apply via the
   # outer `withr::with_makevars(assignment = "+=")` layer, and PKG_CPPFLAGS
@@ -179,6 +194,10 @@ test_that(".stanr_apply_makevars overrides on '=' and appends on '+='", {
 # keep its code, and hence its hash, unique to that test.
 
 test_that("stan_model writes exactly one cache file next to stan_file", {
+  skip_if_backend(
+    "stanli",
+    "the on-disk compiled-library cache is a compiled-backend feature"
+  )
   src_dir <- withr::local_tempdir()
   stan_file <- file.path(src_dir, "model.stan")
   writeLines(unique_stan_code(), stan_file)
@@ -196,6 +215,10 @@ test_that("stan_model writes exactly one cache file next to stan_file", {
 })
 
 test_that("stan_model caches to tempdir, not the working directory, for a code string", {
+  skip_if_backend(
+    "stanli",
+    "the on-disk compiled-library cache is a compiled-backend feature"
+  )
   code <- unique_stan_code()
   before <- list.files(tempdir(), pattern = paste0("\\", .Platform$dynlib.ext, "$"))
 
@@ -207,6 +230,11 @@ test_that("stan_model caches to tempdir, not the working directory, for a code s
 })
 
 test_that("a second compile of identical code in the same session skips stanc() via the in-memory memo", {
+  skip_if_backend(
+    "stanli",
+    "counts stanc() calls made by the compiled backend; stanli builds from a ",
+    "MIR without calling stanc()"
+  )
   call_count <- 0
   real_stanc <- stanc
   testthat::local_mocked_bindings(
@@ -228,6 +256,10 @@ test_that("a second compile of identical code in the same session skips stanc() 
 })
 
 test_that("restoring a warm on-disk cache skips stanc() even without an in-memory hit", {
+  skip_if_backend(
+    "stanli",
+    "the on-disk compiled-library cache is a compiled-backend feature"
+  )
   src_dir <- withr::local_tempdir()
   stan_file <- file.path(src_dir, "model.stan")
   writeLines(unique_stan_code(), stan_file)
@@ -254,6 +286,10 @@ test_that("restoring a warm on-disk cache skips stanc() even without an in-memor
 })
 
 test_that("force_recompile forces a fresh compile and overwrites the single cache file in place", {
+  skip_if_backend(
+    "stanli",
+    "the on-disk compiled-library cache is a compiled-backend feature"
+  )
   src_dir <- withr::local_tempdir()
   stan_file <- file.path(src_dir, "model.stan")
   writeLines(unique_stan_code(), stan_file)
@@ -287,6 +323,11 @@ test_that("force_recompile forces a fresh compile and overwrites the single cach
 })
 
 test_that("the stanr_force_recompile option forces a fresh compile on a warm cache", {
+  skip_if_backend(
+    "stanli",
+    "counts stanc() calls made by the compiled backend; stanli builds from a ",
+    "MIR without calling stanc()"
+  )
   call_count <- 0
   real_stanc <- stanc
   testthat::local_mocked_bindings(
@@ -331,6 +372,7 @@ test_that("force_recompile does not unload the library a live fit still points i
 })
 
 test_that("changing external_cpp file contents (same path) changes model_hash and triggers a fresh compile", {
+  skip_if_backend("stanli", "external_cpp is a compiled-backend feature")
   call_count <- 0
   real_stanc <- stanc
   testthat::local_mocked_bindings(
@@ -396,6 +438,10 @@ test_that("changing external_cpp file contents (same path) changes model_hash an
 })
 
 test_that("changing cpp_options changes model_hash and triggers a fresh compile", {
+  skip_if_backend(
+    "stanli",
+    "non-empty cpp_options are a compiled-backend feature"
+  )
   call_count <- 0
   real_stanc <- stanc
   testthat::local_mocked_bindings(
@@ -431,6 +477,10 @@ test_that("changing cpp_options changes model_hash and triggers a fresh compile"
 })
 
 test_that("stan_model falls back to tempdir when stan_file's directory is unwritable", {
+  skip_if_backend(
+    "stanli",
+    "the on-disk compiled-library cache is a compiled-backend feature"
+  )
   src_dir <- withr::local_tempdir()
   stan_file <- file.path(src_dir, "model.stan")
   writeLines(unique_stan_code(), stan_file)

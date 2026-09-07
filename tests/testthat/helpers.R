@@ -22,16 +22,59 @@ test_stan_file <- local({
   }
 })
 
-# Compiled-model cache shared across test files (helpers load once per run).
+# ---------------------------------------------------------------------------
+# Backend selection.
+#
+# `stan_model()` has two backends -- "compiled" (Stan -> C++ -> shared
+# library) and "stanli" (interpreted) -- and this suite runs in full under
+# either one. The package takes the default `backend` from the
+# `stanr_backend` option, then the STANR_BACKEND environment variable (see
+# `.stanr_default_backend()`, R/stan_model.R). The suite drives that through
+# STANR_BACKEND: one backend per testthat process, "compiled" when unset,
+# with tests/testthat.R running the suite once per backend under R CMD
+# check. To run the stanli pass interactively:
+#
+#   withr::with_envvar(c(STANR_BACKEND = "stanli"), devtools::test())
+#
+# Plain `stan_model()` and `test_model()` calls therefore build models with
+# the backend under test, while a call site that passes `backend =` itself
+# (as test-stanli-backend.R does) behaves the same under either setting. A
+# test of a feature only one backend has starts with `skip_if_backend()`, so
+# the other pass reports it as skipped rather than silently narrowing its
+# assertions.
+# ---------------------------------------------------------------------------
+test_backend <- function() {
+  backend <- stanr:::.stanr_default_backend()
+  if (!backend %in% c("compiled", "stanli")) {
+    stop(
+      "STANR_BACKEND must be \"compiled\" or \"stanli\", not \"",
+      backend,
+      "\" (tests/testthat.R is what runs both passes).",
+      call. = FALSE
+    )
+  }
+  backend
+}
+
+# `...` is pasted into the reason, so long reasons can be split over lines.
+skip_if_backend <- function(backend, ...) {
+  if (identical(test_backend(), backend)) {
+    testthat::skip(paste0(paste0(...), " [", backend, " backend]"))
+  }
+}
+
+# Model cache shared across test files (helpers load once per run), keyed by
+# backend so a cached entry never leaks across passes.
 test_model <- local({
   models <- new.env(parent = emptyenv())
   function(name) {
-    if (is.null(models[[name]])) {
-      models[[name]] <- stan_model(
+    key <- paste(test_backend(), name, sep = "/")
+    if (is.null(models[[key]])) {
+      models[[key]] <- stan_model(
         stan_file = test_stan_file(paste0(name, ".stan"))
       )
     }
-    models[[name]]
+    models[[key]]
   }
 })
 

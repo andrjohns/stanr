@@ -50,6 +50,11 @@ run_captured <- function(expr) {
 }
 
 test_that("show_exceptions = TRUE (default) prints Metropolis rejection chatter to stderr", {
+  skip_if_backend(
+    "stanli",
+    "stanli evaluates reject() as a -Inf density without emitting Stan's ",
+    "rejection chatter"
+  )
   mod <- get_rejecting_model()
 
   cap <- run_captured(
@@ -70,6 +75,11 @@ test_that("show_exceptions = TRUE (default) prints Metropolis rejection chatter 
 })
 
 test_that("show_exceptions = FALSE silences exception chatter on both streams but keeps it in output()", {
+  skip_if_backend(
+    "stanli",
+    "stanli evaluates reject() as a -Inf density without emitting Stan's ",
+    "rejection chatter"
+  )
   mod <- get_rejecting_model()
 
   cap <- run_captured(
@@ -102,6 +112,11 @@ test_that("show_exceptions = FALSE silences exception chatter on both streams bu
 })
 
 test_that("show_messages = FALSE silences progress output but show_exceptions = TRUE still prints chatter", {
+  skip_if_backend(
+    "stanli",
+    "stanli evaluates reject() as a -Inf density without emitting Stan's ",
+    "rejection chatter"
+  )
   mod <- get_rejecting_model()
 
   cap <- run_captured(
@@ -123,6 +138,11 @@ test_that("show_messages = FALSE silences progress output but show_exceptions = 
 })
 
 test_that("multi-chain run with show_exceptions = FALSE completes and retains chatter in output()", {
+  skip_if_backend(
+    "stanli",
+    "stanli evaluates reject() as a -Inf density without emitting Stan's ",
+    "rejection chatter"
+  )
   mod <- get_rejecting_model()
 
   result <- mod$sample(

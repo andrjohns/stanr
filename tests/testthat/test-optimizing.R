@@ -86,6 +86,11 @@ test_that("optimizing output() returns non-empty Stan log messages", {
 })
 
 test_that("optimizing with jacobian = TRUE vs FALSE gives different mle() for constrained parameters", {
+  skip_if_backend(
+    "stanli",
+    "stanli's density always includes the Jacobian, so the services ignore ",
+    "jacobian = FALSE"
+  )
   mod <- test_model("sigma_normal")
   data <- list(N = 5, y = c(0.8, -1.2, 0.5, 1.7, -0.3))
 

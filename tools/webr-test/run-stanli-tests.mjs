@@ -53,6 +53,9 @@ const rCode = `
 library(testthat)
 library(${JSON.stringify(pkgName)}, character.only = TRUE)
 
+# stan_model()'s default backend, unless a test passes `backend =` itself.
+Sys.setenv(STANR_BACKEND = "stanli")
+
 setwd(${JSON.stringify(testsMount)})
 results <- test_dir(
   ${JSON.stringify(testsMount)},

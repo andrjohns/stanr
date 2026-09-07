@@ -22,6 +22,13 @@ loaded_dll_paths <- function() {
 }
 
 .stanr_model_method_model <- function() {
+  # Skipping here (rather than per test) covers every test that reaches the
+  # shared fixture, at the point it would first need it.
+  skip_if_backend(
+    "stanli",
+    "stanli cannot evaluate model_methods.stan: its normal_rng() generated ",
+    "quantity fails with 'OP_RNG requires caller-owned evaluation RNG state'"
+  )
   if (!exists("model", envir = .stanr_model_method_state, inherits = FALSE)) {
     model <- stan_model(
       stan_file = test_stan_file("model_methods.stan"),
@@ -90,18 +97,11 @@ test_that("log probability, gradient, and Hessian match analytical values", {
   upars <- c(0, 0.5, -0.5)
 
   expected_lp <- -6 * log(2) - 0.25
-  expected_lp_no_jacobian <- -4 * log(2) - 0.25
   expected_gradient <- c(1, -0.5, 0.5)
   expected_hessian <- diag(c(-1.5, -1, -1))
-  expected_hessian_no_jacobian <- diag(c(-1, -1, -1))
 
   # Calling a model method must initialize the native pointer lazily.
   expect_equal(fit$log_prob(upars), expected_lp, tolerance = 1e-10)
-  expect_equal(
-    fit$log_prob(upars, jacobian = FALSE),
-    expected_lp_no_jacobian,
-    tolerance = 1e-10
-  )
 
   gradient <- fit$grad_log_prob(upars)
   expect_equal(as.numeric(gradient), expected_gradient, tolerance = 1e-9)
@@ -117,6 +117,22 @@ test_that("log probability, gradient, and Hessian match analytical values", {
   )
   expect_equal(hessian$hessian, expected_hessian, tolerance = 1e-6)
   expect_equal(hessian$hessian, t(hessian$hessian), tolerance = 1e-12)
+})
+
+test_that("log_prob() and hessian() honour jacobian = FALSE", {
+  skip_if_backend("stanli", "stanli model methods support only jacobian = TRUE")
+  fit <- .stanr_model_method_fit()
+  upars <- c(0, 0.5, -0.5)
+
+  expected_lp_no_jacobian <- -4 * log(2) - 0.25
+  expected_gradient <- c(1, -0.5, 0.5)
+  expected_hessian_no_jacobian <- diag(c(-1, -1, -1))
+
+  expect_equal(
+    fit$log_prob(upars, jacobian = FALSE),
+    expected_lp_no_jacobian,
+    tolerance = 1e-10
+  )
 
   hessian_no_jacobian <- fit$hessian(upars, jacobian = FALSE)
   expect_equal(
@@ -420,6 +436,10 @@ test_that("serialized fits lazily rebuild data-bound model methods", {
 })
 
 test_that("model methods on a tuple-data fit still work after readRDS()", {
+  skip_if_backend(
+    "stanli",
+    "stanli does not support tuple or complex data and parameters"
+  )
   mod <- test_model("tuple_complex_battery")
   data <- battery_data()
   # iter_sampling = 1 is below the 3-iteration minimum for E-BFMI, which
@@ -555,6 +575,10 @@ test_that("ensure_native()'s probe is invoked exactly once across N consecutive 
 # tuple_complex_unbounded.stan) via the shared `test_model()` cache.         --
 
 test_that("constrain_variables(unconstrain_variables(x)) recovers canonical tuple/complex shapes exactly", {
+  skip_if_backend(
+    "stanli",
+    "stanli does not support tuple or complex data and parameters"
+  )
   # Unbounded parameters (`tuple(real, vector[2]) t; complex z;`) make
   # unconstrain -> constrain the identity transform, so this is a property
   # test, not just a shape check.
@@ -586,6 +610,10 @@ test_that("constrain_variables(unconstrain_variables(x)) recovers canonical tupl
 })
 
 test_that("variable_skeleton() has the exact golden nested-list/array shape for the tuple/complex battery model", {
+  skip_if_backend(
+    "stanli",
+    "stanli does not support tuple or complex data and parameters"
+  )
   mod <- test_model("tuple_complex_battery")
   # iter_sampling = 1 is below the 3-iteration minimum for E-BFMI, which
   # $sample() would otherwise warn about unprompted; irrelevant here.
@@ -638,6 +666,10 @@ test_that("variable_skeleton() has the exact golden nested-list/array shape for 
 })
 
 test_that("unconstrain_draws() still works on a tuple/complex-model fit (regression: bracket-name path unaffected by tuple/complex support)", {
+  skip_if_backend(
+    "stanli",
+    "stanli does not support tuple or complex data and parameters"
+  )
   mod <- test_model("tuple_complex_unbounded")
   # iter_sampling = 2 is below the 3-iteration minimum for E-BFMI, which
   # $sample() would otherwise warn about unprompted; irrelevant here.
@@ -665,6 +697,10 @@ test_that("unconstrain_draws() still works on a tuple/complex-model fit (regress
 })
 
 test_that("$optimize() and $laplace() succeed on a tuple/complex model (regression: bracket-name paths unaffected by tuple/complex support)", {
+  skip_if_backend(
+    "stanli",
+    "stanli does not support tuple or complex data and parameters"
+  )
   mod <- test_model("tuple_complex_unbounded")
   init <- list(t = list(0, c(0, 0)), z = 0 + 0i)
 
@@ -711,6 +747,10 @@ test_that("$optimize() and $laplace() succeed on a tuple/complex model (regressi
 })
 
 test_that("generate_quantities() runs on draws from a tuple/complex-model $sample() fit", {
+  skip_if_backend(
+    "stanli",
+    "stanli does not support tuple or complex data and parameters"
+  )
   mod <- test_model("tuple_complex_battery")
   data <- battery_data()
   # iter_sampling = 2 is below the 3-iteration minimum for E-BFMI, which
@@ -770,6 +810,10 @@ test_that("generate_quantities() runs on draws from a tuple/complex-model $sampl
 })
 
 test_that("constrain_variables() reconstructs array-of-tuple/2D-tuple-array/complex-in-tuple-array values exactly (not just shape)", {
+  skip_if_backend(
+    "stanli",
+    "stanli does not support tuple or complex data and parameters"
+  )
   # The golden-shape test above exercises the native skeleton builder (no
   # values); this one exercises the element-major native reconstruction on
   # every array-of-tuple shape the battery model declares (`acv_out`:

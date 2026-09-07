@@ -44,7 +44,9 @@ test_that("NA integer data is rejected before Stan services run", {
       show_messages = FALSE,
       num_threads = test_threads()
     ),
-    "Integer variable 'y' contains NA"
+    # The compiled backend's R-side check and stanli's data conversion each
+    # word this differently, but both reject it before any service runs.
+    "Integer variable 'y' contains NA|stanli data cannot contain NA: y"
   )
 })
 
@@ -62,7 +64,7 @@ test_that("NA/NaN real data is rejected before Stan services run", {
       show_messages = FALSE,
       num_threads = test_threads()
     ),
-    "Real variable 'mu' contains NA or NaN"
+    "Real variable 'mu' contains NA or NaN|stanli data cannot contain NA, NaN, or Inf: mu"
   )
 
   data$mu <- NaN
@@ -76,7 +78,7 @@ test_that("NA/NaN real data is rejected before Stan services run", {
       show_messages = FALSE,
       num_threads = test_threads()
     ),
-    "Real variable 'mu' contains NA or NaN"
+    "Real variable 'mu' contains NA or NaN|stanli data cannot contain NA, NaN, or Inf: mu"
   )
 })
 

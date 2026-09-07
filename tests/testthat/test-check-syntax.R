@@ -56,6 +56,7 @@ test_that("check_syntax() resolves #include directives", {
 })
 
 test_that("check_syntax() allows undefined functions declared via external_cpp", {
+  skip_if_backend("stanli", "external_cpp is a compiled-backend feature")
   code <- paste(
     "functions { real external_mean(real x); }",
     "data { real x; }",

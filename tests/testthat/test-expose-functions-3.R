@@ -130,6 +130,11 @@ model {
 })
 
 test_that("expose_stan_functions() errors for a Stan program with no functions block", {
+  skip_if_backend(
+    "stanli",
+    "stanli populates an empty $functions env for a program with no functions ",
+    "block instead of erroring"
+  )
   mod <- stan_model(
     code = "
 parameters {
@@ -220,6 +225,11 @@ model {
 })
 
 test_that("compile_standalone compiles the functions block via a separate stanc call", {
+  skip_if_backend(
+    "stanli",
+    "counts stanc() calls made by the compiled backend; stanli builds from a ",
+    "MIR without calling stanc()"
+  )
   code <- "
 functions {
   real hash_sep_add(real a, real b) { return a + b; }
@@ -277,6 +287,7 @@ model {
 })
 
 test_that("compile_standalone works together with external_cpp: model, external fn, and plain fn all callable", {
+  skip_if_backend("stanli", "external_cpp is a compiled-backend feature")
   code <- paste(
     "functions {",
     "  real external_mean(real x);",
@@ -375,6 +386,10 @@ model {
 })
 
 test_that("compile_standalone = TRUE combined-TU model exposes a tuple function correctly", {
+  skip_if_backend(
+    "stanli",
+    "the stanli Function API cannot expose tuple functions"
+  )
   mod <- stan_model(
     code = "
 functions {
