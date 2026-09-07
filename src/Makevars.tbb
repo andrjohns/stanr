@@ -45,7 +45,10 @@ else
   TBB_RPATH_FLAG =
 endif
 
-ifneq ($(findstring -fsanitize,$(CXX)),)
+
+R_CXX_SANITIZE_CHECK := $(shell $(R_HOME)/bin$(R_ARCH_BIN)/R CMD config CXX 2>/dev/null) \
+  $(shell $(R_HOME)/bin$(R_ARCH_BIN)/R CMD config CXXFLAGS 2>/dev/null)
+ifneq ($(findstring -fsanitize,$(R_CXX_SANITIZE_CHECK)),)
   TBB_SANITIZE_FLAGS = -fno-sanitize=all -D__TBB_USE_SANITIZERS=1
 endif
 
