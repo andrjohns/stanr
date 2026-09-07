@@ -315,6 +315,20 @@
   list(code = code, functions = functions_df)
 }
 
+# Wrapper declarations for the functions a program exposes. Both backends
+# build their `$functions` env from this, so both refuse the same input the
+# same way: a program with no `functions` block, or one declaring none.
+.stanr_exposed_function_wrappers <- function(code) {
+  gen <- .stanr_functions_to_cpp_wrappers(code)
+  if (is.null(gen$functions) || !nrow(gen$functions)) {
+    stop(
+      "The Stan program has no `functions` block to expose.",
+      call. = FALSE
+    )
+  }
+  gen
+}
+
 # Compiles a Stan `functions` block into a callable env via `R CMD SHLIB`:
 # stanc -> standalone C++ + generated SEXP wrappers, then dyn.load. Wrappers
 # call `model_namespace::<fn>`, which the standalone TU defines.
@@ -340,7 +354,7 @@
     perl = TRUE
   )
 
-  gen <- .stanr_functions_to_cpp_wrappers(code)
+  gen <- .stanr_exposed_function_wrappers(code)
   wrapper_section <- gen$code
 
   # external_cpp is at file scope before `model_namespace`; unqualify calls.

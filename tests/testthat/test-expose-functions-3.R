@@ -130,11 +130,6 @@ model {
 })
 
 test_that("expose_stan_functions() errors for a Stan program with no functions block", {
-  skip_if_backend(
-    "stanli",
-    "stanli populates an empty $functions env for a program with no functions ",
-    "block instead of erroring"
-  )
   mod <- stan_model(
     code = "
 parameters {
@@ -147,7 +142,26 @@ model {
     compile = FALSE
   )
 
-  expect_error(mod$expose_stan_functions())
+  expect_error(mod$expose_stan_functions(), "no `functions` block")
+  # And it must not have compiled anything on the way to that error.
+  expect_false(mod$is_compiled())
+})
+
+test_that("compile_standalone = TRUE errors for a Stan program with no functions block", {
+  expect_error(
+    stan_model(
+      code = "
+parameters {
+  real theta;
+}
+model {
+  theta ~ normal(0, 1);
+}
+",
+      compile_standalone = TRUE
+    ),
+    "no `functions` block"
+  )
 })
 
 # Below: `compile_standalone = TRUE` integration tests -- the model's own

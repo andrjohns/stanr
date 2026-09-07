@@ -50,11 +50,6 @@ run_captured <- function(expr) {
 }
 
 test_that("show_exceptions = TRUE (default) prints Metropolis rejection chatter to stderr", {
-  skip_if_backend(
-    "stanli",
-    "stanli evaluates reject() as a -Inf density without emitting Stan's ",
-    "rejection chatter"
-  )
   mod <- get_rejecting_model()
 
   cap <- run_captured(
@@ -75,11 +70,6 @@ test_that("show_exceptions = TRUE (default) prints Metropolis rejection chatter 
 })
 
 test_that("show_exceptions = FALSE silences exception chatter on both streams but keeps it in output()", {
-  skip_if_backend(
-    "stanli",
-    "stanli evaluates reject() as a -Inf density without emitting Stan's ",
-    "rejection chatter"
-  )
   mod <- get_rejecting_model()
 
   cap <- run_captured(
@@ -112,11 +102,6 @@ test_that("show_exceptions = FALSE silences exception chatter on both streams bu
 })
 
 test_that("show_messages = FALSE silences progress output but show_exceptions = TRUE still prints chatter", {
-  skip_if_backend(
-    "stanli",
-    "stanli evaluates reject() as a -Inf density without emitting Stan's ",
-    "rejection chatter"
-  )
   mod <- get_rejecting_model()
 
   cap <- run_captured(
@@ -138,11 +123,6 @@ test_that("show_messages = FALSE silences progress output but show_exceptions = 
 })
 
 test_that("multi-chain run with show_exceptions = FALSE completes and retains chatter in output()", {
-  skip_if_backend(
-    "stanli",
-    "stanli evaluates reject() as a -Inf density without emitting Stan's ",
-    "rejection chatter"
-  )
   mod <- get_rejecting_model()
 
   result <- mod$sample(
@@ -161,6 +141,63 @@ test_that("multi-chain run with show_exceptions = FALSE completes and retains ch
   # is not asserted here (see SHOW_EXCEPTIONS_PLAN.md section 9), only that
   # $output() remains complete.
   expect_match(paste(result$output(), collapse = "\n"), "test rejection")
+})
+
+# print() travels the same route as the chatter above: generated code (and
+# the stanli adapter) write it to the stream Stan's services connect to the
+# logger, so it reaches stdout and stays in $output().
+test_that("print() in the model block reaches stdout and output()", {
+  mod <- stan_model(
+    code = "
+      parameters { real x; }
+      model {
+        print(\"model print: x = \", x);
+        x ~ normal(0, 1);
+      }
+    "
+  )
+
+  cap <- run_captured(
+    mod$sample(
+      data = list(),
+      iter_warmup = 5,
+      iter_sampling = 5,
+      chains = 1,
+      seed = 42,
+      refresh = 0,
+      show_messages = TRUE,
+      num_threads = test_threads()
+    )
+  )
+
+  expect_match(paste(cap$stdout, collapse = "\n"), "model print: x = ")
+  expect_match(paste(cap$result$output(), collapse = "\n"), "model print: x = ")
+})
+
+test_that("print() in generated quantities reaches stdout and output()", {
+  mod <- stan_model(
+    code = "
+      parameters { real x; }
+      model { x ~ normal(0, 1); }
+      generated quantities { print(\"gq print: x = \", x); }
+    "
+  )
+
+  cap <- run_captured(
+    mod$sample(
+      data = list(),
+      iter_warmup = 5,
+      iter_sampling = 5,
+      chains = 1,
+      seed = 42,
+      refresh = 0,
+      show_messages = TRUE,
+      num_threads = test_threads()
+    )
+  )
+
+  expect_match(paste(cap$stdout, collapse = "\n"), "gq print: x = ")
+  expect_match(paste(cap$result$output(), collapse = "\n"), "gq print: x = ")
 })
 
 test_that("show_exceptions wiring also works for a non-sampling service ($optimize)", {

@@ -317,13 +317,8 @@
 }
 
 .stanr_stanli_functions_environment <- function(mir, code, native) {
-  declarations <- .stanr_functions_to_cpp_wrappers(code)$functions
+  declarations <- .stanr_exposed_function_wrappers(code)$functions
   env <- new.env(parent = emptyenv())
-  if (is.null(declarations) || !nrow(declarations)) {
-    registry <- list(name = character(), is_rng = logical(), args = character())
-    env$stanr_exposed_functions <- function() registry
-    return(env)
-  }
 
   unsupported <- declarations$is_rng |
     grepl("_(rng|lp)$", declarations$name) |
@@ -465,7 +460,7 @@
   )
   if (compile_standalone) {
     # Generate R->C++ SEXP wrappers from the AST.
-    gen <- .stanr_functions_to_cpp_wrappers(code)
+    gen <- .stanr_exposed_function_wrappers(code)
     wrapper_section <- gen$code
     # external_cpp is at file scope before `model_namespace`; unqualify calls.
     if (length(external_cpp) > 0) {

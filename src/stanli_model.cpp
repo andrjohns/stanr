@@ -5,6 +5,7 @@
 #include <stanli/compile.hpp>
 #include <stanli/executor_pool.hpp>
 #include <stanli/function.hpp>
+#include <stanli/message_sink.hpp>
 #include <stanli/wa_interp.hpp>
 
 #include <cpp11.hpp>
@@ -22,6 +23,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -29,6 +31,44 @@
 
 namespace stanr {
 namespace {
+
+// Where a print() from the model block or generated quantities goes while a
+// Stan call is in progress: the `std::ostream*` Stan handed to log_prob() /
+// write_array(), which its services connect to the same logger the compiled
+// backend's generated code reaches through pstream__. stanli emits print()
+// through one process-global sink (<stanli/message_sink.hpp>), so the sink
+// forwards to this thread-local, set for the duration of each call -- per
+// thread, so parallel chains cannot cross streams. A null stream drops the
+// text, exactly as generated code does when pstream__ is null.
+thread_local std::ostream* stanli_message_stream = nullptr;
+
+class scoped_message_stream {
+ public:
+  explicit scoped_message_stream(std::ostream* msgs)
+      : previous_(stanli_message_stream) {
+    stanli_message_stream = msgs;
+  }
+  ~scoped_message_stream() { stanli_message_stream = previous_; }
+  scoped_message_stream(const scoped_message_stream&) = delete;
+  scoped_message_stream& operator=(const scoped_message_stream&) = delete;
+
+ private:
+  std::ostream* previous_;
+};
+
+void install_message_sink() {
+  static const bool installed = [] {
+    stanli::set_message_sink([](const char* text, std::size_t len) {
+      if (std::ostream* msgs = stanli_message_stream) {
+        // Generated code prints the message followed by std::endl.
+        msgs->write(text, static_cast<std::streamsize>(len));
+        *msgs << std::endl;
+      }
+    });
+    return true;
+  }();
+  (void)installed;
+}
 
 std::vector<int64_t> sexp_dims(const std::string& name, SEXP value) {
   SEXP dim = Rf_getAttrib(value, R_DimSymbol);
@@ -277,6 +317,7 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
   stanli_model_base(const std::string& mir, const stanli::DataMap& data,
                     std::string model_name)
       : stan::model::model_base(0), name_(std::move(model_name)) {
+    install_message_sink();
     cm_ = stanli::compile_model(mir, data);
     proto_ = std::make_unique<stanli::Executor>(std::move(cm_.graph));
     cm_.bind(*proto_);
@@ -324,42 +365,40 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     for (const auto& p : cm_.unc_params) append_unc_names(p, names);
   }
 
-  double density(Eigen::VectorXd& q) const {
+  // Exceptions propagate exactly as they do from a compiled model: stanli
+  // lowers reject() and its argument checks to std::domain_error, which
+  // Stan's services treat as a rejected proposal / initial value (and log
+  // as such), while anything else is the same unrecoverable error it would
+  // be for generated C++.
+  double density(Eigen::VectorXd& q, std::ostream* msgs) const {
+    scoped_message_stream message_stream(msgs);
     auto lease = pool_->acquire();
     check_size(q.size());
     for (Eigen::Index i = 0; i < q.size(); ++i) lease->params_data()[i] = q(i);
-    try {
-      return lease->forward();
-    } catch (const std::exception&) {
-      return -std::numeric_limits<double>::infinity();
-    }
+    return lease->forward();
   }
 
   stan::math::var density(
-      Eigen::Matrix<stan::math::var, -1, 1>& q) const {
+      Eigen::Matrix<stan::math::var, -1, 1>& q, std::ostream* msgs) const {
+    scoped_message_stream message_stream(msgs);
     auto lease = pool_->acquire();
     check_size(q.size());
     std::vector<double> gradient(static_cast<size_t>(q.size()));
     for (Eigen::Index i = 0; i < q.size(); ++i)
       lease->params_data()[i] = q(i).val();
-    double value;
-    try {
-      value = lease->gradient(gradient.data());
-    } catch (const std::exception&) {
-      return stan::math::var(-std::numeric_limits<double>::infinity());
-    }
+    const double value = lease->gradient(gradient.data());
     std::vector<stan::math::var> operands;
     if (q.size() != 0) operands.assign(q.data(), q.data() + q.size());
     return stan::math::precomputed_gradients(value, operands, gradient);
   }
 
 #define STANLI_EIGEN_LOG_PROB(NAME) \
-  double NAME(Eigen::VectorXd& q, std::ostream*) const override { \
-    return density(q); \
+  double NAME(Eigen::VectorXd& q, std::ostream* msgs) const override { \
+    return density(q, msgs); \
   } \
-  stan::math::var NAME( \
-      Eigen::Matrix<stan::math::var, -1, 1>& q, std::ostream*) const override { \
-    return density(q); \
+  stan::math::var NAME(Eigen::Matrix<stan::math::var, -1, 1>& q, \
+                       std::ostream* msgs) const override { \
+    return density(q, msgs); \
   }
 
   STANLI_EIGEN_LOG_PROB(log_prob)
@@ -588,7 +627,8 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
 
   void write_array_impl(stan::rng_t& rng, const double* q, size_t q_size,
                         double* out, bool include_tparams, bool include_gqs,
-                        std::ostream*) const {
+                        std::ostream* msgs) const {
+    scoped_message_stream message_stream(msgs);
     check_size(static_cast<Eigen::Index>(q_size));
     std::array<Range, 2> ranges;
     const size_t n_ranges =
