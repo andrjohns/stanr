@@ -74,7 +74,7 @@ jobs:
           rwasm::build("local::.", out_dir = ".")
         shell: Rscript {0}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: matrix.config.os == 'wasm'
         with:
           node-version: '22'
