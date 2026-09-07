@@ -23,7 +23,7 @@ jobs:
           - { name: "rhel9" }
 
     env:
-      MAKEFLAGS: -j2
+      MAKEFLAGS: -j1
       TESTTHAT_CPUS: 4
       STANR_USE_QUICKJSR: true
     steps:
