@@ -2,7 +2,7 @@
   "name": "stanr-webr-test",
   "private": true,
   "version": "1.0.0",
-  "description": "Runs stanr's stanli-backend testthat suite against an rwasm-built package under webR (Node).",
+  "description": "Runs stanr's testthat suite (stanli backend) against an rwasm-built package under webR (Node).",
   "type": "module",
   "scripts": {
     "test": "node run-stanli-tests.mjs"

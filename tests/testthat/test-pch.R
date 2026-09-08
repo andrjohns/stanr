@@ -48,6 +48,7 @@ mock_pch_system2 <- function(pch_build_calls_env) {
 }
 
 test_that("compile failure with a fresh PCH does not trigger a PCH rebuild", {
+  skip_on_webr()
   cache_home <- withr::local_tempdir()
   withr::local_envvar(R_USER_CACHE_DIR = cache_home)
   withr::local_options(stanr_pch_dir = file.path(cache_home, "pch"))
@@ -83,6 +84,7 @@ test_that("compile failure with a fresh PCH does not trigger a PCH rebuild", {
 })
 
 test_that("compile failure with a PCH-related diagnostic triggers exactly one rebuild-and-retry", {
+  skip_on_webr()
   cache_home <- withr::local_tempdir()
   withr::local_envvar(R_USER_CACHE_DIR = cache_home)
   withr::local_options(stanr_pch_dir = file.path(cache_home, "pch"))
@@ -126,6 +128,7 @@ test_that("compile failure with a PCH-related diagnostic triggers exactly one re
 })
 
 test_that("PCH builds announce themselves and retain only two cache entries", {
+  skip_on_webr()
   cache_home <- withr::local_tempdir()
   cache_dir <- file.path(cache_home, "pch")
   withr::local_options(stanr_pch_dir = cache_dir)

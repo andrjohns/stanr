@@ -43,6 +43,19 @@ test_stan_file <- local({
 # the other pass reports it as skipped rather than silently narrowing its
 # assertions.
 # ---------------------------------------------------------------------------
+# The wasm build of the suite (tools/webr-test/run-stanli-tests.mjs, run by
+# the "wasm" R-CMD-check job) runs the whole suite under the stanli backend in
+# webR. Some tests need what webR/Emscripten cannot provide regardless of
+# backend -- a C++ toolchain for `R CMD SHLIB` (`system()` is unsupported), or
+# std::thread (webR is built without pthreads). Those skip via this helper so
+# the webR pass reports them as skipped rather than erroring; `...` is pasted
+# into the reason.
+skip_on_webr <- function(...) {
+  if (identical(R.version$os, "emscripten")) {
+    testthat::skip(paste0(paste0(...), " [webR/Emscripten]"))
+  }
+}
+
 test_backend <- function() {
   backend <- stanr:::.stanr_default_backend()
   if (!backend %in% c("compiled", "stanli")) {

@@ -1,13 +1,18 @@
-// Runs a testthat file from tests/testthat/ against an rwasm::build()-built
+// Runs the testthat suite from tests/testthat/ against an rwasm::build()-built
 // stanr package, inside webR (Node), and exits non-zero on any failure.
 //
-// This exists because the "stanli" backend interprets Stan programs rather
-// than compiling them, so it's the one backend that's actually exercisable
-// in a wasm/webR context without a C++ toolchain at runtime -- unlike the
-// default "compiled" backend used by most of the test suite, which JIT
-// compiles a native shared library per model via R CMD SHLIB.
+// The suite runs under the "stanli" backend (STANR_BACKEND=stanli, the same
+// per-backend pass tests/testthat.R drives natively): stanli interprets Stan
+// programs rather than compiling them, so it's the one backend that's
+// exercisable in a wasm/webR context without a C++ toolchain at runtime --
+// unlike the "compiled" backend, which JIT compiles a native shared library
+// per model via R CMD SHLIB. Tests of compiled-only features skip themselves
+// via skip_if_backend("stanli", ...) in tests/testthat/helpers.R.
 //
-// Usage: node run-stanli-tests.mjs <path-to-pkg-tarball> <path-to-repo-root> <filter>
+// Usage: node run-stanli-tests.mjs <path-to-pkg-tarball> <path-to-repo-root> [filter]
+//
+// `filter` is an optional testthat file filter (a regex matched against the
+// test file names, e.g. "stanli-backend"); omit it to run every test file.
 
 import { WebR } from 'webr';
 import { mkdtempSync, existsSync, readdirSync, statSync } from 'node:fs';
@@ -16,8 +21,8 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const [, , tarballPath, repoRoot, filter] = process.argv;
-if (!tarballPath || !repoRoot || !filter) {
-  console.error('Usage: node run-stanli-tests.mjs <path-to-pkg-tarball> <path-to-repo-root> <filter>');
+if (!tarballPath || !repoRoot) {
+  console.error('Usage: node run-stanli-tests.mjs <path-to-pkg-tarball> <path-to-repo-root> [filter]');
   process.exit(1);
 }
 
@@ -53,13 +58,21 @@ const rCode = `
 library(testthat)
 library(${JSON.stringify(pkgName)}, character.only = TRUE)
 
-# stan_model()'s default backend, unless a test passes `backend =` itself.
+# stan_model()'s default backend, unless a test passes backend = itself.
 Sys.setenv(STANR_BACKEND = "stanli")
 
+# Report every failure rather than stopping at testthat's default cap.
+options(testthat.progress.max_fails = Inf)
+
 setwd(${JSON.stringify(testsMount)})
+# package = : mirror test_check() under R CMD check -- tests evaluate with the
+# package namespace as their parent env, and the testthat edition comes from
+# the installed DESCRIPTION (Config/testthat/edition) rather than defaulting to
+# edition 2 because the mounted tests dir has no DESCRIPTION next to it.
 results <- test_dir(
   ${JSON.stringify(testsMount)},
-  filter = ${JSON.stringify(filter)},
+  package = ${JSON.stringify(pkgName)},
+  filter = ${filter ? JSON.stringify(filter) : 'NULL'},
   reporter = "summary",
   stop_on_failure = FALSE
 )

@@ -84,8 +84,8 @@ jobs:
         working-directory: tools/webr-test
         run: npm ci
 
-      - name: Run stanli-backend tests under webR (Node)
+      - name: Run test suite under webR (Node, stanli backend)
         if: matrix.config.os == 'wasm'
         run: |
           node tools/webr-test/run-stanli-tests.mjs \
-            ./stanr_*.tgz . stanli-backend
+            ./stanr_*.tgz .

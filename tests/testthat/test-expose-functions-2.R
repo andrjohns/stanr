@@ -2,6 +2,11 @@ local_test_context()
 
 init_test_cache("expose-functions-2")
 
+# Every test here drives the compiled functions-block toolchain directly
+# (.compile_standalone_functions_environment / .stanr_build_functions_env),
+# which shells out to `R CMD SHLIB` whatever the model backend under test.
+skip_on_webr("compiling a functions block needs R CMD SHLIB")
+
 # Below: integration tests that actually invoke stanc.js + a real C++
 # compile (via .compile_standalone_functions_environment()). Slow but
 # expected for this package; the cache dir is redirected by setup.R.
