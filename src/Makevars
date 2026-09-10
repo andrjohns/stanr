@@ -11,17 +11,18 @@ PKG_CPPFLAGS_BASE = -I"../inst/include" \
   -D_HAS_AUTO_PTR_ETC=0 -DEIGEN_PERMANENTLY_DISABLE_STUPID_WARNINGS \
   -DTBB_INTERFACE_NEW -DEIGEN_NO_DEBUG -DBOOST_DISABLE_ASSERTS
 
-PKG_CPPFLAGS = $(PKG_CPPFLAGS_BASE) -include stan_sundials_printf_override.hpp
-PKG_CXXFLAGS += -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden
-PKG_CFLAGS += -fvisibility=hidden
-
 R_CC := $(shell $(R_HOME)/bin$(R_ARCH_BIN)/R CMD config CC)
 
 ifneq ($(findstring emcc,$(R_CC)),)
   CXX20PICFLAGS = -fPIC
 else
-  PKG_CPPFLAGS += -DSTAN_THREADS
+  # The package objects, Stanli objects, and PCH must agree on TLS storage.
+  PKG_CPPFLAGS_BASE += -DSTAN_THREADS
 endif
+
+PKG_CPPFLAGS = $(PKG_CPPFLAGS_BASE) -include stan_sundials_printf_override.hpp
+PKG_CXXFLAGS += -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden
+PKG_CFLAGS += -fvisibility=hidden
 
 include Makevars.tbb
 
@@ -48,12 +49,12 @@ STANLI_OBJECTS = $(STANLI_SOURCES:.cpp=.o)
 ifneq ($(findstring clang,$(R_CC))$(findstring emcc,$(R_CC)),)
 STANLI_PCH = include/stanli_pch.hpp.pch
 STANLI_CXXFLAGS = $(PKG_CPPFLAGS_BASE) -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden -include-pch include/stanli_pch.hpp.pch
-$(STANLI_PCH): include/stanli_pch.hpp
+$(STANLI_PCH): include/stanli_pch.hpp Makevars
 	env $(CXX) $(CXX20FLAGS) $(PKG_CPPFLAGS_BASE) -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden -fPIC -fpch-instantiate-templates -x c++-header $< -o $@
 else
 STANLI_PCH = include/stanli_pch.hpp.gch
 STANLI_CXXFLAGS = $(PKG_CPPFLAGS_BASE) -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden -include include/stanli_pch.hpp
-$(STANLI_PCH): include/stanli_pch.hpp
+$(STANLI_PCH): include/stanli_pch.hpp Makevars
 	env $(CXX) $(CXX20FLAGS) $(PKG_CPPFLAGS_BASE) -ffp-contract=off -fvisibility=hidden -fvisibility-inlines-hidden -fPIC -x c++-header $< -o $@
 endif
 
