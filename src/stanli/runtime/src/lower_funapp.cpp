@@ -129,6 +129,7 @@ bool Lowering::fun_effectful(const std::string& name) {
   };
 
   visit_expr = [&](const mir::Expr& e) {
+    if (mir::stateful_intrinsic_kind(e)) return true;
     if (e.kind == mir::Expr::FunApp && e.name.size() >= 4 &&
         e.name.compare(e.name.size() - 4, 4, "_rng") == 0)
       return true;
@@ -149,6 +150,7 @@ bool Lowering::fun_effectful(const std::string& name) {
   };
 
   visit_stmt = [&](const mir::Stmt& s) {
+    if (s.kind == mir::Stmt::TargetPE) return true;
     if (s.kind == mir::Stmt::NRFunApp && message_action(s.fn_name)) return true;
     for (const auto& e : s.fn_args)
       if (visit_expr(e)) return true;
@@ -177,7 +179,8 @@ std::vector<int> Lowering::int_arg_values(LoweredArgument& actual) {
     if (int_env.count(oc.name)) return {static_cast<int>(int_env[oc.name])};
   }
   if (oc.kind == mir::Expr::LitInt) return {static_cast<int>(oc.lit_i)};
-  if (oc.kind == mir::Expr::Indexed) {
+  if (oc.kind == mir::Expr::Indexed ||
+      (oc.kind == mir::Expr::FunApp && oc.unsized.depth > 0)) {
     // May be a slice (y[i] on a 2-D array yields a whole row), so
     // evaluate through the data interpreter, not scalar eval_int.
     DataMap::Entry v = eval_pure(oc, "an integer density argument");
@@ -395,21 +398,15 @@ Lowering::Val Lowering::free_transform(uint16_t opcode,
 // in the caller's scope, bound under the parameter names in a shadowed
 // scope, and the body lowers like any other statements (loops unroll,
 // data-only conditions resolve). Return throws the result value out.
-Lowering::Val Lowering::lower_call_udf(
-    const mir::Expr& e, const std::function<void()>& before_body) {
+Lowering::Val Lowering::lower_call_udf(const mir::Expr& e,
+                                       const std::function<void()>& before_body,
+                                       const UdfSpecialization& specialize) {
   auto it = fun_defs.find(e.name);
   if (it == fun_defs.end()) fail("unknown function " + e.name, e.raw);
   const mir::FunDef& f = *it->second;
   CallArguments actuals(*this, e);
   actuals.require_arity(f.arg_names.size());
-  struct Binding {
-    bool is_int = false;
-    long iv = 0;
-    Val v{-1, false, {}};
-    std::optional<DataMap::Entry> data;
-    bool formal_data_only = false;
-  };
-  std::vector<Binding> binds(actuals.size());
+  std::vector<UdfBinding> binds(actuals.size());
   for (size_t i = 0; i < actuals.size(); ++i) {
     LoweredArgument& actual = actuals.at(i);
     const mir::Expr& a = actual.expr();
@@ -434,6 +431,8 @@ Lowering::Val Lowering::lower_call_udf(
   // Higher-order calls may validate after evaluating all actual arguments
   // but before entering the user body (reduce_sum's grainsize check).
   if (before_body) before_body();
+  if (specialize)
+    if (auto result = specialize(binds)) return *result;
   if (++udf_depth > 64) {
     --udf_depth;
     fail("UDF recursion too deep in " + e.name);
@@ -644,9 +643,8 @@ Lowering::Val Lowering::lower_scalar_rng(const mir::Expr& e,
   if (!in_write_array)
     fail(e.name + " is supported only in generated quantities", e.raw);
   const size_t arity = scalar_rng_arity(family);
-  if (actuals.size() != arity || e.unsized.depth != 0)
-    fail(e.name + ": expected scalar result and " + std::to_string(arity) +
-             " scalar argument(s)",
+  if (actuals.size() != arity || e.unsized.depth > 1)
+    fail(e.name + ": expected " + std::to_string(arity) + " argument(s)",
          e.raw);
   const mir::UnsizedLeaf result_leaf = scalar_rng_is_int(family)
                                            ? mir::UnsizedLeaf::Int
@@ -662,29 +660,77 @@ Lowering::Val Lowering::lower_scalar_rng(const mir::Expr& e,
     fail(e.name + ": first argument must be int", e.raw);
   std::vector<Val> args;
   args.reserve(arity);
+  int64_t n = 1;
+  bool saw_container = false;
   for (size_t i = 0; i < actuals.size(); ++i) {
     const mir::Expr& arg = actuals.at(i).expr();
     if (arg.unsized.depth != 0)
       fail(e.name + ": container arguments stay on WaInterp", e.raw);
-    args.push_back(actuals.at(i).value());
-    if (!is_scalar(args.back()))
+    Val v = actuals.at(i).value();
+    if (!is_scalar(v) && !is_vector(v.si) && !is_row_vector(v.si))
       fail(e.name + ": container arguments stay on WaInterp", e.raw);
+    args.push_back(v);
+    saw_container = saw_container || is_vector(v.si) || is_row_vector(v.si);
+    const int64_t len = g.slots[v.slot].len;
+    if (len != 1) {
+      if (n != 1 && len != n)
+        fail(e.name + ": argument lengths disagree", e.raw);
+      n = len;
+    }
   }
-  Val draw = with_layout(
-      arity == 1   ? emit_value(OP_RNG, {args[0]}, 1, view_of(e.type_))
-      : arity == 2 ? emit_value(OP_RNG, {args[0], args[1]}, 1, view_of(e.type_))
-                   : emit_value(OP_RNG, {args[0], args[1], args[2]}, 1,
-                                view_of(e.type_)),
-      ExpressionLayout::scalar());
-  g.ops.back().variant = static_cast<uint8_t>(family);
-  // An effect is never a graph constant, even when all distribution
-  // parameters are. This also keeps downstream compile-time demands from
-  // mistaking a draw for data.
-  draw.si.param_free = false;
-  draw.autodiff = false;
-  if (scalar_rng_is_int(family)) set_int_initialized(draw);
-  if (family == ScalarRng::Bernoulli) set_int_range(draw, 0, 1);
-  return draw;
+  if (e.unsized.depth == 0 && n != 1)
+    fail(e.name + ": expected scalar result and " + std::to_string(arity) +
+             " scalar argument(s)",
+         e.raw);
+  if (e.unsized.depth == 1 && !saw_container)
+    fail(e.name + ": expected scalar result and " + std::to_string(arity) +
+             " scalar argument(s)",
+         e.raw);
+  const char* const scalar_type = scalar_rng_is_int(family) ? "UInt" : "UReal";
+  const auto draw_at = [&](int64_t i) {
+    std::vector<Val> call_args;
+    call_args.reserve(arity);
+    for (const Val& v : args) {
+      const int64_t len = g.slots[v.slot].len;
+      call_args.push_back(
+          len == 1
+              ? v
+              : with_layout(
+                    emit_value(OP_INDEX, {v}, 1, view_of(scalar_type),
+                               {checked_immediate(i, "rng argument offset")}),
+                    ExpressionLayout::scalar()));
+    }
+    Val draw = with_layout(
+        arity == 1 ? emit_value(OP_RNG, {call_args[0]}, 1, view_of(scalar_type))
+        : arity == 2
+            ? emit_value(OP_RNG, {call_args[0], call_args[1]}, 1,
+                         view_of(scalar_type))
+            : emit_value(OP_RNG, {call_args[0], call_args[1], call_args[2]}, 1,
+                         view_of(scalar_type)),
+        ExpressionLayout::scalar());
+    g.ops.back().variant = static_cast<uint8_t>(family);
+    // An effect is never a graph constant, even when all distribution
+    // parameters are. This also keeps downstream compile-time demands from
+    // mistaking a draw for data.
+    draw.si.param_free = false;
+    draw.autodiff = false;
+    return draw;
+  };
+  if (e.unsized.depth == 0) {
+    Val draw = draw_at(0);
+    if (scalar_rng_is_int(family)) set_int_initialized(draw);
+    if (family == ScalarRng::Bernoulli) set_int_range(draw, 0, 1);
+    return draw;
+  }
+  Val acc = draw_at(0);
+  for (int64_t i = 1; i < n; ++i)
+    acc = emit_value(OP_CONCAT2, {acc, draw_at(i)}, i + 1);
+  acc.si = array_view({n}, ViewKind::Flat, false);
+  acc.autodiff = false;
+  acc.layout = owning_layout(acc.si);
+  if (scalar_rng_is_int(family)) set_int_initialized(acc);
+  if (family == ScalarRng::Bernoulli) set_int_range(acc, 0, 1);
+  return acc;
 }
 Lowering::Val Lowering::lower_append_array(const mir::Expr& e,
                                            CallArguments& actuals) {
@@ -1203,6 +1249,19 @@ std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
   // their own policy dispatch further down.
   const bool elementwise_builtin =
       builtin != nullptr && builtin->shape == BuiltinShapePolicy::Elementwise;
+  if (elementwise_builtin && builtin->arity == 4) {
+    actuals.require_arity(4);
+    Val a = actuals.at(0).value(), b = actuals.at(1).value();
+    Val c = actuals.at(2).value(), d = actuals.at(3).value();
+    const std::vector<Val> values{a, b, c, d};
+    const auto layout = resolved_builtin_layout(e, *builtin, values);
+    SlotInfo si = view_of(e.type_);
+    si.param_free = a.si.param_free && b.si.param_free && c.si.param_free &&
+                    d.si.param_free;
+    return with_layout(
+        emit_value(builtin->opcode, {a, b, c, d}, layout.lanes, si),
+        elementwise_layout({a, b, c, d}));
+  }
   if (elementwise_builtin && builtin->arity == 2 &&
       builtin->arguments[0] == BuiltinArgumentKind::Real &&
       builtin->arguments[1] == BuiltinArgumentKind::Real) {
@@ -1214,9 +1273,17 @@ std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
     SlotInfo si = values[layout.result_argument].si;
     si.param_free = a.si.param_free && b.si.param_free;
     Val v = emit_value(builtin->opcode, {a, b}, layout.lanes, si);
-    if (builtin->opcode == OP_POW)
+    if (builtin->opcode == OP_POW) {
       g.ops.back().variant =
           mir::pow_zero_base_law(e.args[0], e.args[1], b.autodiff);
+    } else if (builtin->opcode == OP_FMAX || builtin->opcode == OP_FMIN) {
+      // Operand activity selects the stan-math overload: ties and NaN
+      // adjoints differ between the var,var and mixed instantiations, and
+      // the register-machine backward needs the same bits the kernel path
+      // reads from its adjoint slots.
+      g.ops.back().variant =
+          (uint8_t)((a.autodiff ? 0x1u : 0u) | (b.autodiff ? 0x2u : 0u));
+    }
     return with_layout(v, elementwise_layout({a, b}));
   }
 
@@ -1515,7 +1582,7 @@ std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
       const bool int_surface =
           e.type_ == "UInt" || e.unsized.leaf == mir::UnsizedLeaf::Int ||
           (!e.args.empty() && e.args[0].unsized.leaf == mir::UnsizedLeaf::Int);
-      if (int_surface && in_write_array) {
+      if (int_surface && write_array_unregioned()) {
         if (runtime_int_sum_candidate(e))
           return lower_runtime_int_sum(e, actuals);
         if (!is_int_sum_surface(e))
@@ -1559,7 +1626,16 @@ std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
             ? elementwise_layout({a})
             : owning_layout(si);
     return with_layout(
-        emit_value(builtin->opcode, {a}, g.slots[a.slot].len, si), layout);
+        emit_value(
+            builtin->opcode, {a}, g.slots[a.slot].len, si,
+            resolved.groups < 0
+                ? std::vector<int>{}
+                : std::vector<int>{checked_immediate(resolved.groups,
+                                                     "softmax groups"),
+                                   checked_immediate(resolved.group_width,
+                                                     "softmax width"),
+                                   0}),
+        layout);
   }
   // plus, and its operator spelling, are the identity on every shape.
   if (e.name == "PPlus__" || (e.name == "plus" && e.args.size() == 1)) {

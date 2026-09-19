@@ -12,6 +12,7 @@
 namespace stanli {
 
 class WaRng;
+class ReduceExecutionContext;
 
 // Mutable state owned by one bound Executor and one operation. Most kernels
 // need none; the retained loop keeps its tape here.
@@ -24,6 +25,7 @@ struct KernelState {
 // belongs to one chain/drawing thread, never to a compiled model or executor.
 struct EvalState {
   WaRng* wa_rng = nullptr;
+  ReduceExecutionContext* reduce = nullptr;
 };
 
 // A view of one contiguous buffer. len == 1 means scalar.
@@ -35,7 +37,7 @@ struct Desc {
 // A value in the graph. Slots with is_param are the unconstrained parameter
 // vector, in declaration order; everything else is data or an intermediate.
 struct Slot {
-  int64_t offset = 0;  // into the value arena (filled at bind)
+  int64_t offset = 0;  // within its bound value buffer (filled at bind)
   int64_t len = 0;
   bool is_param = false;
 };

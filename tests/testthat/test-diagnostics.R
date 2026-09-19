@@ -68,11 +68,6 @@ test_that("$gradients() has one row per unconstrained parameter", {
 })
 
 test_that("$gradients() has correct dimensions for multi-parameter model", {
-  skip_if_backend(
-    "stanli",
-    "stanli cannot evaluate model_methods.stan: its normal_rng() generated ",
-    "quantity fails with 'OP_RNG requires caller-owned evaluation RNG state'"
-  )
   # model_methods has 3 unconstrained parameters: theta, beta[1], beta[2]
   mod <- test_model("model_methods")
   data <- list(N = 10, y = c(1, 0, 1, 1, 0, 1, 0, 0, 1, 0), mu = 0)

@@ -22,13 +22,6 @@ loaded_dll_paths <- function() {
 }
 
 .stanr_model_method_model <- function() {
-  # Skipping here (rather than per test) covers every test that reaches the
-  # shared fixture, at the point it would first need it.
-  skip_if_backend(
-    "stanli",
-    "stanli cannot evaluate model_methods.stan: its normal_rng() generated ",
-    "quantity fails with 'OP_RNG requires caller-owned evaluation RNG state'"
-  )
   if (!exists("model", envir = .stanr_model_method_state, inherits = FALSE)) {
     model <- stan_model(
       stan_file = test_stan_file("model_methods.stan"),

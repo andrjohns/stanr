@@ -418,6 +418,15 @@ const std::vector<FunctionSpec>& function_specs() {
     builtin("sqrt", unary_builtin(OP_SQRT));
     builtin("square", unary_builtin(OP_SQUARE));
     builtin("log1m", unary_builtin(OP_LOG1M));
+    builtin("student_t_qf",
+            {OP_STUDENT_T_QF,
+             4,
+             {BuiltinArgumentKind::Real, BuiltinArgumentKind::Real,
+              BuiltinArgumentKind::Real, BuiltinArgumentKind::Real},
+             FunctionArgumentKind::Real,
+             BuiltinShapePolicy::Elementwise,
+             BuiltinCompatibilityPolicy::LaneCount,
+             0xf});
     builtin("softmax", unary_builtin(OP_SOFTMAX));
     builtin("tanh", unary_builtin(OP_TANHV));
     builtin("cumulative_sum", unary_builtin(OP_CUMSUM));
@@ -539,6 +548,9 @@ const std::vector<FunctionSpec>& function_specs() {
     builtin("gumbel_rng", rng_builtin(ScalarRng::Gumbel));
     builtin("beta_binomial_rng", rng_builtin(ScalarRng::BetaBinomial));
     builtin("exponential_rng", rng_builtin(ScalarRng::Exponential));
+    builtin("poisson_rng", rng_builtin(ScalarRng::Poisson));
+    builtin("student_t_rng", rng_builtin(ScalarRng::StudentT));
+    builtin("bernoulli_logit_rng", rng_builtin(ScalarRng::BernoulliLogit));
 
     constexpr auto kInt = BuiltinArgumentKind::Integer;
     constexpr auto kReal = BuiltinArgumentKind::Real;
@@ -616,6 +628,9 @@ const std::vector<FunctionSpec>& function_specs() {
     builtin("Transpose__", slice_builtin(BuiltinSlice::Transpose, 1));
     builtin("to_vector", slice_builtin(BuiltinSlice::ToVector, 1));
     builtin("to_row_vector", slice_builtin(BuiltinSlice::ToRowVector, 1));
+    builtin("to_vector_array", slice_builtin(BuiltinSlice::ToVectorArray, 1));
+    builtin("to_row_vector_array",
+            slice_builtin(BuiltinSlice::ToRowVectorArray, 1));
     builtin("to_matrix", slice_builtin(BuiltinSlice::ToMatrix, 1));
     builtin("to_matrix", slice_builtin(BuiltinSlice::ToMatrix, 3));
     builtin("to_matrix", slice_builtin(BuiltinSlice::ToMatrix, 4));
@@ -691,6 +706,15 @@ const std::vector<FunctionSpec>& function_specs() {
     density("categorical_logit_lpmf",
             {OP_CATEGORICAL, 2, 0, false, DensityShape::Categorical, -1, false,
              0, kCategoricalLogit});
+    for (const auto& entry : {std::pair{"poisson_binomial_lpmf", 0},
+                              std::pair{"poisson_binomial_cdf", 2},
+                              std::pair{"poisson_binomial_lcdf", 4},
+                              std::pair{"poisson_binomial_lccdf", 6}}) {
+      DensitySpec spec{OP_POISSON_BINOMIAL, 2, 1, false,
+                       DensityShape::PoissonBinomial};
+      spec.fixed_variant = entry.second;
+      density(entry.first, spec);
+    }
     density("poisson_lpmf",
             {OP_POISSON_LPMF, 2, 1, false, DensityShape::Plain, -1, true});
     density("neg_binomial_2_lpmf", {OP_NEG_BINOMIAL_2_LPMF, 3, 1, false,
@@ -726,9 +750,9 @@ const std::vector<FunctionSpec>& function_specs() {
     density("multi_normal_prec_lpdf",
             vectorized_mvt_spec(OP_MULTI_NORMAL_PREC_LPDF, 3, 0x3));
     density("lkj_corr_cholesky_lpdf", {OP_LKJ_CORR_CHOL_LPDF, 2, 0, false,
-                                       DensityShape::FirstMatrixRows, 0x1});
-    density("lkj_corr_lpdf", {OP_LKJ_CORR_LPDF, 2, 0, false,
-                              DensityShape::FirstMatrixRows, 0x1});
+                                       DensityShape::FirstMatrixRows, -1});
+    density("lkj_corr_lpdf",
+            {OP_LKJ_CORR_LPDF, 2, 0, false, DensityShape::FirstMatrixRows, -1});
     density("lkj_cov_lpdf",
             {OP_LKJ_COV_LPDF, 4, 0, false, DensityShape::FirstMatrixRows, 0xf});
     density("multi_gp_lpdf", {OP_MULTI_GP_LPDF, 3, 0, false,

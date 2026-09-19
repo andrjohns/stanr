@@ -504,9 +504,14 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
       const stan::io::var_context& context) const {
     const stanli::DataMap supplied =
         stanli::DataMap::from_var_context(context);
-    const std::map<std::string, stanli::DataMap::Entry> inits(
-        supplied.entries().begin(), supplied.entries().end());
-    return check_unconstrained_size(init_interpreter().eval(inits));
+    const stanli::InitInterp& interp = init_interpreter();
+    // Stan's transform_inits ignores names that are not parameters.
+    std::map<std::string, stanli::DataMap::Entry> inits;
+    for (const stanli::InitParam& param : interp.params()) {
+      const auto it = supplied.entries().find(param.name);
+      if (it != supplied.entries().end()) inits.insert(*it);
+    }
+    return check_unconstrained_size(interp.eval(inits));
   }
 
   std::vector<double> unconstrain_flat(const double* values, size_t size) const {
@@ -634,8 +639,8 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
     const size_t n_ranges =
         selected_ranges(include_tparams, include_gqs, ranges);
 
+    stanli::WaRng wa_rng(include_gqs ? static_cast<unsigned>(rng()) : 1);
     if (wa_interp_) {
-      stanli::WaRng wa_rng(include_gqs ? static_cast<unsigned>(rng()) : 1);
       auto lease = pool_->acquire();
       if (q_size != 0) std::copy(q, q + q_size, lease->params_data());
       lease->run_forward_only();
@@ -652,7 +657,7 @@ class __attribute__((visibility("hidden"))) stanli_model_base final
 
     auto lease = (wa_pool_ ? *wa_pool_ : *pool_).acquire();
     if (q_size != 0) std::copy(q, q + q_size, lease->params_data());
-    lease->run_forward_only();
+    lease->run_forward_only(stanli::EvalState{&wa_rng});
     for (size_t r = 0; r < n_ranges; ++r) {
       for (size_t i = ranges[r].first; i < ranges[r].second; ++i) {
         const auto& v = columns_[i];

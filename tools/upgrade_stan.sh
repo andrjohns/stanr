@@ -9,8 +9,8 @@
 # Makevars and the headers are vendored into the package instead.
 set -e
 
-MATH_REF="8f326d14599d3030c626c46532d8e8534c1cdbec"
-STAN_REF="c96d04115d35cb04f42e45c5a69a82f9704798f1"
+MATH_REF="5252d51d47c1d5e78005fc043ad996fad6dd8da8"
+STAN_REF="a6806ef8477a7b5f65b27449ec33528c162bc024"
 MATH_SRC="math-$MATH_REF"
 STAN_SRC="stan-$STAN_REF"
 INC=../inst/include
@@ -236,12 +236,12 @@ patch_sprintf "../src/cvodes/cvodes_diag.c" "name" 30 10
 patch_sprintf "../src/cvodes/cvodes_ls.c" "name" 30 13
 
 # --- 6d. Fix the size_t/unsigned int write() overload collision on ILP32 ---
-patch_size_t_overload() {
-  # $1 = file, $2 = true if the overload has a real (non-empty) body
-  python3 - "$1" "$2" << 'EOF'
+# structured_writer.hpp uses fixed-width overloads upstream; only
+# json_writer.hpp still declares both.
+python3 - "$INC/stan/callbacks/json_writer.hpp" << 'EOF'
 import sys
 
-path, has_body = sys.argv[1], sys.argv[2] == "1"
+path = sys.argv[1]
 text = open(path).read()
 
 old_includes = "#include <string>\n"
@@ -249,8 +249,7 @@ new_includes = "#include <climits>\n#include <cstdint>\n#include <string>\n"
 assert old_includes in text, f"'#include <string>' not found -- {path} changed upstream"
 text = text.replace(old_includes, new_includes, 1)
 
-if has_body:
-    old = """  /**
+old = """  /**
    * Write a key-value pair where the value is an `unsigned int`.
    * @param key Name of the value pair
    * @param value `unsigned int` to write.
@@ -259,7 +258,7 @@ if has_body:
     write_int_like(key, value);
   }
 """
-    new = """#if SIZE_MAX != UINT_MAX
+new = """#if SIZE_MAX != UINT_MAX
   /**
    * Write a key-value pair where the value is an `unsigned int`.
    * @param key Name of the value pair
@@ -268,23 +267,6 @@ if has_body:
   void write(const std::string& key, unsigned int value) {
     write_int_like(key, value);
   }
-#endif
-"""
-else:
-    old = """  /**
-   * Write a key-value pair where the value is an `unsigned int`.
-   * @param key Name of the value pair
-   * @param value `unsigned int` to write.
-   */
-  virtual void write(const std::string& key, unsigned int value) {}
-"""
-    new = """#if SIZE_MAX != UINT_MAX
-  /**
-   * Write a key-value pair where the value is an `unsigned int`.
-   * @param key Name of the value pair
-   * @param value `unsigned int` to write.
-   */
-  virtual void write(const std::string& key, unsigned int value) {}
 #endif
 """
 assert old in text, f"unsigned int write() overload not found -- {path} changed upstream"
@@ -292,9 +274,6 @@ text = text.replace(old, new, 1)
 
 open(path, "w").write(text)
 EOF
-}
-patch_size_t_overload "$INC/stan/callbacks/structured_writer.hpp" 0
-patch_size_t_overload "$INC/stan/callbacks/json_writer.hpp" 1
 
 # --- 7. TBB ------------------------------------------------------------
 # TBB is not vendored from the CmdStan/math bundle -- see tools/upgrade_tbb.sh,

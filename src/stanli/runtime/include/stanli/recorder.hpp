@@ -72,6 +72,23 @@ inline Eigen::Map<const Eigen::Matrix<rvar, -1, 1>> as_rvar(const Desc& d) {
       reinterpret_cast<const rvar*>(d.data), d.len);
 }
 
+// vector_seq_view lives in namespace stan and finds scalar-specific value
+// extraction by ADL. Keep this in rvar's namespace, just as var's overloads
+// are in var's namespace. The view is consumed in the caller's expression.
+template <typename T,
+          std::enable_if_t<std::is_same_v<typename T::Scalar, rvar>, int> = 0>
+inline auto value_of(const T& values) {
+  return values.unaryExpr([](const rvar& value) { return value.val(); });
+}
+
+// The same promotion for a matrix operand (a GLM's parameter-dependent
+// design matrix). Column-major, like every kernel matrix map.
+inline Eigen::Map<const Eigen::Matrix<rvar, -1, -1>> as_rvar_matrix(
+    const Desc& d, int64_t rows, int64_t cols) {
+  return Eigen::Map<const Eigen::Matrix<rvar, -1, -1>>(
+      reinterpret_cast<const rvar*>(d.data), rows, cols);
+}
+
 // Where build() deposits partials: one buffer per propagator edge, in
 // operand order. A null buf skips that edge's copy-out. len is the configured
 // buffer width; it lets a probability function that returns before build()
@@ -188,14 +205,19 @@ class ops_partials_edge<ViewElt, stanli::rvar, void> {
 };
 
 template <typename ViewElt, typename Op>
-class ops_partials_edge<ViewElt, Op, require_eigen_vt<is_fvar, Op>> {
+class ops_partials_edge<ViewElt, Op, require_eigen_vector_vt<is_fvar, Op>> {
  public:
   using partials_t = Eigen::Map<Eigen::Array<double, -1, 1>>;
   Eigen::Index size_{0};
   bool owns_partials_{true};
   std::vector<double> owned_;
   partials_t partials_;
-  broadcast_array<partials_t> partials_vec_{partials_};
+  // Stan Math's vector-sequence partials accept matrix expressions, while
+  // scalar-vectorized densities use the array view above. Both alias the same
+  // storage and copy construction must rebind both views to the new edge.
+  Eigen::MatrixWrapper<partials_t> vector_partials_{partials_};
+  broadcast_array<Eigen::MatrixWrapper<partials_t>> partials_vec_{
+      vector_partials_};
 
   template <typename OpT, require_eigen_vt<is_fvar, OpT>* = nullptr>
   explicit ops_partials_edge(const OpT& ops, std::size_t idx)
@@ -226,6 +248,61 @@ class ops_partials_edge<ViewElt, Op, require_eigen_vt<is_fvar, Op>> {
         owns_partials_(slot == nullptr),
         owned_(owns_partials_ ? static_cast<std::size_t>(n) : std::size_t{0}),
         partials_(owns_partials_ ? owned_.data() : slot, n) {
+    partials_.setZero();
+  }
+};
+
+// Matrix operands (a GLM's parameter-dependent design matrix). The partials
+// keep the operand's two-dimensional shape so stan-math's matrix-shaped
+// derivative assignments dimension-check, and they sit directly on the sink
+// slot column-major -- the same layout the kernel's input buffer uses, so
+// emit is the identity whenever the slot matched.
+template <typename ViewElt, typename Op>
+class ops_partials_edge<ViewElt, Op,
+                        require_eigen_matrix_dynamic_vt<is_fvar, Op>> {
+ public:
+  using partials_t = Eigen::Map<Eigen::Array<double, -1, -1>>;
+  Eigen::Index rows_{0};
+  Eigen::Index cols_{0};
+  bool owns_partials_{true};
+  std::vector<double> owned_;
+  partials_t partials_;
+  broadcast_array<partials_t> partials_vec_{partials_};
+
+  template <typename OpT,
+            require_eigen_matrix_dynamic_vt<is_fvar, OpT>* = nullptr>
+  explicit ops_partials_edge(const OpT& ops, std::size_t idx)
+      : ops_partials_edge(slot_for(idx, ops.size()), ops.rows(), ops.cols()) {}
+  ops_partials_edge(const ops_partials_edge& o)
+      : rows_(o.rows_),
+        cols_(o.cols_),
+        owns_partials_(o.owns_partials_),
+        owned_(o.owns_partials_ ? o.owned_ : std::vector<double>()),
+        partials_(o.owns_partials_ ? owned_.data()
+                                   : const_cast<double*>(o.partials_.data()),
+                  o.rows_, o.cols_) {}
+
+  int size() const { return static_cast<int>(rows_ * cols_); }
+  void emit(double* dst) const {
+    if (partials_.data() == dst) return;
+    for (Eigen::Index i = 0; i < rows_ * cols_; ++i)
+      dst[i] = partials_.data()[i];
+  }
+
+ private:
+  static double* slot_for(std::size_t idx, Eigen::Index n) {
+    stanli::sink* s = stanli::active_sink();
+    if (s != nullptr && s->buf[idx] != nullptr && s->len[idx] == n)
+      return s->buf[idx];
+    return nullptr;
+  }
+  ops_partials_edge(double* slot, Eigen::Index rows, Eigen::Index cols)
+      : rows_(rows),
+        cols_(cols),
+        owns_partials_(slot == nullptr),
+        owned_(owns_partials_ ? static_cast<std::size_t>(rows * cols)
+                              : std::size_t{0}),
+        partials_(owns_partials_ ? owned_.data() : slot, rows, cols) {
     partials_.setZero();
   }
 };

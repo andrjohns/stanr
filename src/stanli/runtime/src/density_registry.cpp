@@ -262,6 +262,17 @@ DensityCallPlan density_call_plan(
                             << (k - static_cast<size_t>(spec.integer_args));
   }
 
+  // A nonnegative spec mask is the kernel's promise of which real arguments
+  // it can differentiate. Parameter-dependent input outside that promise
+  // must refuse here -- the one plan choke point every backend shares --
+  // because binding it anyway drops the argument's partial silently: the
+  // lkj eta mask did exactly that and surfaced only as a 0.5% CmdStan
+  // gradient divergence in the signature-reference gate.
+  if (spec.activity_mask >= 0 &&
+      (plan.activity_mask & ~static_cast<uint8_t>(spec.activity_mask)) != 0)
+    throw std::invalid_argument(
+        "density argument outside the kernel's differentiable set");
+
   const auto matrix_dimensions = [&](size_t real_index,
                                      bool allow_row_vector = false) {
     if (real_index >= real_shapes.size())
@@ -271,6 +282,10 @@ DensityCallPlan density_call_plan(
         shape.container == FunctionContainerKind::RowVector &&
         shape.array_depth == 0 && shape.dimensions.size() == 1)
       return std::pair<int64_t, int64_t>{1, shape.dimensions[0]};
+    if (spec.opcode == OP_NORMAL_ID_GLM_LPDF && allow_row_vector &&
+        shape.container == FunctionContainerKind::Vector &&
+        shape.array_depth == 0)
+      return std::pair<int64_t, int64_t>{shape.dimensions[0], 1};
     if (shape.container != FunctionContainerKind::Matrix ||
         shape.array_depth != 0 || shape.dimensions.size() != 2)
       throw std::invalid_argument("density argument is not a matrix");
@@ -319,8 +334,39 @@ DensityCallPlan density_call_plan(
     plan.idata.push_back(as_int_extent(cols));
     plan.idata.push_back(kGlmScalarLayoutMarker);
     plan.idata.push_back(static_cast<int>(glm_scalar_mask));
+    if (spec.opcode == OP_NORMAL_ID_GLM_LPDF)
+      plan.idata.push_back(real_shapes[spec.glm_matrix_arg].container ==
+                                   FunctionContainerKind::RowVector
+                               ? 1
+                               : 0);
   }
 
+  if (spec.shape == DensityShape::PoissonBinomial) {
+    const auto& theta = arguments[1].shape;
+    const auto leaf = function_leaf(theta);
+    const bool real_array = theta.container == FunctionContainerKind::Array &&
+                            leaf == FunctionContainerKind::Scalar &&
+                            theta.array_depth == 1;
+    if (!real_array && ((leaf != FunctionContainerKind::Vector &&
+                         leaf != FunctionContainerKind::RowVector) ||
+                        theta.array_depth != 0))
+      throw std::invalid_argument(
+          "poisson_binomial expects vector, row_vector or array[] real");
+    if (arguments[0].shape.array_depth > 1 || !arguments[0].data_only)
+      throw std::invalid_argument(
+          "poisson_binomial expects data int or array[] int");
+    const int width = as_int_extent(theta.storage_size);
+    // Math indexes y[0] even for an empty outcome array. Reject before its
+    // unchecked scalar_seq_view access; empty probability vectors are valid.
+    if (arguments[0].integers.empty())
+      throw std::invalid_argument(
+          "poisson_binomial requires nonempty outcomes");
+    plan.idata = {width, arguments[0].scalar ? 1 : 0};
+    plan.idata.insert(plan.idata.end(), arguments[0].integers.begin(),
+                      arguments[0].integers.end());
+    plan.variant = spec.fixed_variant | plan.activity_mask;
+    return plan;
+  }
   if (spec.shape == DensityShape::Categorical) {
     const FunctionArgumentShape& outcome = arguments[0].shape;
     const FunctionArgumentShape& probabilities = arguments[1].shape;

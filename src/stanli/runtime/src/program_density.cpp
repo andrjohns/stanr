@@ -224,9 +224,19 @@ int program_density_id_by_name(const std::string& name) {
 }
 
 int program_density_id_by_opcode(uint16_t opcode) {
-  for (int i = 0; i < kCount; ++i)
-    if (opcode == kDensities[i].opcode) return i;
-  return -1;
+  // The carver asks this for arithmetic and indexing ops as well as
+  // densities. Generate direct dispatch from the registry so a miss does
+  // not scan every probability function for every speculative partition.
+  switch (opcode) {
+#define STANLI_PD_OPCODE(opc, fn, arity, tier) \
+  case opc:                                    \
+    return kId_##fn;
+    STANLI_SCALAR_DENSITY_LIST(STANLI_PD_OPCODE)
+    STANLI_SCALAR_CDF_LIST(STANLI_PD_OPCODE)
+#undef STANLI_PD_OPCODE
+    default:
+      return -1;
+  }
 }
 
 bool program_density_container_capable(int id) {
@@ -290,6 +300,17 @@ template stan::math::var program_density_vec<stan::math::var>(
 
 bool program_density_partials(int id, unsigned mask, const double* args,
                               double* partials) {
+  if (id == kId_normal_lccdf || id == kId_std_normal_lccdf) {
+    const bool normal = id == kId_normal_lccdf;
+    double reflected[3] = {-args[0], normal ? -args[1] : 0.0,
+                           normal ? args[2] : 1.0};
+    const bool connected =
+        program_density_partials(normal ? kId_normal_lcdf : kId_std_normal_lcdf,
+                                 mask, reflected, partials);
+    if (mask & 1u) partials[0] = -partials[0];
+    if (normal && (mask & 2u)) partials[1] = -partials[1];
+    return connected;
+  }
   const int n = program_density_arity(id);
   sink s;
   for (int k = 0; k < n; ++k) {
@@ -319,7 +340,8 @@ bool program_density_partials(int id, unsigned mask, const double* args,
       });                                                                 \
     });                                                                   \
     break;
-    STANLI_SCALAR_CDF_LIST(STANLI_PCDF_PARTIALS)
+    STANLI_SCALAR_CDF_LIST_A(STANLI_PCDF_PARTIALS)
+    STANLI_SCALAR_CDF_LIST_B(STANLI_PCDF_PARTIALS)
 #undef STANLI_PCDF_PARTIALS
     default:
       break;

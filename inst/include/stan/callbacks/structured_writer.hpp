@@ -1,10 +1,9 @@
 #ifndef STAN_CALLBACKS_STRUCTURED_WRITER_HPP
 #define STAN_CALLBACKS_STRUCTURED_WRITER_HPP
 
+#include <cstdint>
 #include <stan/math/prim/fun/Eigen.hpp>
 #include <vector>
-#include <climits>
-#include <cstdint>
 #include <string>
 
 namespace stan {
@@ -67,11 +66,11 @@ class structured_writer {
   virtual void write(const std::string& key, int value) {}
 
   /**
-   * Write a key-value pair where the value is an `std::size_t`.
+   * Write a key-value pair where the value is an `uint64_t`.
    * @param key Name of the value pair
-   * @param value `std::size_t` to write.
+   * @param value `uint64_t` to write.
    */
-  virtual void write(const std::string& key, std::size_t value) {}
+  virtual void write(const std::string& key, uint64_t value) {}
 
   /**
    * Write a key-value pair where the value is an `long long int`.
@@ -82,14 +81,12 @@ class structured_writer {
                      long long int value  // NOLINT(runtime/int)
   ) {}
 
-#if SIZE_MAX != UINT_MAX
   /**
    * Write a key-value pair where the value is an `unsigned int`.
    * @param key Name of the value pair
    * @param value `unsigned int` to write.
    */
-  virtual void write(const std::string& key, unsigned int value) {}
-#endif
+  virtual void write(const std::string& key, uint32_t value) {}
 
   /**
    * Write a key-value pair where the value is a double.

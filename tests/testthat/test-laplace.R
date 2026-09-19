@@ -46,11 +46,6 @@ test_that("laplace lp() and lp_approx() return numeric vectors", {
 })
 
 test_that("laplace with mode = NULL works for models with vector/array parameters", {
-  skip_if_backend(
-    "stanli",
-    "stanli cannot evaluate model_methods.stan: its normal_rng() generated ",
-    "quantity fails with 'OP_RNG requires caller-owned evaluation RNG state'"
-  )
   path <- test_path("test-models/model_methods.stan")
   mod <- stan_model(stan_file = path, quiet = TRUE)
   data <- list(N = 4, y = c(1L, 1L, 1L, 0L), mu = 0)
@@ -75,11 +70,6 @@ test_that("laplace with mode = NULL works for models with vector/array parameter
 })
 
 test_that("laplace with mode = StanMLE works for models with vector parameters", {
-  skip_if_backend(
-    "stanli",
-    "stanli cannot evaluate model_methods.stan: its normal_rng() generated ",
-    "quantity fails with 'OP_RNG requires caller-owned evaluation RNG state'"
-  )
   path <- test_path("test-models/model_methods.stan")
   mod <- stan_model(stan_file = path, quiet = TRUE)
   data <- list(N = 4, y = c(1L, 1L, 1L, 0L), mu = 0)
@@ -110,11 +100,6 @@ test_that("laplace with mode = StanMLE works for models with vector parameters",
 })
 
 test_that("laplace with a raw numeric mode vector uses bracket-format names for vector parameters", {
-  skip_if_backend(
-    "stanli",
-    "stanli cannot evaluate model_methods.stan: its normal_rng() generated ",
-    "quantity fails with 'OP_RNG requires caller-owned evaluation RNG state'"
-  )
   path <- test_path("test-models/model_methods.stan")
   mod <- stan_model(stan_file = path, quiet = TRUE)
   data <- list(N = 4, y = c(1L, 1L, 1L, 0L), mu = 0)
