@@ -32,6 +32,17 @@ cp -Rf "$STANLI_DIR/runtime/src" "$SRC/runtime/"
 cp -Rf "$STANLI_DIR/runtime/kernels" "$SRC/runtime/"
 rm -f "$SRC/runtime/include/stanli/README.md"
 
+# shared_ptr::unique() was removed in C++20; libc++ no longer provides it.
+python3 - "$SRC/runtime/src/executor.cpp" << 'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+old = "  if (data_.unique()) return;\n"
+assert text.count(old) == 1, f"data_.unique() not found -- {path} changed upstream"
+open(path, "w").write(text.replace(old, "  if (data_.use_count() == 1) return;\n"))
+EOF
+
 # reduce_sum.cpp needs thread_safe_build(), defined in the stripped nuts.cpp.
 python3 - "$SRC/runtime/src" << 'EOF'
 import os

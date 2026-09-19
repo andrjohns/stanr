@@ -236,8 +236,33 @@ patch_sprintf "../src/cvodes/cvodes_diag.c" "name" 30 10
 patch_sprintf "../src/cvodes/cvodes_ls.c" "name" 30 13
 
 # --- 6d. Fix the size_t/unsigned int write() overload collision on ILP32 ---
-# structured_writer.hpp uses fixed-width overloads upstream; only
-# json_writer.hpp still declares both.
+# Upstream's fixed-width overloads leave size_t (unsigned long) ambiguous on
+# LP64 macOS, and json_writer's size_t overload no longer overriding.
+python3 - "$INC/stan/callbacks/structured_writer.hpp" << 'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+
+old = "  virtual void write(const std::string& key, uint64_t value) {}\n"
+new = "  virtual void write(const std::string& key, std::size_t value) {}\n"
+assert old in text, f"uint64_t write() overload not found -- {path} changed upstream"
+text = text.replace(old, new, 1)
+
+old = "  virtual void write(const std::string& key, uint32_t value) {}\n"
+new = ("#if SIZE_MAX != UINT_MAX\n"
+       "  virtual void write(const std::string& key, unsigned int value) {}\n"
+       "#endif\n")
+assert old in text, f"uint32_t write() overload not found -- {path} changed upstream"
+text = text.replace(old, new, 1)
+
+old = "#include <cstdint>\n"
+assert old in text, f"'#include <cstdint>' not found -- {path} changed upstream"
+text = text.replace(old, "#include <climits>\n" + old, 1)
+
+open(path, "w").write(text)
+EOF
+
 python3 - "$INC/stan/callbacks/json_writer.hpp" << 'EOF'
 import sys
 
@@ -305,6 +330,10 @@ cp -Rf "$MATH_SRC"/lib/boost_*/boost/circular_buffer "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/accumulators "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/parameter "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/mp11 "$INC/boost"
+# stanli's island.cpp uses boost::unordered_flat_map.
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/unordered "$INC/boost"
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/container_hash "$INC/boost"
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/describe "$INC/boost"
 # odeint and boost::math each probe __has_include(<boost/predef/other/endian.h>)
 # to decide whether to fall back to a "standalone" build (see their
 # tools/is_standalone.hpp). Without this vendored, both silently switch to
