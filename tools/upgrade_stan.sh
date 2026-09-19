@@ -324,16 +324,8 @@ cp -Rf "$MATH_SRC"/lib/boost_*/boost/concept "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/function_types "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/multi_array "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/random "$INC/boost"
-cp -Rf "$MATH_SRC"/lib/boost_*/boost/optional "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/io "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/circular_buffer "$INC/boost"
-cp -Rf "$MATH_SRC"/lib/boost_*/boost/accumulators "$INC/boost"
-cp -Rf "$MATH_SRC"/lib/boost_*/boost/parameter "$INC/boost"
-cp -Rf "$MATH_SRC"/lib/boost_*/boost/mp11 "$INC/boost"
-# stanli's island.cpp uses boost::unordered_flat_map.
-cp -Rf "$MATH_SRC"/lib/boost_*/boost/unordered "$INC/boost"
-cp -Rf "$MATH_SRC"/lib/boost_*/boost/container_hash "$INC/boost"
-cp -Rf "$MATH_SRC"/lib/boost_*/boost/describe "$INC/boost"
 # odeint and boost::math each probe __has_include(<boost/predef/other/endian.h>)
 # to decide whether to fall back to a "standalone" build (see their
 # tools/is_standalone.hpp). Without this vendored, both silently switch to

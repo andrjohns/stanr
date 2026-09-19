@@ -43,6 +43,23 @@ assert text.count(old) == 1, f"data_.unique() not found -- {path} changed upstre
 open(path, "w").write(text.replace(old, "  if (data_.use_count() == 1) return;\n"))
 EOF
 
+# island.cpp's flat containers are never iterated, so the std equivalents
+# are a drop-in and avoid vendoring boost/unordered.
+python3 - "$SRC/runtime/src/island.cpp" << 'EOF'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+text, n = re.subn(r'#include <boost/unordered/unordered_flat_(?:map|set)\.hpp>\n',
+                  '', text)
+assert n == 2, f"boost/unordered includes not found -- {path} changed upstream"
+text, n = re.subn(r'boost::unordered_flat_(map|set)<', r'std::unordered_\1<', text)
+assert n == 3, f"expected 3 boost::unordered_flat uses, found {n} -- {path} changed upstream"
+assert "boost" not in text, f"unexpected boost use -- {path} changed upstream"
+open(path, "w").write(text)
+EOF
+
 # reduce_sum.cpp needs thread_safe_build(), defined in the stripped nuts.cpp.
 python3 - "$SRC/runtime/src" << 'EOF'
 import os

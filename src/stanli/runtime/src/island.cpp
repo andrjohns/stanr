@@ -27,8 +27,6 @@
 #include <stanli/optable.hpp>
 #include <stanli/program_density.hpp>
 
-#include <boost/unordered/unordered_flat_map.hpp>
-#include <boost/unordered/unordered_flat_set.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -243,7 +241,7 @@ struct Compiler {
   IslandProg prog;
   // Entries are only looked up by slot, never iterated or retained across
   // insertion. Flat storage avoids a heap node per speculative register.
-  boost::unordered_flat_map<int, int> reg_of;  // slot -> first register
+  std::unordered_map<int, int> reg_of;  // slot -> first register
   std::vector<int> live_in_slots;
   size_t op_index = 0;  // graph index of the op being compiled
   // Scratch registers CALLs allocated: working memory the graph op also
@@ -709,7 +707,7 @@ struct Carver {
     // the program's live-outs are registers and compaction renumbers them.
     c.in_set.insert(cc.live_in_slots.begin(), cc.live_in_slots.end());
     if (compiled) {
-      boost::unordered_flat_set<int> seen;
+      std::unordered_set<int> seen;
       for (size_t u = i; u < j; ++u) {
         const int o = g.ops[u].out;
         if (seen.count(o)) continue;
@@ -951,7 +949,7 @@ struct Carver {
   // otherwise every rewrite would double- or triple-book the same value.
   std::vector<int64_t> live_pressure(size_t i, size_t j) const {
     std::vector<int64_t> diff(j - i + 2, 0);
-    boost::unordered_flat_set<int> charged;
+    std::unordered_set<int> charged;
     for (size_t u = i; u < j; ++u) {
       const int o = g.ops[u].out;
       if (o < 0 || !charged.insert(o).second) continue;
