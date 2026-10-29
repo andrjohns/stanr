@@ -2,6 +2,7 @@
 // stan-math REV overloads' forward Eigen expressions and their backward
 // accumulation shapes (see constrain.cpp for why: packet math vs libm).
 // Shape dispatch is runtime: len==1 broadcasts.
+#include <stanli/builtin_registry.hpp>
 #include <stanli/graph.hpp>
 #include <stanli/optable.hpp>
 #include <stanli/packet.hpp>
@@ -47,6 +48,19 @@ void add_fwd(KernelCtx& ctx) {
 // ascending order (measured against add(var, Matrix<var>); a local Eigen
 // sum added once differs by 1 ULP).
 void add_bwd(KernelCtx& ctx) {
+  if (ctx.variant) {
+    const int original = ctx.variant == kAddTransposeRight ? 0 : 1;
+    if (!ctx.in_adj[original].data) return;
+    double* adj = ctx.in_adj[original].data;
+    const int64_t n = ctx.idata[0];
+    for (int64_t i = 0; i < ctx.out.len; ++i) {
+      const int64_t transposed = (i % n) * n + i / n;
+      const double seed = ctx.out_adj_vec.data[i];
+      adj[original == 0 ? i : transposed] += seed;
+      adj[original == 0 ? transposed : i] += seed;
+    }
+    return;
+  }
   for (int k = 0; k < 2; ++k) {
     if (!ctx.in_adj[k].data) continue;
     if (scal(ctx, k)) {
@@ -169,6 +183,13 @@ void mul_bwd(KernelCtx& ctx) {
 }
 
 void div_fwd(KernelCtx& ctx) {
+  if ((ctx.variant & kDivMatrixScalar) &&
+      (ctx.variant & (kDivMatrixActive | kDivScalarActive))) {
+    const double inv = 1.0 / ctx.in[1].data[0];
+    for (int64_t i = 0; i < ctx.out.len; ++i)
+      ctx.out.data[i] = inv * ctx.in[0].data[i];
+    return;
+  }
   if (scal(ctx, 0) && scal(ctx, 1))
     ctx.out.data[0] = ctx.in[0].data[0] / ctx.in[1].data[0];
   else if (scal(ctx, 1))
@@ -180,20 +201,53 @@ void div_fwd(KernelCtx& ctx) {
 }
 void div_bwd(KernelCtx& ctx) {
   const bool s0 = scal(ctx, 0), s1 = scal(ctx, 1);
+  if (ctx.variant & kDivMatrixScalar) {
+    const double inv = 1.0 / ctx.in[1].data[0];
+    double scalar_partial = 0.0;
+    for (int64_t i = 0; i < ctx.out.len; ++i) {
+      const double seed =
+          ctx.out.len == 1 ? ctx.out_adj : ctx.out_adj_vec.data[i];
+      const double scaled_seed = inv * seed;
+      if (ctx.in_adj[0].data) ctx.in_adj[0].data[i] += scaled_seed;
+      if (ctx.in_adj[1].data) {
+        if (ctx.variant & kDivMatrixActive)
+          scalar_partial += scaled_seed * ctx.out.data[i];
+        else
+          scalar_partial += seed * ctx.out.data[i];
+      }
+    }
+    if (ctx.in_adj[1].data)
+      ctx.in_adj[1].data[0] -= (ctx.variant & kDivMatrixActive)
+                                   ? scalar_partial
+                                   : inv * scalar_partial;
+    return;
+  }
   if (ctx.out.len == 1) {
+    const double a = ctx.in[0].data[0];
     const double b = ctx.in[1].data[0];
     if (ctx.in_adj[0].data) ctx.in_adj[0].data[0] += ctx.out_adj / b;
-    if (ctx.in_adj[1].data)
-      ctx.in_adj[1].data[0] += -ctx.out_adj * ctx.out.data[0] / b;
+    if (ctx.in_adj[1].data) ctx.in_adj[1].data[0] -= ctx.out_adj * a / (b * b);
+    return;
+  }
+  if (ctx.variant & kDivScalarLanes) {
+    for (int64_t i = ctx.out.len; i-- > 0;) {
+      const int64_t ai = s0 ? 0 : i, bi = s1 ? 0 : i;
+      const double a = ctx.in[0].data[ai], b = ctx.in[1].data[bi];
+      const double seed = ctx.out_adj_vec.data[i];
+      if (ctx.in_adj[0].data) ctx.in_adj[0].data[ai] += seed / b;
+      if (ctx.in_adj[1].data) ctx.in_adj[1].data[bi] -= seed * a / (b * b);
+    }
     return;
   }
   CMapA out_v(ctx.out.data, ctx.out.len);
   if (!s0 && !s1) {
-    // rev elt_divide: ret_div = dout/b; a.adj += ret_div;
-    // b.adj -= out * ret_div (same grouping, same reuse).
-    Arr ret_div = dout_a(ctx) / in_a(ctx, 1);
-    if (ctx.in_adj[0].data) dx_a(ctx, 0) += ret_div;
-    if (ctx.in_adj[1].data) dx_a(ctx, 1) -= out_v * ret_div;
+    for (int64_t i = 0; i < ctx.out.len; ++i) {
+      double da, db;
+      div_partials(ctx.out_adj_vec.data[i], ctx.in[1].data[i], ctx.out.data[i],
+                   &da, &db);
+      if (ctx.in_adj[0].data) ctx.in_adj[0].data[i] += da;
+      if (ctx.in_adj[1].data) ctx.in_adj[1].data[i] += db;
+    }
     return;
   }
   if (ctx.in_adj[0].data) {
@@ -236,9 +290,9 @@ void pow_bwd(KernelCtx& ctx) {
             pow_zero_base_partial(ctx.variant, ctx.out_adj, a, b);
       return;
     }
-    if (ctx.in_adj[0].data) ctx.in_adj[0].data[0] += ctx.out_adj * b * v / a;
-    if (ctx.in_adj[1].data)
-      ctx.in_adj[1].data[0] += ctx.out_adj * std::log(a) * v;
+    const double scaled_value = ctx.out_adj * v;
+    if (ctx.in_adj[0].data) ctx.in_adj[0].data[0] += scaled_value * b / a;
+    if (ctx.in_adj[1].data) ctx.in_adj[1].data[0] += scaled_value * std::log(a);
     return;
   }
   for (int64_t i = 0; i < ctx.out.len; ++i) {
@@ -252,16 +306,29 @@ void pow_bwd(KernelCtx& ctx) {
             pow_zero_base_partial(ctx.variant, dout, a, b);
       continue;
     }
-    if (ctx.in_adj[0].data) ctx.in_adj[0].data[s0 ? 0 : i] += dout * b * v / a;
+    const double scaled_value = dout * v;
+    if (ctx.in_adj[0].data)
+      ctx.in_adj[0].data[s0 ? 0 : i] += scaled_value * b / a;
     if (ctx.in_adj[1].data)
-      ctx.in_adj[1].data[s1 ? 0 : i] += dout * std::log(a) * v;
+      ctx.in_adj[1].data[s1 ? 0 : i] += scaled_value * std::log(a);
   }
 }
 
 void dot_fwd(KernelCtx& ctx) {
+  if (ctx.variant == 1) {
+    double sum = 0;
+    for (int64_t i = 0; i < ctx.in[0].len; ++i)
+      sum += ctx.in[0].data[i] * ctx.in[0].data[i];
+    ctx.out.data[0] = sum;
+    return;
+  }
   ctx.out.data[0] = (in_a(ctx, 0) * in_a(ctx, 1)).sum();
 }
 void dot_bwd(KernelCtx& ctx) {
+  if (ctx.variant == 1) {
+    if (ctx.in_adj[0].data) dx_a(ctx, 0) += (2.0 * ctx.out_adj) * in_a(ctx, 0);
+    return;
+  }
   if (ctx.in_adj[0].data) dx_a(ctx, 0) += ctx.out_adj * in_a(ctx, 1);
   if (ctx.in_adj[1].data) dx_a(ctx, 1) += ctx.out_adj * in_a(ctx, 0);
 }
@@ -373,6 +440,47 @@ void cumsum_bwd(KernelCtx& ctx) {
   ctx.in_adj[0].data[0] += radj[0];
 }
 
+template <bool Ascending>
+void sort_fwd(KernelCtx& ctx) {
+  const int64_t n = ctx.in[0].len;
+  const double* x = ctx.in[0].data;
+  stan::math::check_not_nan(
+      "sort_asc", "container argument",
+      Eigen::Map<const Eigen::Matrix<double, -1, 1>>(x, n));
+  double* order = ctx.scratch;
+  for (int64_t k = 0; k < n; ++k) order[k] = static_cast<double>(k);
+  std::sort(order, order + n, [x](double i, double j) {
+    const double a = x[static_cast<int64_t>(i)];
+    const double b = x[static_cast<int64_t>(j)];
+    return Ascending ? a < b : a > b;
+  });
+  for (int64_t k = 0; k < n; ++k)
+    ctx.out.data[k] = x[static_cast<int64_t>(order[k])];
+}
+void sort_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data) return;
+  const int64_t n = ctx.out.len;
+  const double* order = ctx.scratch;
+  const double* radj = n == 1 ? &ctx.out_adj : ctx.out_adj_vec.data;
+  for (int64_t k = 0; k < n; ++k)
+    ctx.in_adj[0].data[static_cast<int64_t>(order[k])] += radj[k];
+}
+int64_t sort_scratch(const Op& op, const Slot* slots) {
+  return slots[op.in[0]].len;
+}
+
+void ordering_fwd(KernelCtx& ctx) {
+  const double* x = ctx.in[0].data;
+  const std::vector<double> values(x, x + ctx.in[0].len);
+  const int position =
+      ctx.n_in > 1 ? static_cast<int>(std::llround(ctx.in[1].data[0])) : 0;
+  const std::vector<int> result = evaluate_ordering(
+      static_cast<BuiltinOrdering>(ctx.variant), values, position);
+  for (size_t k = 0; k < result.size(); ++k)
+    ctx.out.data[k] = static_cast<double>(result[k]);
+}
+void ordering_bwd(KernelCtx&) {}
+
 // Eigen's packet log, a ulp off libm on some arguments. The matching packet
 // exp is NOT taken: it puts kronecker_gp over its reference gate.
 void logv_fwd(KernelCtx& ctx) { out_a(ctx) = in_a(ctx, 0).log(); }
@@ -437,7 +545,7 @@ void sqrtv_bwd(KernelCtx& ctx) {
     if (ctx.out.data[0] != 0.0)
       ctx.in_adj[0].data[0] += ctx.out_adj / (2.0 * ctx.out.data[0]);
   } else {
-    dx_a(ctx, 0) += (out_v != 0.0).select(dout_a(ctx) / (2.0 * out_v), 0.0);
+    dx_a(ctx, 0) += (out_v != 0.0).select(dout_a(ctx) / (2.0 * out_v), -0.0);
   }
 }
 void squarev_fwd(KernelCtx& ctx) { out_a(ctx) = in_a(ctx, 0).square(); }
@@ -563,6 +671,78 @@ void repv_dynamic_bwd(KernelCtx& ctx) {
     ctx.in_adj[0].data[0] += ctx.out_adj_vec.data[i];
 }
 
+bool add_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.variant != 0 || ctx.out.len != 1) return false;
+  for (int k = 0; k < 2; ++k)
+    if (ctx.in_adj[k].data && ctx.in[k].len != 1) return false;
+  for (int k = 0; k < 2; ++k)
+    if (ctx.in_adj[k].data)
+      out.push_back(
+          bwd_micro(kMicroAdd, ctx.in_adj[k].data, ctx.out_adj_vec.data));
+  return true;
+}
+
+bool sub_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1) return false;
+  for (int k = 0; k < 2; ++k)
+    if (ctx.in_adj[k].data && ctx.in[k].len != 1) return false;
+  if (ctx.in_adj[0].data)
+    out.push_back(
+        bwd_micro(kMicroAdd, ctx.in_adj[0].data, ctx.out_adj_vec.data));
+  if (ctx.in_adj[1].data)
+    out.push_back(
+        bwd_micro(kMicroSub, ctx.in_adj[1].data, ctx.out_adj_vec.data));
+  return true;
+}
+
+bool neg_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1) return false;
+  if (ctx.in_adj[0].data)
+    out.push_back(
+        bwd_micro(kMicroSub, ctx.in_adj[0].data, ctx.out_adj_vec.data));
+  return true;
+}
+
+bool mul_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1 || ctx.in[0].len != 1 || ctx.in[1].len != 1)
+    return false;
+  if (ctx.in_adj[0].data)
+    out.push_back(bwd_micro(kMicroScaled, ctx.in_adj[0].data,
+                            ctx.out_adj_vec.data, ctx.in[1].data));
+  if (ctx.in_adj[1].data)
+    out.push_back(bwd_micro(kMicroScaled, ctx.in_adj[1].data,
+                            ctx.out_adj_vec.data, ctx.in[0].data));
+  return true;
+}
+
+double logv_delta(double seed, double x, double) { return seed / x; }
+double invlogit_delta(double seed, double, double y) {
+  return seed * y * (1.0 - y);
+}
+double square_delta(double seed, double x, double) { return seed * 2.0 * x; }
+double log1m_delta(double seed, double x, double) { return seed / (x - 1.0); }
+
+template <double (*Delta)(double, double, double)>
+bool unary_fn_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1) return false;
+  if (ctx.in_adj[0].data)
+    out.push_back(bwd_micro(kMicroFn, ctx.in_adj[0].data, ctx.out_adj_vec.data,
+                            ctx.in[0].data, ctx.out.data, Delta));
+  return true;
+}
+
+template <double (*Delta)(double, double, double), UnaryTopology Topology>
+bool unary_list_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1) return false;
+  if (Topology == UnaryTopology::Disconnected || !ctx.in_adj[0].data)
+    return true;
+  out.push_back(
+      bwd_micro(Topology == UnaryTopology::Nonzero ? kMicroFnNonzero : kMicroFn,
+                ctx.in_adj[0].data, ctx.out_adj_vec.data, ctx.in[0].data,
+                ctx.out.data, Delta));
+  return true;
+}
+
 // Generated from STANLI_SCALAR_UNARY_LIST (optable.hpp): the value in the
 // forward, the ordered delta and its pullback topology in the backward.
 // Shape-preserving and elementwise, so a re-rolled vector arrives here as one
@@ -574,6 +754,11 @@ void repv_dynamic_bwd(KernelCtx& ctx) {
       const double x = ctx.in[0].data[i];                                    \
       ctx.out.data[i] = (VAL);                                               \
     }                                                                        \
+  }                                                                          \
+  double name##_udelta(double seed, double x, double y) {                    \
+    (void)x;                                                                 \
+    (void)y;                                                                 \
+    return (DELTA);                                                          \
   }                                                                          \
   void name##_ubwd(KernelCtx& ctx) {                                         \
     if (!ctx.in_adj[0].data) return;                                         \
@@ -592,27 +777,47 @@ STANLI_SCALAR_UNARY_LIST(STANLI_DEFINE_UNARY)
 }  // namespace
 
 void register_eltwise_kernels() {
-#define STANLI_REGISTER_UNARY(code, name, value, delta, topology) \
-  register_kernel(code, Kernel{name##_ufwd, name##_ubwd, nullptr});
+#define STANLI_REGISTER_UNARY(code, name, value, delta, topology)        \
+  register_kernel(                                                       \
+      code, with_cached_micro(Kernel{name##_ufwd, name##_ubwd, nullptr}, \
+                              unary_list_micro<name##_udelta, topology>));
   STANLI_SCALAR_UNARY_LIST(STANLI_REGISTER_UNARY)
 #undef STANLI_REGISTER_UNARY
-  register_kernel(OP_ADD, Kernel{add_fwd, add_bwd, nullptr});
-  register_kernel(OP_SUB, Kernel{sub_fwd, sub_bwd, nullptr});
-  register_kernel(OP_MUL, Kernel{mul_fwd, mul_bwd, nullptr});
+  register_kernel(OP_ADD,
+                  with_cached_micro(Kernel{add_fwd, add_bwd, nullptr, nullptr,
+                                           backward_reads_none},
+                                    add_micro));
+  register_kernel(
+      OP_SUB, with_cached_micro(Kernel{sub_fwd, sub_bwd, nullptr}, sub_micro));
+  register_kernel(
+      OP_MUL, with_cached_micro(Kernel{mul_fwd, mul_bwd, nullptr}, mul_micro));
   register_kernel(OP_FMA, Kernel{fma_fwd, fma_bwd, nullptr});
   register_kernel(OP_DIV, Kernel{div_fwd, div_bwd, nullptr});
   register_kernel(OP_POW, Kernel{pow_fwd, pow_bwd, nullptr});
   register_kernel(OP_DOT, Kernel{dot_fwd, dot_bwd, nullptr});
   register_kernel(OP_GROUP_DOT, Kernel{group_dot_fwd, group_dot_bwd, nullptr});
-  register_kernel(OP_NEG, Kernel{negu_fwd, negu_bwd, nullptr});
+  register_kernel(OP_NEG, with_cached_micro(Kernel{negu_fwd, negu_bwd, nullptr},
+                                            neg_micro));
   register_kernel(OP_EXPV, Kernel{expv_fwd, expv_bwd, nullptr});
   register_kernel(OP_TANHV, Kernel{tanhv_fwd, tanhv_bwd, nullptr});
   register_kernel(OP_CUMSUM, Kernel{cumsum_fwd, cumsum_bwd, nullptr});
-  register_kernel(OP_LOGV, Kernel{logv_fwd, logv_bwd, nullptr});
-  register_kernel(OP_INV_LOGIT, Kernel{invlogit_fwd, invlogit_bwd, nullptr});
+  register_kernel(OP_SORT_ASC, Kernel{sort_fwd<true>, sort_bwd, sort_scratch});
+  register_kernel(OP_SORT_DESC,
+                  Kernel{sort_fwd<false>, sort_bwd, sort_scratch});
+  register_kernel(OP_ORDERING, Kernel{ordering_fwd, ordering_bwd, nullptr});
+  register_kernel(OP_LOGV,
+                  with_cached_micro(Kernel{logv_fwd, logv_bwd, nullptr},
+                                    unary_fn_micro<logv_delta>));
+  register_kernel(OP_INV_LOGIT,
+                  with_cached_micro(Kernel{invlogit_fwd, invlogit_bwd, nullptr},
+                                    unary_fn_micro<invlogit_delta>));
   register_kernel(OP_SQRT, Kernel{sqrtv_fwd, sqrtv_bwd, nullptr});
-  register_kernel(OP_SQUARE, Kernel{squarev_fwd, squarev_bwd, nullptr});
-  register_kernel(OP_LOG1M, Kernel{log1mv_fwd, log1mv_bwd, nullptr});
+  register_kernel(OP_SQUARE,
+                  with_cached_micro(Kernel{squarev_fwd, squarev_bwd, nullptr},
+                                    unary_fn_micro<square_delta>));
+  register_kernel(OP_LOG1M,
+                  with_cached_micro(Kernel{log1mv_fwd, log1mv_bwd, nullptr},
+                                    unary_fn_micro<log1m_delta>));
   register_kernel(OP_LOGIT, Kernel{logitv_fwd, logitv_bwd, nullptr});
   register_kernel(OP_MEAN, Kernel{mean_fwd, mean_bwd, nullptr});
   register_kernel(

@@ -79,7 +79,7 @@ void check_leaf(const double* values, int64_t rows, int64_t cols,
   Eigen::Map<const Eigen::VectorXd> vector(values, (Eigen::Index)rows);
   Eigen::Map<const Eigen::MatrixXd> matrix(values, (Eigen::Index)rows,
                                            (Eigen::Index)cols);
-  constexpr const char* function = "stanli MIR check";
+  constexpr const char* function = "";
   switch (spec.kind) {
     case mir::Transform::Simplex:
       stan::math::check_simplex(function, name.c_str(), vector);
@@ -174,7 +174,7 @@ void check_structured_value(const double* values, int64_t len,
     if (spec.kind != mir::Transform::Correlation &&
         spec.kind != mir::Transform::Covariance)
       for (int64_t i : index) name += "[" + std::to_string(i + 1) + "]";
-    check_leaf(one, rows, cols, name, spec);
+    without_check_prefix([&] { check_leaf(one, rows, cols, name, spec); });
   }
 }
 
@@ -217,8 +217,8 @@ void check_matching_dims_fwd(KernelCtx& ctx) {
     throw std::logic_error("malformed dimension-check op");
   const auto* spec = static_cast<const BoundCheckSpec*>(ctx.udata);
   if (!spec->shapes_match)
-    throw std::invalid_argument(
-        "stanli MIR check: constraint shapes do not match for " + spec->name);
+    throw std::invalid_argument("constraint shapes do not match for " +
+                                spec->name);
   ctx.out.data[0] = 0.0;
 }
 
@@ -230,22 +230,22 @@ void check_fwd(KernelCtx& ctx) {
   const Desc& bound = ctx.in[1];
   const auto* spec = static_cast<const BoundCheckSpec*>(ctx.udata);
   if (!spec->shapes_match)
-    throw std::invalid_argument(
-        "stanli MIR check: constraint shapes do not "
-        "match for " +
-        spec->name);
+    throw std::invalid_argument("constraint shapes do not match for " +
+                                spec->name);
   if ((spec->bound_is_scalar && bound.len != 1) ||
       (!spec->bound_is_scalar && bound.len != value.len))
     throw std::logic_error("bound-check shape metadata is inconsistent");
-  for (int64_t i = 0; i < value.len; ++i) {
-    const double b = bound.data[spec->bound_is_scalar ? 0 : i];
-    if constexpr (Lower)
-      stan::math::check_greater_or_equal("stanli MIR check", spec->name.c_str(),
-                                         value.data[i], b);
-    else
-      stan::math::check_less_or_equal("stanli MIR check", spec->name.c_str(),
-                                      value.data[i], b);
-  }
+  without_check_prefix([&] {
+    for (int64_t i = 0; i < value.len; ++i) {
+      const double b = bound.data[spec->bound_is_scalar ? 0 : i];
+      if constexpr (Lower)
+        stan::math::check_greater_or_equal("", spec->name.c_str(),
+                                           value.data[i], b);
+      else
+        stan::math::check_less_or_equal("", spec->name.c_str(), value.data[i],
+                                        b);
+    }
+  });
   ctx.out.data[0] = 0.0;
 }
 
@@ -305,6 +305,12 @@ bool native_scalar_probability(uint8_t variant) {
          (variant & kCategoricalArgAutodiff);
 }
 
+bool native_scalar_logit(uint8_t variant) {
+  return (variant & kCategoricalLogit) &&
+         (variant & kCategoricalScalarOutcome) &&
+         (variant & kCategoricalArgAutodiff);
+}
+
 int categorical_scalar_outcome(const KernelCtx& ctx) {
   if (ctx.in[0].len != 1)
     throw std::logic_error("categorical scalar outcome has wrong width");
@@ -324,6 +330,12 @@ void categorical_fwd(KernelCtx& ctx) {
     // With an active argument, both <true> and <false> retain this summand;
     // the double <false> body is the same value/check order without a tape.
     ctx.out.data[0] = stan::math::categorical_lpmf<false>(outcome, arg);
+    return;
+  }
+  if (native_scalar_logit(ctx.variant) && !values_only()) {
+    const int outcome = categorical_scalar_outcome(ctx);
+    const Eigen::Map<const Eigen::VectorXd> arg(ctx.in[1].data, ctx.in[1].len);
+    ctx.out.data[0] = stan::math::categorical_logit_lpmf<false>(outcome, arg);
     return;
   }
   const std::vector<int> outcomes = categorical_outcomes(ctx);
@@ -346,6 +358,25 @@ void categorical_bwd(KernelCtx& ctx) {
     const int outcome = categorical_scalar_outcome(ctx);
     ctx.in_adj[1].data[outcome - 1] +=
         ctx.out_adj / ctx.in[1].data[outcome - 1];
+    return;
+  }
+  if (native_scalar_logit(ctx.variant)) {
+    const int outcome = categorical_scalar_outcome(ctx);
+    const Eigen::Map<const Eigen::VectorXd> arg(ctx.in[1].data, ctx.in[1].len);
+    static constexpr const char* function = "categorical_logit_lpmf";
+    stan::math::check_bounded(function, "categorical outcome out of support",
+                              outcome, 1, arg.size());
+    stan::math::check_finite(function, "log odds parameter", arg);
+    const double normalizer = stan::math::log_sum_exp(arg);
+    // Mirror categorical_logit_lpmf's subtraction followed by the scalar
+    // AoS-var log_sum_exp callback (rev/fun/log_sum_exp.hpp). In particular,
+    // update the selected logit first, and form the negative seed with -=
+    // from zero. Packet exp changes low bits and must not replace std::exp.
+    ctx.in_adj[1].data[outcome - 1] += ctx.out_adj;
+    double normalizer_adj = 0.0;
+    normalizer_adj -= ctx.out_adj;
+    for (int64_t i = 0; i < arg.size(); ++i)
+      ctx.in_adj[1].data[i] += normalizer_adj * std::exp(arg(i) - normalizer);
     return;
   }
   stan::math::nested_rev_autodiff nested;

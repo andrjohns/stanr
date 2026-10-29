@@ -61,19 +61,41 @@ class WaRng {
 // same Stan Math function with the exact same stream.
 double scalar_rng_draw(ScalarRng family, const double* args, size_t nargs,
                        WaRng& rng);
-int categorical_rng_draw(const double* probabilities, size_t size, WaRng& rng);
+// Preserve language scalar/container identity even for zero/one elements.
+// Vectorized calls validate complete arguments before consuming the stream.
+struct RngArgument {
+  const double* data;
+  size_t size;
+  bool scalar;
+};
+void container_rng_draw(ScalarRng family, const RngArgument* args, size_t nargs,
+                        double* output, size_t output_size, WaRng& rng);
+int vector_integer_rng_draw(const double* probabilities, size_t size,
+                            WaRng& rng,
+                            uint8_t variant = kCategoricalRngVariant);
 void multi_normal_rng_draw(const double* location, size_t location_size,
                            const double* covariance, size_t covariance_size,
                            size_t covariance_rows, size_t covariance_cols,
-                           double* output, size_t output_size, WaRng& rng);
+                           double* output, size_t output_size, WaRng& rng,
+                           bool cholesky = false);
 void dirichlet_rng_draw(const double* alpha, size_t alpha_size, double* output,
                         size_t output_size, WaRng& rng);
 
+// The interpreter's RNG vocabulary: every `_rng` spelling an interpreted
+// section can draw, evaluated with `in` and advancing `rng`. One function
+// for every interpreter that owns a stream (transformed data at load,
+// interpreted write_array per draw), so no section can speak a different
+// subset. Returns false for a name outside the vocabulary; the caller then
+// falls through to its remaining hooks and finally to "unsupported".
+bool interpreted_rng_call(MirInterp<double>& in, const mir::Expr& e,
+                          DataMap::Entry* out, WaRng& rng);
+
 // The columns only exist after one evaluation, so every driver that wants
-// them at construction time has to probe. These two are that probe, shared
-// so the C ABI and the BridgeStan facade discover the SAME columns: a
-// driver with its own probe schedule would find a model in support where
-// the other found it out of support, and quietly serve a shorter row.
+// them at construction time has to probe. wa_probe_point and
+// probe_wa_columns are that probe, shared so the C ABI and the BridgeStan
+// facade discover the SAME columns: a driver with its own probe schedule
+// would find a model in support where the other found it out of support,
+// and quietly serve a shorter row.
 
 // Probe point i under variant 0, 1 or 2. A model can be out of support at
 // one variant and fine at the next, so callers walk all three.
@@ -101,9 +123,6 @@ class WaInterp {
                   const std::map<std::string, DataMap::Entry>& params);
   bool write_param(MirInterp<double>& in, const mir::Stmt& s,
                    std::vector<double>& row);
-  bool rng_fun(MirInterp<double>& in, const mir::Expr& e, DataMap::Entry* out,
-               WaRng& rng);
-
   std::shared_ptr<const mir::Program> prog_;
   std::map<std::string, const mir::FunDef*> funs_;
   std::map<std::string, DataMap::Entry> base_env_;
@@ -117,6 +136,12 @@ class WaInterp {
   // the optimizer substituted away (see write_param).
   std::string last_written_;
 };
+
+// Evaluates `interp` on `ex` at the probe points until one succeeds, with a
+// scratch stream that leaves every caller's untouched. Returns the row size
+// and clears `failure`, or returns -1 with the last error in `failure`.
+int64_t probe_wa_columns(WaInterp& interp, const CompiledModel& cm,
+                         Executor& ex, std::string& failure);
 
 }  // namespace stanli
 

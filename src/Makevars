@@ -63,6 +63,13 @@ stanli/runtime/kernels/%.o: stanli/runtime/kernels/%.cpp $(STANLI_PCH)
 
 STANLI_RUNNER_ARCHIVE = ../inst/lib/$(R_ARCH)/libstanr_runner.a
 STANLI_PACKAGE_ARCHIVE = stanli/libstanr_stanli.a
+
+# GCC LTO objects need the GCC linker plugin when the archives are indexed.
+# Plain ar indexes only __gnu_lto_slim, leaving stanr_stanli_* unresolved at
+# package load; plain strip would rebuild that broken index afterwards.
+STANR_GCC_LTO = $(if $(findstring g++,$(CXX)),$(filter -flto%,$(CXX20FLAGS)))
+STANR_ARCHIVER = $(if $(STANR_GCC_LTO),gcc-ar,$(AR))
+
 PKG_LIBS += $(STANLI_PACKAGE_ARCHIVE) $(STANLI_RUNNER_ARCHIVE)
 ifeq ($(shell uname -s),Linux)
 PKG_LIBS += -Wl,--exclude-libs,ALL
@@ -75,14 +82,14 @@ $(SHLIB): $(TBB_LIB_DIR)/$(firstword $(TBB_LIB_NAMES)) $(STANLI_PACKAGE_ARCHIVE)
 
 $(STANLI_PACKAGE_ARCHIVE): $(STANLI_PACKAGE_OBJECTS)
 	$(RM) $@
-	$(AR) -rs $@ $(STANLI_PACKAGE_OBJECTS)
-	@strip -S $@ || true
+	$(STANR_ARCHIVER) -rs $@ $(STANLI_PACKAGE_OBJECTS)
+	@if [ -z "$(STANR_GCC_LTO)" ]; then strip -S $@ || true; fi
 
 $(STANLI_RUNNER_ARCHIVE): $(RUNNER_OBJECTS) $(SUNDIALS_OBJECTS)
 	@mkdir -p ../inst/lib/$(R_ARCH)
 	$(RM) $@
-	$(AR) -rs $@ $(SUNDIALS_OBJECTS) $(RUNNER_OBJECTS)
-	@strip -S $@ || true
+	$(STANR_ARCHIVER) -rs $@ $(SUNDIALS_OBJECTS) $(RUNNER_OBJECTS)
+	@if [ -z "$(STANR_GCC_LTO)" ]; then strip -S $@ || true; fi
 
 clean:
 	rm -rf ../inst/lib ../inst/tbb-build;

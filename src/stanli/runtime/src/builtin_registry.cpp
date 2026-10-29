@@ -11,6 +11,11 @@
 #include <stan/math/prim/fun/identity_matrix.hpp>
 #include <stan/math/prim/fun/linspaced_array.hpp>
 #include <stan/math/prim/fun/linspaced_int_array.hpp>
+#include <stan/math/prim/fun/rank.hpp>
+#include <stan/math/prim/fun/sort_asc.hpp>
+#include <stan/math/prim/fun/sort_desc.hpp>
+#include <stan/math/prim/fun/sort_indices.hpp>
+#include <stan/math/prim/fun/to_int.hpp>
 #include <stan/math/prim/fun/linspaced_row_vector.hpp>
 #include <stan/math/prim/fun/linspaced_vector.hpp>
 #include <stan/math/prim/fun/one_hot_array.hpp>
@@ -70,8 +75,14 @@ const char* slice_function_name(BuiltinSlice slice) {
       return "to_row_vector";
     case BuiltinSlice::ToMatrix:
       return "to_matrix";
+    case BuiltinSlice::ToVectorArray:
+      return "to_vector_array";
+    case BuiltinSlice::ToRowVectorArray:
+      return "to_row_vector_array";
     case BuiltinSlice::ToArray1d:
       return "to_array_1d";
+    case BuiltinSlice::ToArray2d:
+      return "to_array_2d";
     case BuiltinSlice::RepVector:
       return "rep_vector";
     case BuiltinSlice::RepRowVector:
@@ -242,6 +253,17 @@ BuiltinLayout builtin_layout(
 
   BuiltinLayout layout;
   layout.lanes = arguments[0].storage_size;
+  if ((spec.opcode == OP_SOFTMAX || spec.opcode == OP_LOG_SOFTMAX) &&
+      arguments[0].container == FunctionContainerKind::Array) {
+    const auto& a = arguments[0];
+    if (a.array_leaf != FunctionContainerKind::Vector &&
+        a.array_leaf != FunctionContainerKind::RowVector)
+      throw std::invalid_argument("softmax requires vector leaves");
+    layout.groups = 1;
+    for (size_t k = 0; k + 1 < a.dimensions.size(); ++k)
+      layout.groups *= a.dimensions[k];
+    layout.group_width = a.dimensions.back();
+  }
   if (spec.shape == BuiltinShapePolicy::Reduction) {
     if (spec.arity != 1)
       throw std::invalid_argument("unsupported reduction arity");
@@ -264,6 +286,23 @@ BuiltinLayout builtin_layout(
   if (spec.shape == BuiltinShapePolicy::Product ||
       spec.shape == BuiltinShapePolicy::Solve)
     throw std::logic_error("product and solve builtins have their own maps");
+  if (spec.arity > 2 && spec.shape == BuiltinShapePolicy::Elementwise) {
+    bool shaped = false;
+    for (size_t k = 0; k < arguments.size(); ++k) {
+      if (arguments[k].container == BuiltinContainerKind::Scalar) continue;
+      if (shaped &&
+          (spec.compatibility == BuiltinCompatibilityPolicy::LaneCount
+               ? arguments[layout.result_argument].storage_size !=
+                     arguments[k].storage_size
+               : !same_builtin_shape(arguments[layout.result_argument],
+                                     arguments[k])))
+        throw std::invalid_argument("incompatible logical views");
+      shaped = true;
+      layout.result_argument = static_cast<uint8_t>(k);
+    }
+    layout.lanes = arguments[layout.result_argument].storage_size;
+    return layout;
+  }
   if (spec.arity == 1) return layout;
   if (spec.arity != 2) throw std::invalid_argument("unsupported builtin arity");
 
@@ -493,6 +532,31 @@ BuiltinSliceMap builtin_slice_map(const BuiltinSpec& spec,
                                              : FunctionContainerKind::RowVector,
         input.storage_size));
   }
+  if (spec.slice == BuiltinSlice::ToVectorArray ||
+      spec.slice == BuiltinSlice::ToRowVectorArray ||
+      spec.slice == BuiltinSlice::ToArray2d) {
+    if (input.container != FunctionContainerKind::Matrix)
+      throw std::invalid_argument("expected a matrix");
+    const bool columns = spec.slice == BuiltinSlice::ToVectorArray;
+    const int64_t rows = input.dimensions[0], cols = input.dimensions[1];
+    const int64_t outer = columns ? cols : rows;
+    const int64_t width = columns ? rows : cols;
+    FunctionContainerKind leaf = columns ? FunctionContainerKind::Vector
+                                         : FunctionContainerKind::RowVector;
+    if (spec.slice == BuiltinSlice::ToArray2d)
+      leaf = FunctionContainerKind::Scalar;
+    auto map = slice_identity_map(make_function_shape(
+        FunctionArgumentKind::Real, FunctionContainerKind::Array, leaf,
+        {outer, width}, input.storage_size));
+    // Matrix inputs are column-major. Array storage varies by backend.
+    const bool identity = columns == (order == SliceStorageOrder::OuterMajor);
+    if (!identity) {
+      map.kind = BuiltinSliceMap::Kind::Gather;
+      for (int64_t i = 0; i < rows; ++i)
+        for (int64_t j = 0; j < cols; ++j) map.gather.push_back(j * rows + i);
+    }
+    return map;
+  }
   if (spec.slice == BuiltinSlice::ToMatrix) {
     if (spec.arity == 1) {
       if (input.container == FunctionContainerKind::Matrix)
@@ -507,23 +571,20 @@ BuiltinSliceMap builtin_slice_map(const BuiltinSpec& spec,
             FunctionArgumentKind::Real, FunctionContainerKind::Matrix,
             FunctionContainerKind::Scalar, {1, input.storage_size},
             input.storage_size));
-      // Two logical axes over scalar cells: array[,] and array[] row_vector
-      // per the language, plus array[] vector for legacy hand-built MIR
-      // (both prior backends accepted it with these same semantics).
       const bool matrix_shaped_array =
           input.container == FunctionContainerKind::Array &&
           input.dimensions.size() == 2 &&
           input.array_leaf != FunctionContainerKind::Matrix;
       if (!matrix_shaped_array)
         throw std::invalid_argument("cannot convert this shape to a matrix");
-      // Stan Math builds an empty matrix from an empty outer array,
-      // regardless of the declared suffix extent.
-      const int64_t rows = input.dimensions[0];
-      const int64_t columns = rows == 0 ? 0 : input.dimensions[1];
-      // The array's semantic cell (i, j) already sits at the column-major
-      // matrix position under first-index-fast storage; outer-major storage
-      // is the row-major spelling, i.e. the transpose of that.
-      if (order == SliceStorageOrder::FirstIndexFast)
+      const bool vectors = input.array_leaf == FunctionContainerKind::Vector;
+      const int64_t outer = input.dimensions[0];
+      const int64_t width = outer == 0 ? 0 : input.dimensions[1];
+      const int64_t rows = vectors ? width : outer;
+      const int64_t columns = vectors ? outer : width;
+      // Column vectors become columns; row vectors and scalar arrays become
+      // rows. An empty outer array loses its suffix extent in Stan Math.
+      if (vectors == (order == SliceStorageOrder::OuterMajor))
         return slice_identity_map(make_function_shape(
             FunctionArgumentKind::Real, FunctionContainerKind::Matrix,
             FunctionContainerKind::Scalar, {rows, columns},
@@ -1197,6 +1258,12 @@ std::vector<int64_t> builtin_shape_query(const BuiltinSpec& spec,
           shape.dimensions.end() - (std::ptrdiff_t)leaf_rank);
       const auto* leaf_extents =
           shape.dimensions.data() + (shape.dimensions.size() - leaf_rank);
+      // Stan Math recurses into x[0], so an empty array ends the list.
+      for (size_t d = 0; d < extents.size(); ++d)
+        if (extents[d] == 0) {
+          extents.resize(d + 1);
+          return extents;
+        }
       switch (leaf) {
         case FunctionContainerKind::Vector:
           extents.push_back(leaf_extents[0]);
@@ -1333,28 +1400,35 @@ BuiltinIndexMap builtin_index_map(
     }
   }
 
-  // A selection that walks storage at one non-negative step needs no gather.
-  bool constant_step = true;
-  const int64_t step = total > 1 ? map.gather[1] - map.gather[0] : 1;
-  for (int64_t cell = 1; constant_step && cell < total; ++cell)
-    constant_step = map.gather[cell] - map.gather[cell - 1] == step;
-  if (total == 0) {
-    map.kind = BuiltinSliceMap::Kind::Contiguous;
-    map.offset = 0;
-    map.gather.clear();
-  } else if (constant_step && step == 1) {
-    map.kind = BuiltinSliceMap::Kind::Contiguous;
-    map.offset = map.gather.front();
-    map.gather.clear();
-  } else if (constant_step && step >= 0) {
-    map.kind = BuiltinSliceMap::Kind::Strided;
-    map.offset = map.gather.front();
-    map.stride = step;
-    map.gather.clear();
-  } else {
-    map.kind = BuiltinSliceMap::Kind::Gather;
-  }
+  const FlatOffsetRun run = classify_flat_offsets(map.gather);
+  map.kind = run.kind;
+  map.offset = run.offset;
+  map.stride = run.stride;
+  if (map.kind != BuiltinSliceMap::Kind::Gather) map.gather.clear();
   return map;
+}
+
+FlatOffsetRun classify_flat_offsets(const std::vector<int64_t>& offsets) {
+  const int64_t total = static_cast<int64_t>(offsets.size());
+  bool constant_step = true;
+  const int64_t step = total > 1 ? offsets[1] - offsets[0] : 1;
+  for (int64_t cell = 1; constant_step && cell < total; ++cell)
+    constant_step = offsets[cell] - offsets[cell - 1] == step;
+  FlatOffsetRun run;
+  if (total == 0) {
+    run.kind = BuiltinSliceMap::Kind::Contiguous;
+    run.offset = 0;
+  } else if (constant_step && step == 1) {
+    run.kind = BuiltinSliceMap::Kind::Contiguous;
+    run.offset = offsets.front();
+  } else if (constant_step && step >= 0) {
+    run.kind = BuiltinSliceMap::Kind::Strided;
+    run.offset = offsets.front();
+    run.stride = step;
+  } else {
+    run.kind = BuiltinSliceMap::Kind::Gather;
+  }
+  return run;
 }
 
 int evaluate_predicate_builtin(const BuiltinSpec& spec, double lhs,
@@ -1389,6 +1463,37 @@ int evaluate_predicate_builtin(const BuiltinSpec& spec, double lhs,
       break;
   }
   throw std::invalid_argument("descriptor is not a predicate");
+}
+
+std::vector<int> evaluate_ordering_builtin(const BuiltinSpec& spec,
+                                           const std::vector<double>& values,
+                                           int position) {
+  return evaluate_ordering(spec.ordering, values, position);
+}
+
+std::vector<int> evaluate_ordering(BuiltinOrdering kind,
+                                   const std::vector<double>& values,
+                                   int position) {
+  switch (kind) {
+    case BuiltinOrdering::SortAsc:
+    case BuiltinOrdering::SortDesc: {
+      std::vector<int> integers(values.size());
+      for (size_t k = 0; k < values.size(); ++k)
+        integers[k] = static_cast<int>(std::llround(values[k]));
+      return kind == BuiltinOrdering::SortAsc
+                 ? stan::math::sort_asc(std::move(integers))
+                 : stan::math::sort_desc(std::move(integers));
+    }
+    case BuiltinOrdering::IndicesAsc:
+      return stan::math::sort_indices<true>(values);
+    case BuiltinOrdering::IndicesDesc:
+      return stan::math::sort_indices<false>(values);
+    case BuiltinOrdering::Rank:
+      return {stan::math::rank(values, position)};
+    case BuiltinOrdering::None:
+      break;
+  }
+  throw std::invalid_argument("descriptor is not an ordering function");
 }
 
 int evaluate_integer_binary_builtin(const BuiltinSpec& spec, int lhs, int rhs) {
@@ -1426,9 +1531,17 @@ int evaluate_integer_unary_builtin(const BuiltinSpec& spec, int value) {
       return -value;
     case OP_ABS:
       return value < 0 ? -value : value;
+    case OP_TO_INT:
+      return value;
     default:
       throw std::logic_error("integer unary builtin has no evaluator");
   }
+}
+
+int evaluate_real_to_integer_builtin(const BuiltinSpec& spec, double value) {
+  if (spec.opcode != OP_TO_INT || builtin_argument_is_integer(spec, 0))
+    throw std::logic_error("builtin is not a real-to-integer function");
+  return stan::math::to_int(value);
 }
 
 }  // namespace stanli

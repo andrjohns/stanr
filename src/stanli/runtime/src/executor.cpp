@@ -17,6 +17,10 @@
 
 namespace stanli {
 
+namespace {
+constexpr size_t kMinMicroRun = 2;
+}  // namespace
+
 using ForwardFn = void (*)(KernelCtx&);
 ForwardFn resolve_forward_fn(const Op& op);
 
@@ -36,6 +40,10 @@ static bool g_packet_math = [] {
 
 bool packet_math() { return g_packet_math; }
 void set_packet_math(bool on) { g_packet_math = on; }
+
+static bool g_fixed_small_matrices = true;
+bool fixed_small_matrices() { return g_fixed_small_matrices; }
+void set_fixed_small_matrices(bool on) { g_fixed_small_matrices = on; }
 
 // Set only for the duration of Executor::forward_value_only(). Kernels
 // that read it must still write ctx.out; all they may skip is work whose
@@ -77,8 +85,8 @@ const Kernel* find_kernel(uint16_t opcode) {
 // integer/shape metadata are immutable call-site facts, so builders resolve
 // the former once and a program invocation reuses one context packet across
 // all of its CALL instructions.
-static void bind_call_fwd_ctx(const Program::Call& call, double* reg,
-                              KernelCtx& ctx, EvalState* state) {
+void bind_call_fwd_ctx(const Program::Call& call, double* reg, KernelCtx& ctx,
+                       EvalState* state) {
   ctx.n_in = call.n_in;
   for (int k = 0; k < call.n_in; ++k)
     ctx.in[k] = Desc{reg + call.in[k], call.in_len[k]};
@@ -150,14 +158,14 @@ void run_call_var(const Program::Call& call, stan::math::var* reg) {
   total += call.scratch_len;
 
   ArenaDoubles values((size_t)total, 0.0);
-  ArenaDoubles adjoints((size_t)total, 0.0);
   ArenaVaris input_varis;
-  input_varis.reserve((size_t)out_offset);
+  const bool active = call.input_adjoint_mask != 0;
+  if (active) input_varis.reserve((size_t)out_offset);
   for (int k = 0; k < call.n_in; ++k) {
     for (int i = 0; i < call.in_len[k]; ++i) {
       const stan::math::var& x = reg[(size_t)(call.in[k] + i)];
       values[(size_t)(in_offset[(size_t)k] + i)] = x.val();
-      input_varis.push_back(x.vi_);
+      if (active) input_varis.push_back(x.vi_);
     }
   }
 
@@ -175,13 +183,17 @@ void run_call_var(const Program::Call& call, stan::math::var* reg) {
   ctx.udata = call.udata_owner.get();
   call.forward(ctx);
 
-  ArenaVaris output_varis((size_t)call.out_len);
+  ArenaVaris output_varis(active ? (size_t)call.out_len : 0);
   for (int i = 0; i < call.out_len; ++i) {
     reg[(size_t)(call.out + i)] =
         stan::math::var(values[(size_t)(out_offset + i)]);
-    output_varis[(size_t)i] = reg[(size_t)(call.out + i)].vi_;
+    if (active) output_varis[(size_t)i] = reg[(size_t)(call.out + i)].vi_;
   }
+  // Inactive calls still perform their forward computation and validation.
+  // Their fresh constant outputs have no reverse edges to retain.
+  if (!active) return;
 
+  ArenaDoubles adjoints((size_t)total, 0.0);
   const KernelFn backward = call.backward;
   const uint8_t variant = call.variant;
   const uint8_t input_adjoint_mask = call.input_adjoint_mask;
@@ -252,6 +264,7 @@ void run_call(const Program::Call& call, double* reg, EvalState* state) {
 
 void register_elementwise_kernels();
 void register_density_kernels();
+void register_probability_fns_kernels();
 void register_legacy_kernels();
 void register_matrix_kernels();
 void register_algebra_kernels();
@@ -267,12 +280,15 @@ void register_mixture_kernels();
 void register_message_kernels();
 void register_rng_kernel();
 void register_island_kernel();
+void register_region_map_kernel();
 void register_structured_loop_kernel();
+void register_reduce_sum_kernel();
 
 static void ensure_registered() {
   static const bool once = [] {
     register_elementwise_kernels();
     register_density_kernels();
+    register_probability_fns_kernels();
     register_legacy_kernels();
     register_matrix_kernels();
     register_algebra_kernels();
@@ -288,7 +304,9 @@ static void ensure_registered() {
     register_scalar_unary_ad_kernels();
     register_mixture_kernels();
     register_island_kernel();
+    register_region_map_kernel();
     register_structured_loop_kernel();
+    register_reduce_sum_kernel();
     return true;
   }();
   (void)once;
@@ -377,15 +395,32 @@ Executor::Executor(Graph g) : graph_(std::move(g)) {
   bind_();
 }
 
-Executor::Executor(const Executor& src) : graph_(src.graph_) {
+Executor::Executor(Graph g, std::vector<Borrow> borrows)
+    : graph_(std::move(g)) {
+  ensure_registered();
+  graph_.compact_idata();
+  borrowed_.assign(graph_.slots.size(), nullptr);
+  for (const auto& borrow : borrows) {
+    if (borrow.slot < 0 || size_t(borrow.slot) >= graph_.slots.size() ||
+        !borrow.data)
+      throw std::invalid_argument("borrowed slot is not in the graph");
+    borrowed_[size_t(borrow.slot)] = borrow.data;
+  }
+  bind_();
+}
+
+Executor::Executor(const Executor& src)
+    : graph_(src.graph_),
+      data_(src.data_pointer_exposed_
+                ? std::make_shared<std::vector<double>>(*src.data_)
+                : src.data_),
+      borrowed_(src.borrowed_) {
   ensure_registered();
   bind_();
-  // bind_ zeroes the arena. The source's arena is where compile_model's
-  // data and constant fills went, and the slot layout is a deterministic
-  // function of the graph, so the two arenas agree element for element.
-  // Copying into the existing buffer rather than assigning the vector
-  // keeps the contexts' interior pointers valid by construction.
   std::copy(src.values_.begin(), src.values_.end(), values_.begin());
+  for (size_t i = 0; i < ctx_.size(); ++i)
+    if (ctx_[i].state && src.ctx_[i].state)
+      ctx_[i].state->clone_from(*src.ctx_[i].state);
 }
 
 void Executor::bind_() {
@@ -396,9 +431,26 @@ void Executor::bind_() {
       throw std::length_error("executor arena size overflow");
     return a + b;
   };
-  // Parameters first so the gradient vector is contiguous in declaration
-  // order; then everything else.
-  int64_t off = 0;
+  // Only parameters and written slots need private value storage. Classify
+  // both outputs, including inactive writes: activity is not immutability.
+  std::vector<char> written(graph_.slots.size(), 0);
+  bool has_shared_primals = false;
+  size_t n_forward = 0;
+  for (const auto& op : graph_.ops) {
+    written[op.out] = 1;
+    if (op.out2 >= 0) written[op.out2] = 1;
+    has_shared_primals |= op.primal_source >= 0;
+    n_forward += op.primal_source < 0 || op.primal_source == op.out;
+  }
+  std::vector<int> primal_sources;
+  if (has_shared_primals) {
+    primal_sources.assign(graph_.slots.size(), -1);
+    for (const auto& op : graph_.ops)
+      if (op.primal_source >= 0 && op.primal_source != op.out)
+        primal_sources[(size_t)op.out] = op.primal_source;
+  }
+  int64_t off = 0, data_size = 0;
+  data_offsets_.assign(graph_.slots.size(), -1);
   for (auto& s : graph_.slots) {
     if (s.is_param) {
       s.offset = off;
@@ -406,21 +458,31 @@ void Executor::bind_() {
     }
   }
   n_params_ = off;
-  for (auto& s : graph_.slots) {
-    if (!s.is_param) {
+  for (size_t i = 0; i < graph_.slots.size(); ++i) {
+    auto& s = graph_.slots[i];
+    const bool borrowed = !borrowed_.empty() && borrowed_[i];
+    if (borrowed && (s.is_param || written[i]))
+      throw std::invalid_argument("only unwritten data can be borrowed");
+    if (s.is_param) continue;
+    if (borrowed) {
+      s.offset = 0;
+    } else if (written[i]) {
+      if (has_shared_primals && primal_sources[i] >= 0) continue;
       s.offset = off;
       off = checked_size(off, s.len);
+    } else {
+      s.offset = data_size;
+      data_offsets_[i] = data_size;
+      data_size = checked_size(data_size, s.len);
     }
   }
+  if (has_shared_primals)
+    for (size_t i = 0; i < graph_.slots.size(); ++i)
+      if (primal_sources[i] >= 0)
+        graph_.slots[i].offset = graph_.slots[(size_t)primal_sources[i]].offset;
   values_.assign(off, 0.0);
-
-  // A slot carries adjoint if it is a parameter or an op writes it. Slots
-  // that are neither are data: kernels see a null adjoint Desc and skip them.
-  std::vector<char> written(graph_.slots.size(), 0);
-  for (const auto& op : graph_.ops) {
-    written[op.out] = 1;
-    if (op.out2 >= 0) written[op.out2] = 1;
-  }
+  if (!data_) data_ = std::make_shared<std::vector<double>>(data_size, 0.0);
+  assert(static_cast<int64_t>(data_->size()) == data_size);
 
   // Adjoint addresses never escape the executor, so unlike values they do
   // not need a hole for every externally addressable data slot or for slots
@@ -457,6 +519,9 @@ void Executor::bind_() {
   // context pointers survive this function; copies compute their own layout.
   std::vector<int64_t> scratch_offsets;
   scratch_offsets.reserve(graph_.ops.size());
+  // Reuse the optional map now that value offsets have been assigned.
+  if (has_shared_primals)
+    std::fill(primal_sources.begin(), primal_sources.end(), -1);
   for (const auto& op : graph_.ops) {
     const Kernel& k = kernel(op.opcode);
     if (op.opcode == OP_NONE_ || k.forward == nullptr)
@@ -465,6 +530,15 @@ void Executor::bind_() {
       // to do from this string.
       throw std::runtime_error(std::string("opcode not registered: ") +
                                opcode_name(op.opcode));
+    if (op.primal_source >= 0 && op.primal_source != op.out) {
+      const int source = primal_sources[(size_t)op.primal_source];
+      if (source < 0)
+        throw std::logic_error("cached primal precedes its source");
+      scratch_offsets.push_back(scratch_offsets[(size_t)source]);
+      continue;
+    }
+    if (op.primal_source == op.out)
+      primal_sources[(size_t)op.out] = (int)scratch_offsets.size();
     scratch_offsets.push_back(scratch);
     scratch = checked_size(
         scratch, k.scratch_size ? k.scratch_size(op, graph_.slots.data()) : 0);
@@ -478,33 +552,99 @@ void Executor::bind_() {
   // vectorize) was a third of the time.
   ctx_.resize(graph_.ops.size());
   kernel_states_.clear();
-  out2_adj_ptr_.assign(graph_.ops.size(), nullptr);
+  // Keep executable forwards in a contiguous prefix. Cached primals only
+  // need their original reverse callbacks, so their contexts follow it.
+  // The ordinary forward loop and its context layout stay unchanged.
+  if (has_shared_primals) primal_sources.resize(graph_.ops.size());
+  size_t next_forward = 0, next_cached = n_forward;
   for (size_t i = 0; i < graph_.ops.size(); ++i) {
-    ctx_[i] =
-        make_ctx_(graph_.ops[i], scratch_offsets[i], written, adjoint_offsets);
+    const Op& op = graph_.ops[i];
+    const size_t ci = op.primal_source >= 0 && op.primal_source != op.out
+                          ? next_cached++
+                          : next_forward++;
+    if (has_shared_primals) primal_sources[i] = static_cast<int>(ci);
+    ctx_[ci] = make_ctx_(op, scratch_offsets[i], written, adjoint_offsets);
     const Kernel& k = kernel(graph_.ops[i].opcode);
     if (k.make_state) {
-      kernel_states_.emplace_back(
+      std::unique_ptr<KernelState> state(
           k.make_state(graph_.ops[i], graph_.slots.data()));
-      ctx_[i].state = kernel_states_.back().get();
-    }
-    const int o2 = graph_.ops[i].out2;
-    if (o2 >= 0) {
-      assert(adjoint_offsets[o2] >= 0);
-      out2_adj_ptr_[i] = adjoints_.data() + adjoint_offsets[o2];
+      if (state) {
+        ctx_[ci].state = state.get();
+        kernel_states_.push_back(std::move(state));
+      }
     }
   }
   // Resolve dispatch now that ctx_ is final (it never reallocates after
   // this, so BwdStep may hold pointers into it).
-  fwd_fn_.resize(graph_.ops.size());
+  fwd_fn_.clear();
+  fwd_fn_.reserve(n_forward);
   bwd_.clear();
   bwd_.reserve(graph_.ops.size());
   for (size_t i = 0; i < graph_.ops.size(); ++i) {
-    fwd_fn_[i] = resolve_forward_fn(graph_.ops[i]);
+    const Op& op = graph_.ops[i];
+    if (op.primal_source < 0 || op.primal_source == op.out)
+      fwd_fn_.push_back(resolve_forward_fn(op));
   }
+  micro_.clear();
+  micro_runs_.clear();
+  fused_.clear();
+  struct Pending {
+    size_t ci;
+    const Kernel* k;
+    uint16_t opcode;
+  };
+  std::vector<Pending> pending;
+  size_t run_start = 0;
+  const auto close_run = [&] {
+    if (pending.empty()) return;
+    if (micro_.size() - run_start >= kMinMicroRun) {
+      micro_runs_.push_back(MicroRun{static_cast<uint32_t>(run_start),
+                                     static_cast<uint32_t>(micro_.size()),
+                                     static_cast<uint32_t>(bwd_.size())});
+      bwd_.push_back(BwdStep{nullptr, nullptr, nullptr});
+      for (const Pending& p : pending)
+        fused_.push_back(FusedOp{&ctx_[p.ci], p.k->cached_micro, p.opcode});
+    } else {
+      micro_.resize(run_start);
+      for (const Pending& p : pending)
+        bwd_.push_back(BwdStep{p.k->backward, &ctx_[p.ci], nullptr});
+    }
+    pending.clear();
+  };
   for (size_t i = graph_.ops.size(); i-- > 0;) {
-    void (*b)(KernelCtx&) = kernel(graph_.ops[i].opcode).backward;
-    if (b) bwd_.push_back(BwdStep{b, &ctx_[i], out2_adj_ptr_[i]});
+    const Op& op = graph_.ops[i];
+    const Kernel& k = kernel(op.opcode);
+    void (*b)(KernelCtx&) = k.backward;
+    if (!b) continue;
+    const size_t ci = has_shared_primals ? (size_t)primal_sources[i] : i;
+    if (has_shared_primals && op.primal_source >= 0 &&
+        op.primal_source != op.out && op.out2 < 0 && k.cached_micro) {
+      const size_t before = micro_.size();
+      if (pending.empty()) run_start = before;
+      if (k.cached_micro(ctx_[ci], micro_)) {
+        for (size_t m = before; m < micro_.size(); ++m)
+          micro_[m].opcode = op.opcode;
+        if (micro_.size() != before)
+          pending.push_back(Pending{ci, &k, op.opcode});
+        continue;
+      }
+      micro_.resize(before);
+    }
+    close_run();
+    const int o2 = op.out2;
+    const double* out2 =
+        o2 >= 0 ? adjoints_.data() + adjoint_offsets[o2] : nullptr;
+    bwd_.push_back(BwdStep{b, &ctx_[ci], out2});
+  }
+  close_run();
+}
+
+void Executor::refresh_micros_() {
+  micro_.clear();
+  for (const FusedOp& f : fused_) {
+    const size_t before = micro_.size();
+    f.fn(*f.ctx, micro_);
+    for (size_t m = before; m < micro_.size(); ++m) micro_[m].opcode = f.opcode;
   }
 }
 
@@ -515,13 +655,13 @@ KernelCtx Executor::make_ctx_(const Op& op, int64_t scratch_offset,
   ctx.n_in = op.n_in;
   for (int i = 0; i < op.n_in; ++i) {
     const Slot& s = graph_.slots[op.in[i]];
-    ctx.in[i] = Desc{values_.data() + s.offset, s.len};
+    ctx.in[i] = Desc{slot_data_(op.in[i]), s.len};
   }
   const Slot& so = graph_.slots[op.out];
-  ctx.out = Desc{values_.data() + so.offset, so.len};
+  ctx.out = Desc{slot_data_(op.out), so.len};
   if (op.out2 >= 0) {
     const Slot& s2 = graph_.slots[op.out2];
-    ctx.out2 = Desc{values_.data() + s2.offset, s2.len};
+    ctx.out2 = Desc{slot_data_(op.out2), s2.len};
   }
   ctx.variant = op.variant;
   ctx.scratch = scratch_.empty() ? nullptr : scratch_.data() + scratch_offset;
@@ -548,9 +688,57 @@ KernelCtx Executor::make_ctx_(const Op& op, int64_t scratch_offset,
   return ctx;
 }
 
+void Executor::detach_data_() {
+  if (data_.use_count() == 1) return;
+  auto replacement = std::make_shared<std::vector<double>>(*data_);
+  data_ = std::move(replacement);
+  // Bound contexts hold input pointers. No output can belong to data_.
+  size_t forward = 0, cached = fwd_fn_.size();
+  for (const Op& op : graph_.ops) {
+    const size_t ci = op.primal_source >= 0 && op.primal_source != op.out
+                          ? cached++
+                          : forward++;
+    for (int i = 0; i < op.n_in; ++i) {
+      const int slot = op.in[i];
+      if (data_offsets_[slot] >= 0) ctx_[ci].in[i].data = slot_data_(slot);
+    }
+  }
+  refresh_micros_();
+}
+
+double* Executor::value_ptr(int slot) {
+  if (!borrowed_.empty() && borrowed_[slot])
+    throw std::logic_error("borrowed slot is read-only");
+  if (data_offsets_[slot] >= 0) {
+    detach_data_();
+    data_pointer_exposed_ = true;
+  }
+  return slot_data_(slot);
+}
+
+void Executor::set_values(int slot, const double* data, size_t size) {
+  if (slot < 0 || static_cast<size_t>(slot) >= graph_.slots.size() ||
+      size > static_cast<uint64_t>(graph_.slots[slot].len))
+    throw std::out_of_range("executor fill exceeds slot");
+  if (!borrowed_.empty() && borrowed_[slot])
+    throw std::logic_error("borrowed slot is read-only");
+  if (data_offsets_[slot] >= 0) detach_data_();
+  if (size) std::copy_n(data, size, slot_data_(slot));
+}
+
 void Executor::set_profile(bool on) {
   profile_ = on;
   if (on && prof_.empty()) prof_.resize(OP_COUNT_);
+  if (on && ctx_opcodes_.empty()) {
+    ctx_opcodes_.resize(ctx_.size());
+    size_t forward = 0, cached = fwd_fn_.size();
+    for (const Op& op : graph_.ops) {
+      const size_t ci = op.primal_source >= 0 && op.primal_source != op.out
+                            ? cached++
+                            : forward++;
+      ctx_opcodes_[ci] = op.opcode;
+    }
+  }
 }
 
 std::string Executor::profile_report() const {
@@ -560,7 +748,7 @@ std::string Executor::profile_report() const {
   // Opcodes by total time, descending.
   std::vector<uint16_t> order;
   for (uint16_t op = 0; op < prof_.size(); ++op)
-    if (prof_[op].calls > 0) order.push_back(op);
+    if (prof_[op].calls > 0 || prof_[op].bwd_ns > 0) order.push_back(op);
   std::sort(order.begin(), order.end(), [&](uint16_t a, uint16_t b) {
     return prof_[a].fwd_ns + prof_[a].bwd_ns >
            prof_[b].fwd_ns + prof_[b].bwd_ns;
@@ -586,9 +774,12 @@ std::string Executor::profile_report() const {
   return out;
 }
 
-void Executor::run_forward_only() { run_forward_only(EvalState{}); }
+void Executor::run_forward_only() {
+  run_forward_only(EvalState{nullptr, reduce_context_});
+}
 
 void Executor::run_forward_only(EvalState state) {
+  reverse_ready_ = false;
   struct RestoreState {
     EvalState& slot;
     EvalState previous;
@@ -596,17 +787,16 @@ void Executor::run_forward_only(EvalState state) {
   } restore{eval_state_, eval_state_};
   eval_state_ = state;
   // The profiled path keeps the opcode-keyed loop (attribution needs the
-  // opcode anyway, and the timing calls dwarf dispatch cost). This bypasses
-  // resolve_forward_fn, so a variant-specialized op is timed through its
-  // canonical kernel. island.hpp requires the two forwards to leave bitwise-
-  // identical outputs and scratch; switch this loop to fwd_fn_ only when the
-  // executor's layout is next re-gated.
+  // opcode anyway, and the timing calls dwarf dispatch cost), but it must
+  // invoke the same bound function pointer as the fast path. The registry is
+  // mutable for extension kernels; consulting it here would make profiling
+  // change both variant specialization and post-bind kernel overrides.
   if (profile_) {
-    const size_t np = graph_.ops.size();
+    const size_t np = fwd_fn_.size();
     for (size_t i = 0; i < np; ++i) {
-      const uint16_t op = graph_.ops[i].opcode;
+      const uint16_t op = ctx_opcodes_[i];
       const auto t0 = std::chrono::steady_clock::now();
-      kernel(op).forward(ctx_[i]);
+      fwd_fn_[i](ctx_[i]);
       const auto t1 = std::chrono::steady_clock::now();
       ProfEntry& e = prof_[op];
       ++e.calls;
@@ -634,8 +824,9 @@ void Executor::run_forward_only(EvalState state) {
 
 double Executor::forward_value_only() {
   struct ValuesOnly {
+    bool previous = g_values_only;
     ValuesOnly() { g_values_only = true; }
-    ~ValuesOnly() { g_values_only = false; }
+    ~ValuesOnly() { g_values_only = previous; }
   } guard;
   return forward();
 }
@@ -644,31 +835,119 @@ double Executor::forward() {
   run_forward_only();
   const Slot& r = graph_.slots[graph_.result_slot];
   assert(r.len == 1);
-  return values_[r.offset];
+  reverse_ready_ = !g_values_only;
+  return slot_data_(graph_.result_slot)[0];
 }
 
 double Executor::gradient(double* grad_out) {
   ++n_grad_evals_;
+  struct FullGradient {
+    bool previous = g_values_only;
+    FullGradient() { g_values_only = false; }
+    ~FullGradient() { g_values_only = previous; }
+  } guard;
   const double v = forward();
+  reverse(grad_out, 1.0);
+  return v;
+}
+
+namespace {
+
+template <class Step>
+inline void run_bwd_step(const Step& s) {
+  KernelCtx& ctx = *s.ctx;
+  if (ctx.out_adj_vec.len == 1) ctx.out_adj = ctx.out_adj_vec.data[0];
+  if (s.out2_adj) ctx.out2_adj = *s.out2_adj;
+  s.fn(ctx);
+}
+
+inline void run_micro_range(const BwdMicro* m, const BwdMicro* end) {
+  for (; m != end; ++m) run_bwd_micro(*m);
+}
+
+template <class Steps, class Runs>
+[[gnu::noinline]] void reverse_dense_micro(const Steps& bwd, const Runs& runs,
+                                           const std::vector<BwdMicro>& micro) {
+  size_t run = 0;
+  for (const auto& s : bwd) {
+    if (s.fn) {
+      run_bwd_step(s);
+      continue;
+    }
+    const auto r = runs[run++];
+    run_micro_range(micro.data() + r.begin, micro.data() + r.end);
+  }
+}
+
+template <class Steps, class Runs>
+[[gnu::noinline]] void reverse_sparse_micro(
+    const Steps& bwd, const Runs& runs, const std::vector<BwdMicro>& micro) {
+  const auto plain = [&](size_t i, const size_t end) {
+    for (; i + 4 <= end; i += 4) {
+      run_bwd_step(bwd[i]);
+      run_bwd_step(bwd[i + 1]);
+      run_bwd_step(bwd[i + 2]);
+      run_bwd_step(bwd[i + 3]);
+    }
+    for (; i < end; ++i) run_bwd_step(bwd[i]);
+  };
+  size_t pos = 0;
+  for (const auto& r : runs) {
+    plain(pos, r.at);
+    run_micro_range(micro.data() + r.begin, micro.data() + r.end);
+    pos = r.at + 1;
+  }
+  plain(pos, bwd.size());
+}
+
+}  // namespace
+
+void Executor::reverse(double* grad_out, double seed) {
+  if (!reverse_ready_)
+    throw std::logic_error("reverse requires a fresh forward");
+  reverse_ready_ = false;
+  struct RestoreState {
+    EvalState& state;
+    EvalState previous;
+    ~RestoreState() { state = previous; }
+  } restore{eval_state_, eval_state_};
+  eval_state_.reduce = reduce_context_;
   std::memset(adjoints_.data(), 0, sizeof(double) * adjoints_.size());
   assert(result_adjoint_offset_ >= 0);
-  adjoints_[result_adjoint_offset_] = 1.0;
+  adjoints_[result_adjoint_offset_] = seed;
   if (profile_) {
-    for (size_t pi = graph_.ops.size(); pi-- > 0;) {
-      const Kernel& k = kernel(graph_.ops[pi].opcode);
-      if (!k.backward) continue;
-      KernelCtx& ctx = ctx_[pi];
+    // Profile the exact bound backward plan. Each context belongs to ctx_,
+    // so its index supplies opcode attribution without a second graph walk
+    // or extra fields in the fast-path BwdStep layout.
+    size_t run = 0;
+    for (const BwdStep& step : bwd_) {
+      if (!step.fn) {
+        const MicroRun r = micro_runs_[run++];
+        for (uint32_t m = r.begin; m < r.end; ++m) {
+          const auto t0 = std::chrono::steady_clock::now();
+          run_bwd_micro(micro_[m]);
+          prof_[micro_[m].opcode].bwd_ns +=
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+        }
+        continue;
+      }
+      KernelCtx& ctx = *step.ctx;
+      const size_t pi = static_cast<size_t>(step.ctx - ctx_.data());
+      assert(pi < graph_.ops.size());
       if (ctx.out_adj_vec.len == 1) ctx.out_adj = ctx.out_adj_vec.data[0];
-      if (out2_adj_ptr_[pi]) ctx.out2_adj = *out2_adj_ptr_[pi];
+      if (step.out2_adj) ctx.out2_adj = *step.out2_adj;
       const auto t0 = std::chrono::steady_clock::now();
-      k.backward(ctx);
-      prof_[graph_.ops[pi].opcode].bwd_ns +=
+      step.fn(ctx);
+      prof_[ctx_opcodes_[pi]].bwd_ns +=
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - t0)
               .count();
     }
-    std::memcpy(grad_out, adjoints_.data(), sizeof(double) * n_params_);
-    return v;
+    if (n_params_)
+      std::memcpy(grad_out, adjoints_.data(), sizeof(double) * n_params_);
+    return;
   }
   // Same unroll as the forward sweep (see run_forward_only).
   const auto step = [](const BwdStep& s) {
@@ -680,6 +959,15 @@ double Executor::gradient(double* grad_out) {
     s.fn(ctx);
   };
   const size_t nb = bwd_.size();
+  if (!micro_runs_.empty()) {
+    if (micro_.size() * 2 < nb)
+      reverse_sparse_micro(bwd_, micro_runs_, micro_);
+    else
+      reverse_dense_micro(bwd_, micro_runs_, micro_);
+    if (n_params_)
+      std::memcpy(grad_out, adjoints_.data(), sizeof(double) * n_params_);
+    return;
+  }
   size_t i = 0;
   for (; i + 4 <= nb; i += 4) {
     step(bwd_[i]);
@@ -688,8 +976,8 @@ double Executor::gradient(double* grad_out) {
     step(bwd_[i + 3]);
   }
   for (; i < nb; ++i) step(bwd_[i]);
-  std::memcpy(grad_out, adjoints_.data(), sizeof(double) * n_params_);
-  return v;
+  if (n_params_)
+    std::memcpy(grad_out, adjoints_.data(), sizeof(double) * n_params_);
 }
 
 }  // namespace stanli

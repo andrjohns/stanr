@@ -6,15 +6,15 @@
 
 #include <algorithm>
 #include <functional>
+#include <map>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
 namespace stanli {
 namespace {
 
-[[noreturn]] void refuse(const std::string& what) {
-  throw CompileError("stanli init: " + what);
-}
+[[noreturn]] void refuse(const std::string& what) { throw CompileError(what); }
 
 int64_t product(const std::vector<int64_t>& dims) {
   int64_t n = 1;
@@ -219,6 +219,34 @@ std::vector<double> InitInterp::eval(
     refuse("the init section produced " + std::to_string(free_values.size()) +
            " free values, expected " + std::to_string(total_free));
   return free_values;
+}
+
+namespace {
+
+const InitInterp& transform_inits_interp(const CompiledModel& cm) {
+  if (!cm.transform_inits)
+    throw std::runtime_error(
+        "this model has no inverse parameter transforms: its MIR carries no "
+        "transform_inits section");
+  if (!cm.transform_inits->interp)
+    throw std::runtime_error(
+        "this model's inverse parameter transforms are unavailable: " +
+        cm.transform_inits->truncated);
+  return *cm.transform_inits->interp;
+}
+
+}  // namespace
+
+void unconstrain_inits(const CompiledModel& cm,
+                       const std::map<std::string, DataMap::Entry>& inits,
+                       double* out) {
+  const std::vector<double> unc = transform_inits_interp(cm).eval(inits);
+  if ((int64_t)unc.size() != cm.n_unconstrained)
+    throw std::runtime_error("the inverse transforms produced " +
+                             std::to_string(unc.size()) +
+                             " unconstrained values, expected " +
+                             std::to_string(cm.n_unconstrained));
+  std::copy(unc.begin(), unc.end(), out);
 }
 
 }  // namespace stanli

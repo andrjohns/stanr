@@ -36,6 +36,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -58,6 +59,9 @@ struct IslandProg : Program {
     // True where nobody says otherwise, which is the all-active binding
     // this was before.
     bool active = true;
+    // Filled by gen_adjoint. Only an unmodified input's adjoint cells may
+    // continue accumulation from the corresponding external adjoints.
+    bool immutable = false;
   };
   std::vector<LiveIn> ins;
   // The generated backward (adjoint.hpp), empty for a program the generator
@@ -68,32 +72,20 @@ struct IslandProg : Program {
   // so the two backwards are compared over the SAME islands running the
   // SAME forward program, which is the only comparison worth having.
   bool native_adj = false;
+  // Set after necessity lowering has finalized code and live-in windows.
+  // Immutable once published; hand-built programs leave this unset and the
+  // workspace factory proves initialization when binding them.
+  std::optional<bool> replay_initialized;
 };
 
-// Payload used only by OP_ISLAND with kIslandSoftmax3Variant. Ordinary islands
-// retain the exact IslandProg size and allocation they had before this
-// optimization existed.
-// The inherited canonical Program stays untouched and remains the replay
-// oracle wherever var replay is supported.
-struct Softmax3IslandProg : IslandProg {
-  std::shared_ptr<const Program> optimized_double;
-};
-
-// This value selects the derived payload's double-only plan while retaining
-// the ordinary island opcode and kernel-table layout. Setting it on a plain
-// IslandProg violates the tagged payload contract; the graph carver is the
-// only production producer. Its
-// forward must leave outputs and scratch bitwise-identical to OP_ISLAND's
-// canonical forward: the profiled executor and direct kernel-table callers
-// use that path, and the generated adjoint consumes either register file.
-// test_softmax3_double_exact enforces this contract.
-constexpr uint8_t kIslandSoftmax3Variant = 1;
 // Generic variant for a canonical IslandProg whose forward bytecode contains
 // Program::CALL. Executor binding selects its context-reusing forward once;
 // ordinary islands retain the context-free evaluator with no runtime check.
 constexpr uint8_t kIslandCallVariant = 2;
 
 void island_calls_fwd(KernelCtx& ctx);
+
+bool continue_input_adjoints(const IslandProg& p, const KernelCtx& ctx);
 
 // True when the region's program has an observable effect: a draw from the
 // caller's stream, a print, or a reject. A pass that reasons about purity has
@@ -116,23 +108,14 @@ bool compact_island_gated(IslandProg& p, bool enable_destination_forwarding);
 
 // Generate p.adj, appending checkpoint saves to p's forward code. False
 // leaves p untouched and keeps the replay.
-bool gen_adjoint(IslandProg& p);
-
-// After gen_adjoint has captured the original forward program, return a
-// double-only clone that replaces sufficiently common SOFTMAX(3) instructions
-// with calls to an allocation-free private Program kernel. Null means refused;
-// the canonical bytecode stays unchanged.
-std::shared_ptr<const Program> specialize_softmax3(const IslandProg& p,
-                                                   size_t min_count = 32);
+bool gen_adjoint(IslandProg& p, bool keep_every_clear = false);
 
 // Evaluate on T = double (forward) or stan::math::var (backward replay,
 // inside the caller's nested_rev_autodiff). The register file is reused
-// between calls. Not reentrant; islands cannot contain islands.
+// by the caller, which owns its lifetime.
 template <typename T>
-void run_island(const IslandProg& p, const T* const* in, T* out,
+void run_island(const IslandProg& p, const T* const* in, T* out, T* reg,
                 EvalState* state = nullptr) {
-  static thread_local std::vector<T> reg;
-  if ((int64_t)reg.size() < p.n_regs) reg.resize((size_t)p.n_regs);
   for (size_t k = 0; k < p.ins.size(); ++k) {
     const int input = p.ins[k].input >= 0 ? p.ins[k].input : (int)k;
     for (int i = 0; i < p.ins[k].len; ++i)

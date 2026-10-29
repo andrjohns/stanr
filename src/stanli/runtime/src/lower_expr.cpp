@@ -1,5 +1,7 @@
 #include "lower_internal.hpp"
 
+#include <numeric>
+
 namespace stanli {
 namespace lower_detail {
 
@@ -61,6 +63,19 @@ std::vector<int64_t> Lowering::index_positions(const mir::Expr& ix,
   fail(std::string("unsupported ") + what + " " + ix.name, raw);
 }
 
+// For each graph cell of v, its position in v's observation.
+std::optional<std::vector<int64_t>> Lowering::observed_positions(const Val& v) {
+  std::vector<int64_t> at((size_t)g.slots[v.slot].len);
+  std::iota(at.begin(), at.end(), int64_t{0});
+  if (!is_array(v.si)) return at;
+  const ArrayShape& shape = array_shape(v.si);
+  try {
+    return graph_container_order(
+        at, shape.dims, shape.dims.size() - (size_t)leaf_rank(shape.leaf));
+  } catch (const std::domain_error&) {
+    return std::nullopt;
+  }
+}
 // Target models build int arrays in ascending contiguous writes.  Track the
 // initialized prefix in O(1) per immutable slot: overwrites inside it are
 // safe, an adjacent write extends it, and any gap/stride fails closed.  The
@@ -70,34 +85,30 @@ void Lowering::propagate_int_update(const Val& out_v, const Val& base,
                                     const Val& rhs, int64_t start,
                                     int64_t stride) {
   // A write of an observed value into an observed base stays observed:
-  // splice the element into a copy of the base's entry. Graph slots store
-  // arrays outer-major while DataMap entries keep first-index-fast order,
-  // so splicing graph offsets is only sound where the two flat orders
-  // coincide: scalars, vectors, matrices (column-major on both sides), and
-  // one-dimensional flat arrays. Deeper and Eigen-leaf arrays drop the
-  // observation instead of recording cells under the wrong order; their
-  // reads then evaluate against the graph value itself.
-  const bool splice_orders_agree =
-      !is_array(base.si) || (array_shape(base.si).dims.size() == 1 &&
-                             array_shape(base.si).leaf == ViewKind::Flat);
-  if (const DataMap::Entry* be =
-          splice_orders_agree ? observation(base) : nullptr) {
+  // splice the elements into a copy of the base's entry. Graph slots store
+  // arrays outer-major while DataMap entries keep first-index-fast order, so
+  // each graph offset is mapped to its entry position on both sides.
+  if (const DataMap::Entry* be = observation(base)) {
     const DataMap::Entry* re = observation(rhs);
     const int64_t rl = g.slots[rhs.slot].len;
     if ((rl == 0 || re) && g.slots[out_v.slot].len == g.slots[base.slot].len) {
       DataMap::Entry en = *be;
-      bool ok = true;
-      for (int64_t k = 0; k < rl; ++k) {
+      const auto base_at = observed_positions(base);
+      const auto rhs_at = observed_positions(rhs);
+      bool ok = base_at && rhs_at;
+      for (int64_t k = 0; ok && k < rl; ++k) {
         const int64_t at = start + k * stride;
         if (at < 0 || at >= (int64_t)en.r.size()) {
           ok = false;
           break;
         }
-        const double v = k < (int64_t)re->r.size()
-                             ? re->r[(size_t)k]
-                             : static_cast<double>(re->i.at((size_t)k));
-        en.r[(size_t)at] = v;
-        if (!en.i.empty()) en.i[(size_t)at] = (int)v;
+        const size_t from = (size_t)(*rhs_at)[(size_t)k];
+        const size_t to = (size_t)(*base_at)[(size_t)at];
+        const double v = from < re->r.size()
+                             ? re->r[from]
+                             : static_cast<double>(re->i.at(from));
+        en.r[to] = v;
+        if (!en.i.empty()) en.i[to] = (int)v;
       }
       if (ok) observe(out_v, std::move(en));
     }
@@ -166,10 +177,41 @@ long Lowering::answer_shape_query(const mir::Expr& e, const SlotInfo& si,
   }
 }
 
+static void append_signature(const mir::Expr& e, std::string* out) {
+  *out += '(';
+  *out += std::to_string(static_cast<int>(e.kind));
+  *out += ' ';
+  *out += std::to_string(static_cast<int>(e.fn_lib));
+  *out += ' ';
+  *out += e.name;
+  *out += ' ';
+  *out += std::to_string(e.lit_i);
+  *out += ' ';
+  *out += std::to_string(e.lit);
+  *out += ' ';
+  *out += e.lit_s;
+  for (const auto& a : e.args) append_signature(a, out);
+  *out += ')';
+}
+
+std::string Lowering::expr_signature(const mir::Expr& e) {
+  std::string out;
+  append_signature(e, &out);
+  return out;
+}
+
 long Lowering::eval_int(const mir::Expr& e) {
-  if (expr_effectful(e))
-    fail("effectful expression cannot be used as a compile-time integer",
-         e.raw);
+  if (const unsigned effects = expr_effects(e)) {
+    if (!data_extent_scope || effects != kMessageEffect)
+      fail("effectful expression cannot be used as a compile-time integer",
+           e.raw);
+    std::string key = expr_signature(e);
+    auto memo = data_extent_memo.find(key);
+    if (memo != data_extent_memo.end()) return memo->second;
+    const long value = td.as_int(e);
+    data_extent_memo.emplace(std::move(key), value);
+    return value;
+  }
   switch (e.kind) {
     case mir::Expr::LitInt:
       return e.lit_i;
@@ -196,25 +238,36 @@ long Lowering::eval_int(const mir::Expr& e) {
       // O1 can leave an empty Indexed wrapper around a fully composed
       // integer access, just as it does for real-valued expressions.
       if (e.args.size() == 1) return eval_int(e.args[0]);
-      DataMap::Entry* en =
+      const DataMap::Entry* en =
           e.args[0].kind == mir::Expr::Var ? td.find(e.args[0].name) : nullptr;
-      if (en && en->is_int && e.args.size() == 2 &&
-          e.args[1].name == "IndexSingle") {
-        const long index = eval_int(e.args[1].args[0]);
-        if (index < 1 || (size_t)index > en->i.size())
-          fail("integer index " + std::to_string(index) +
-                   " out of bounds for size " + std::to_string(en->i.size()),
-               e.raw);
-        return en->i[(size_t)index - 1];
-      }
-      if (en && en->is_int && e.args.size() == 3 &&
-          e.args[1].name == "IndexSingle" && e.args[2].name == "IndexSingle" &&
-          en->dims.size() == 2) {
-        const long row = eval_int(e.args[1].args[0]);
-        const long col = eval_int(e.args[2].args[0]);
-        if (row < 1 || row > en->dims[0] || col < 1 || col > en->dims[1])
-          fail("integer matrix index out of bounds", e.raw);
-        return en->i[(size_t)((col - 1) * en->dims[0] + row - 1)];
+      bool all_single = en && en->is_int;
+      // A local held only as a graph value is read from its observation,
+      // which keeps the same first-index-fastest order but may hold the
+      // integers as reals.
+      if (!en && e.args[0].kind == mir::Expr::Var)
+        if (const auto bound = scope.find(e.args[0].name); bound != scope.end())
+          if ((en = observation(bound->second)))
+            all_single =
+                en->is_int ? en->i.size() == en->r.size() : en->i.empty();
+      const size_t stored = !en ? 0 : en->is_int ? en->i.size() : en->r.size();
+      for (size_t k = 1; all_single && k < e.args.size(); ++k)
+        all_single = e.args[k].name == "IndexSingle";
+      const size_t rank = en ? std::max<size_t>(en->dims.size(), 1) : 0;
+      if (all_single && e.args.size() - 1 == rank) {
+        size_t offset = 0, stride = 1;
+        for (size_t d = 0; d < rank; ++d) {
+          const int64_t extent =
+              en->dims.empty() ? (int64_t)stored : en->dims[d];
+          const long index = eval_int(e.args[d + 1].args[0]);
+          if (index < 1 || index > extent)
+            fail("integer index " + std::to_string(index) +
+                     " out of bounds for size " + std::to_string(extent),
+                 e.raw);
+          offset += (size_t)(index - 1) * stride;
+          stride *= (size_t)extent;
+        }
+        if (offset >= stored) fail("integer index storage", e.raw);
+        return en->is_int ? en->i[offset] : static_cast<long>(en->r[offset]);
       }
       // dims(x)[k] and friends: evaluate the base as a compile-time
       // sequence, then index it.
@@ -250,6 +303,12 @@ long Lowering::eval_int(const mir::Expr& e) {
           function->builtin()->shape == BuiltinShapePolicy::Elementwise &&
           function->result() == FunctionArgumentKind::Integer) {
         const BuiltinSpec& spec = *function->builtin();
+        if (spec.arity == 1 && !builtin_argument_is_integer(spec, 0)) {
+          const std::vector<double> value = const_values(e.args[0]);
+          if (value.size() != 1)
+            fail(e.name + ": expected a scalar argument", e.raw);
+          return evaluate_real_to_integer_builtin(spec, value[0]);
+        }
         if (spec.arity == 1)
           return evaluate_integer_unary_builtin(
               spec, static_cast<int>(eval_int(e.args[0])));
@@ -264,6 +323,11 @@ long Lowering::eval_int(const mir::Expr& e) {
         for (int v : const_ints(e.args[0])) acc += v;
         return acc;
       }
+      // Stock stanc's --O1 folds an integer a * b + c into fma(a, b, c).
+      if (e.name == "fma" && e.args.size() == 3 &&
+          std::all_of(e.args.begin(), e.args.end(),
+                      [](const mir::Expr& a) { return a.type_ == "UInt"; }))
+        return eval_int(e.args[0]) * eval_int(e.args[1]) + eval_int(e.args[2]);
       if (const BuiltinSpec* pred =
               e.args.size() == 2 ? shaped_builtin_spec(
                                        e.name, 2, BuiltinShapePolicy::Predicate)
@@ -290,12 +354,20 @@ long Lowering::eval_int(const mir::Expr& e) {
       if (scalar_shape_query(e) && e.args.size() == 1 &&
           e.args[0].kind == mir::Expr::Var) {
         auto sit = scope.find(e.args[0].name);
-        if (sit != scope.end() && !has_runtime_shape(sit->second))
+        if (sit != scope.end()) {
+          if (has_runtime_shape(sit->second))
+            fail(e.name + ": operand has no compile-time extent", e.raw);
           return answer_shape_query(e, sit->second.si,
                                     g.slots[sit->second.slot].len);
+        }
         auto dl = decls.find(e.args[0].name);
-        if (dl != decls.end())
+        if (dl != decls.end()) {
+          if (std::any_of(dl->second.runtime_dims.begin(),
+                          dl->second.runtime_dims.end(),
+                          [](int slot) { return slot >= 0; }))
+            fail(e.name + ": operand has no compile-time extent", e.raw);
           return answer_shape_query(e, dl->second.si, dl->second.len);
+        }
         // A name td knows but neither scope nor decls does: the scalar
         // `int` input. bind_data fills both tables from a declared shape
         // and a scalar int has none, so it falls past both -- the one
@@ -344,7 +416,7 @@ long Lowering::eval_int(const mir::Expr& e) {
   }
 }
 int64_t Lowering::sized_len(const mir::SizedType& t, int64_t* rows,
-                            int64_t* cols) {
+                            int64_t* cols, const std::string& var) {
   if (t.base == "SInt" || t.base == "SReal") return 1;
   if (t.base == "SVector" || t.base == "SRowVector") {
     const int64_t n = eval_int(t.dims[0]);
@@ -361,7 +433,10 @@ int64_t Lowering::sized_len(const mir::SizedType& t, int64_t* rows,
   if (t.base == "SArray") {
     return checked_product(sized_dims(t), "array shape");
   }
-  fail("unsupported sized type " + t.base, t.raw);
+  const std::string where = var.empty() ? "" : " (in variable " + var + ")";
+  if (t.base.rfind("SComplex", 0) == 0)
+    fail("complex numbers are not supported yet" + where, t.raw);
+  fail("this variable type is not supported yet" + where, t.raw);
 }
 SlotInfo Lowering::view_of(const mir::SizedType& t, bool param_free) {
   SlotInfo si;
@@ -836,28 +911,31 @@ Lowering::Val Lowering::lower_expr_impl(const mir::Expr& e) {
                        {checked_immediate(offset, "range offset")}),
             contiguous_layout(base, offset, "range"));
       }
-      // A data gather on a one-dimensional scalar array keeps an exact
-      // one-dimensional Array view. More structural forms need strides
-      // and therefore stay fail-loud rather than masquerading as vectors.
+      // A data gather over the outer array dimension copies whole outer
+      // elements, which graph storage keeps contiguous.
       if (e.args.size() == 2 && is_array(base.si) &&
           e.args[1].name == "IndexMulti") {
         const ArrayShape& sh = array_shape(base.si);
-        if (sh.leaf != ViewKind::Flat || sh.dims.size() != 1)
-          fail("unsupported index expression", e.raw);
         DataMap::Entry iv = eval_pure(e.args[1].args[0], "a gather index");
         if (!iv.is_int || iv.i.size() != iv.r.size())
           fail("gather index must be int data", e.raw);
+        const std::vector<int64_t> suffix(sh.dims.begin() + 1, sh.dims.end());
+        const int64_t width = checked_product(suffix, "array element");
+        std::vector<int64_t> out_dims = sh.dims;
+        out_dims[0] = (int64_t)iv.i.size();
+        const int64_t len = checked_product(out_dims, "array gather");
         std::vector<int> idata;
-        idata.reserve(iv.i.size());
+        idata.reserve((size_t)len);
         for (int x : iv.i) {
           if (x < 1 || x > sh.dims[0])
             fail("array gather out of bounds", e.raw);
-          idata.push_back(x - 1);
+          for (int64_t k = 0; k < width; ++k)
+            idata.push_back(
+                checked_immediate((x - 1) * width + k, "array gather offset"));
         }
-        SlotInfo si = array_view({(int64_t)idata.size()}, ViewKind::Flat);
-        return with_layout(
-            emit_value(OP_GATHER, {base}, (int64_t)idata.size(), si, idata),
-            owning_layout(si));
+        SlotInfo si = array_view(std::move(out_dims), sh.leaf);
+        return with_layout(emit_value(OP_GATHER, {base}, len, si, idata),
+                           owning_layout(si));
       }
       // Gather by a data int array: v[idx].
       if (e.args.size() == 2 && e.args[1].name == "IndexMulti") {
@@ -1312,7 +1390,10 @@ Lowering::Val Lowering::emit_value(uint16_t opcode,
     if (!has_runtime_shape(in) && g.slots[in.slot].len != 1)
       fail(std::string(opcode_name(opcode)) +
            ": a full-extent operand beside a runtime-length one");
-  const bool elementwise = out_len == op.dyn_capacity;
+  // A sum stays scalar even when its input capacity is one.
+  // Matching storage counts alone would give sum(vector[0:1]) a changing
+  // output shape and incorrectly reject its scalar assignment.
+  const bool elementwise = out_len == op.dyn_capacity && opcode != OP_SUM_VEC;
   if ((out_len != 1 && !elementwise) || out2 >= 0 || !idata.empty() ||
       is_matrix(out_si))
     fail(std::string(opcode_name(opcode)) +
@@ -1331,6 +1412,24 @@ Lowering::Val Lowering::emit_value(uint16_t opcode,
 std::optional<DataMap::Entry> Lowering::try_eval_interpreter(
     const mir::Expr& e) {
   if (expr_effectful(e)) return std::nullopt;
+  // Unknown variables are an ordinary answer to a speculative probe, not
+  // an interpreter error. Check only eagerly evaluated operands: a missing
+  // name in a dead logical/conditional arm must not prevent constant folding.
+  // Higher-order and compiler-internal calls own their argument evaluation.
+  const auto missing_input = [&](const auto& self, const mir::Expr& x) -> bool {
+    if (x.kind == mir::Expr::Var)
+      return !td.env().count(x.name) && !int_env.count(x.name);
+    if (x.kind == mir::Expr::EAnd || x.kind == mir::Expr::EOr ||
+        x.kind == mir::Expr::TernaryIf)
+      return !x.args.empty() && self(self, x.args[0]);
+    if (x.kind == mir::Expr::FunApp &&
+        (x.fn_lib == mir::Expr::Lib::Internal || mir::higher_order_call(x)))
+      return false;
+    for (const auto& arg : x.args)
+      if (self(self, arg)) return true;
+    return false;
+  };
+  if (missing_input(missing_input, e)) return std::nullopt;
   if (region_current) {
     // A pure user function can still contain a huge loop. Do not execute
     // it as a speculative control/shape probe inside a retained body.
@@ -1345,6 +1444,7 @@ std::optional<DataMap::Entry> Lowering::try_eval_interpreter(
     if (calls_user(e)) return std::nullopt;
   }
   try {
+    record_interpreter_event("lowering", "folding_probe");
     return td.eval(e);
   } catch (const CompileError&) {
     return std::nullopt;
@@ -1426,21 +1526,40 @@ Lowering::StaticProbe<Lowering::StaticView> Lowering::try_static_view(
     const mir::Expr& e) {
   if (e.kind == mir::Expr::Var) {
     auto value = scope.find(e.name);
-    if (value != scope.end())
+    if (value != scope.end()) {
+      // Allocated capacity is not the logical shape of a retained local.
+      // Returning it here would freeze size(a), including loop bounds, at
+      // the maximum extent even when this evaluation uses fewer elements.
+      if (has_runtime_shape(value->second)) return {};
       return {StaticProbeState::Known,
               {g.slots[value->second.slot].len, value->second.si},
               {}};
+    }
     auto declaration = decls.find(e.name);
-    if (declaration != decls.end())
+    if (declaration != decls.end()) {
+      if (std::any_of(declaration->second.runtime_dims.begin(),
+                      declaration->second.runtime_dims.end(),
+                      [](int slot) { return slot >= 0; }))
+        return {};
       return {StaticProbeState::Known,
               {declaration->second.len, declaration->second.si},
               {}};
+    }
     return {};
   }
   if (e.kind == mir::Expr::Promotion && e.args.size() == 1)
     return try_static_view(e.args[0]);
   if (e.kind == mir::Expr::FunApp) {
-    if (e.name == "transpose" && e.args.size() == 1) {
+    if (e.name == "FnMakeRowVec" && !e.args.empty() &&
+        std::all_of(e.args.begin(), e.args.end(), [](const mir::Expr& a) {
+          return is_scalar_type(a.type_);
+        })) {
+      SlotInfo si = view_of("URowVector");
+      si.param_free = e.data_only;
+      return {StaticProbeState::Known, {(int64_t)e.args.size(), si}, {}};
+    }
+    if ((e.name == "transpose" || e.name == "Transpose__") &&
+        e.args.size() == 1) {
       auto base = try_static_view(e.args[0]);
       if (base.state != StaticProbeState::Known) return base;
       std::swap(base.value.si.rows, base.value.si.cols);

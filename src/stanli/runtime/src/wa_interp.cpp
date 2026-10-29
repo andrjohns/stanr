@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <type_traits>
 #include <utility>
 
 namespace stanli {
@@ -27,17 +28,32 @@ const ScalarRng* scalar_rng_family(const std::string& name) {
 
 size_t scalar_rng_arity(ScalarRng family) {
   switch (family) {
+    case ScalarRng::StdNormal:
+      return 0;
+    case ScalarRng::ChiSquare:
     case ScalarRng::PoissonLog:
     case ScalarRng::Bernoulli:
     case ScalarRng::Exponential:
+    case ScalarRng::Poisson:
+    case ScalarRng::BernoulliLogit:
       return 1;
     case ScalarRng::Uniform:
     case ScalarRng::Normal:
     case ScalarRng::Lognormal:
     case ScalarRng::Binomial:
     case ScalarRng::Gumbel:
+    case ScalarRng::Gamma:
+    case ScalarRng::InvGamma:
+    case ScalarRng::Beta:
+    case ScalarRng::Cauchy:
+    case ScalarRng::DoubleExponential:
+    case ScalarRng::Logistic:
+    case ScalarRng::Weibull:
+    case ScalarRng::NegBinomial2:
+    case ScalarRng::NegBinomial2Log:
       return 2;
     case ScalarRng::BetaBinomial:
+    case ScalarRng::StudentT:
       return 3;
   }
   throw std::logic_error("unknown scalar RNG family");
@@ -45,7 +61,153 @@ size_t scalar_rng_arity(ScalarRng family) {
 
 bool scalar_rng_is_int(ScalarRng family) {
   return family == ScalarRng::PoissonLog || family == ScalarRng::Bernoulli ||
-         family == ScalarRng::Binomial || family == ScalarRng::BetaBinomial;
+         family == ScalarRng::Poisson || family == ScalarRng::BernoulliLogit ||
+         family == ScalarRng::Binomial || family == ScalarRng::BetaBinomial ||
+         family == ScalarRng::NegBinomial2 ||
+         family == ScalarRng::NegBinomial2Log;
+}
+
+namespace {
+// Only this boundary chooses C++ scalar/container overloads. All validation
+// and generation remain in Stan Math, including empty-input behavior and
+// validation before the first draw. Numeric graph storage stays unchanged.
+template <bool Integer = false, class F>
+void with_rng_argument(const RngArgument& arg, F&& f) {
+  if (arg.scalar) {
+    if constexpr (Integer)
+      f(static_cast<int>(arg.data[0]));
+    else
+      f(arg.data[0]);
+  } else if constexpr (Integer) {
+    std::vector<int> values(arg.size);
+    for (size_t i = 0; i < arg.size; ++i)
+      values[i] = static_cast<int>(arg.data[i]);
+    f(values);
+  } else {
+    f(Eigen::Map<const Eigen::VectorXd>(arg.data, arg.size));
+  }
+}
+
+template <class T>
+void copy_rng_result(const T& result, double* output, size_t size) {
+  if constexpr (std::is_arithmetic_v<T>) {
+    if (size != 1) throw std::logic_error("RNG output size mismatch");
+    output[0] = static_cast<double>(result);
+  } else {
+    if (result.size() != size)
+      throw std::logic_error("RNG output size mismatch");
+    std::copy(result.begin(), result.end(), output);
+  }
+}
+}  // namespace
+
+void container_rng_draw(ScalarRng family, const RngArgument* args, size_t nargs,
+                        double* output, size_t output_size, WaRng& rng) {
+  if (nargs != scalar_rng_arity(family) || nargs == 0 || args == nullptr ||
+      (output_size != 0 && output == nullptr))
+    throw std::logic_error("malformed container RNG arguments");
+  for (size_t k = 0; k < nargs; ++k)
+    if ((args[k].scalar && args[k].size != 1) ||
+        (args[k].size != 0 && args[k].data == nullptr))
+      throw std::logic_error("malformed container RNG argument");
+  const auto save = [&](const auto& result) {
+    copy_rng_result(result, output, output_size);
+  };
+  auto& g = rng.gen();
+  if (family == ScalarRng::Binomial || family == ScalarRng::BetaBinomial) {
+    with_rng_argument<true>(args[0], [&](const auto& a) {
+      with_rng_argument(args[1], [&](const auto& b) {
+        if (family == ScalarRng::Binomial) {
+          save(stan::math::binomial_rng(a, b, g));
+        } else {
+          with_rng_argument(args[2], [&](const auto& c) {
+            save(stan::math::beta_binomial_rng(a, b, c, g));
+          });
+        }
+      });
+    });
+  } else if (family == ScalarRng::StudentT) {
+    with_rng_argument(args[0], [&](const auto& a) {
+      with_rng_argument(args[1], [&](const auto& b) {
+        with_rng_argument(args[2], [&](const auto& c) {
+          save(stan::math::student_t_rng(a, b, c, g));
+        });
+      });
+    });
+  } else if (nargs == 1) {
+    with_rng_argument(args[0], [&](const auto& a) {
+      switch (family) {
+        case ScalarRng::ChiSquare:
+          save(stan::math::chi_square_rng(a, g));
+          break;
+        case ScalarRng::PoissonLog:
+          save(stan::math::poisson_log_rng(a, g));
+          break;
+        case ScalarRng::Bernoulli:
+          save(stan::math::bernoulli_rng(a, g));
+          break;
+        case ScalarRng::Exponential:
+          save(stan::math::exponential_rng(a, g));
+          break;
+        case ScalarRng::Poisson:
+          save(stan::math::poisson_rng(a, g));
+          break;
+        case ScalarRng::BernoulliLogit:
+          save(stan::math::bernoulli_logit_rng(a, g));
+          break;
+        default:
+          throw std::logic_error("unknown unary RNG family");
+      }
+    });
+  } else {
+    with_rng_argument(args[0], [&](const auto& a) {
+      with_rng_argument(args[1], [&](const auto& b) {
+        switch (family) {
+          case ScalarRng::Uniform:
+            save(stan::math::uniform_rng(a, b, g));
+            break;
+          case ScalarRng::Normal:
+            save(stan::math::normal_rng(a, b, g));
+            break;
+          case ScalarRng::Lognormal:
+            save(stan::math::lognormal_rng(a, b, g));
+            break;
+          case ScalarRng::Gumbel:
+            save(stan::math::gumbel_rng(a, b, g));
+            break;
+          case ScalarRng::Gamma:
+            save(stan::math::gamma_rng(a, b, g));
+            break;
+          case ScalarRng::InvGamma:
+            save(stan::math::inv_gamma_rng(a, b, g));
+            break;
+          case ScalarRng::Beta:
+            save(stan::math::beta_rng(a, b, g));
+            break;
+          case ScalarRng::Cauchy:
+            save(stan::math::cauchy_rng(a, b, g));
+            break;
+          case ScalarRng::DoubleExponential:
+            save(stan::math::double_exponential_rng(a, b, g));
+            break;
+          case ScalarRng::Logistic:
+            save(stan::math::logistic_rng(a, b, g));
+            break;
+          case ScalarRng::Weibull:
+            save(stan::math::weibull_rng(a, b, g));
+            break;
+          case ScalarRng::NegBinomial2:
+            save(stan::math::neg_binomial_2_rng(a, b, g));
+            break;
+          case ScalarRng::NegBinomial2Log:
+            save(stan::math::neg_binomial_2_log_rng(a, b, g));
+            break;
+          default:
+            throw std::logic_error("unknown binary RNG family");
+        }
+      });
+    });
+  }
 }
 
 double scalar_rng_draw(ScalarRng family, const double* args, size_t nargs,
@@ -54,6 +216,28 @@ double scalar_rng_draw(ScalarRng family, const double* args, size_t nargs,
     throw std::logic_error("malformed scalar RNG arguments");
   stan::rng_t& g = rng.gen();
   switch (family) {
+    case ScalarRng::StdNormal:
+      return stan::math::std_normal_rng(g);
+    case ScalarRng::Gamma:
+      return stan::math::gamma_rng(args[0], args[1], g);
+    case ScalarRng::InvGamma:
+      return stan::math::inv_gamma_rng(args[0], args[1], g);
+    case ScalarRng::Beta:
+      return stan::math::beta_rng(args[0], args[1], g);
+    case ScalarRng::ChiSquare:
+      return stan::math::chi_square_rng(args[0], g);
+    case ScalarRng::Cauchy:
+      return stan::math::cauchy_rng(args[0], args[1], g);
+    case ScalarRng::DoubleExponential:
+      return stan::math::double_exponential_rng(args[0], args[1], g);
+    case ScalarRng::Logistic:
+      return stan::math::logistic_rng(args[0], args[1], g);
+    case ScalarRng::Weibull:
+      return stan::math::weibull_rng(args[0], args[1], g);
+    case ScalarRng::NegBinomial2:
+      return stan::math::neg_binomial_2_rng(args[0], args[1], g);
+    case ScalarRng::NegBinomial2Log:
+      return stan::math::neg_binomial_2_log_rng(args[0], args[1], g);
     case ScalarRng::PoissonLog:
       return static_cast<double>(stan::math::poisson_log_rng(args[0], g));
     case ScalarRng::Uniform:
@@ -74,23 +258,44 @@ double scalar_rng_draw(ScalarRng family, const double* args, size_t nargs,
           static_cast<int>(args[0]), args[1], args[2], g));
     case ScalarRng::Exponential:
       return stan::math::exponential_rng(args[0], g);
+    case ScalarRng::Poisson:
+      return static_cast<double>(stan::math::poisson_rng(args[0], g));
+    case ScalarRng::StudentT:
+      return stan::math::student_t_rng(args[0], args[1], args[2], g);
+    case ScalarRng::BernoulliLogit:
+      return static_cast<double>(stan::math::bernoulli_logit_rng(args[0], g));
   }
   throw std::logic_error("unknown scalar RNG family");
 }
 
-int categorical_rng_draw(const double* probabilities, size_t size, WaRng& rng) {
+int vector_integer_rng_draw(const double* probabilities, size_t size,
+                            WaRng& rng, uint8_t variant) {
   if (size != 0 && probabilities == nullptr)
     throw std::logic_error("malformed categorical RNG arguments");
   Eigen::VectorXd theta(static_cast<Eigen::Index>(size));
   for (size_t i = 0; i < size; ++i)
     theta[static_cast<Eigen::Index>(i)] = probabilities[i];
-  return stan::math::categorical_rng(theta, rng.gen());
+  switch (variant) {
+    case kCategoricalRngVariant:
+      return stan::math::categorical_rng(theta, rng.gen());
+    case kCategoricalLogitRngVariant:
+      // Upstream indexes its cumulative sum even for an empty input. Reject
+      // that invalid distribution before it consumes the stream or reads OOB.
+      stan::math::check_nonzero_size("categorical_logit_rng",
+                                     "Log odds parameter", theta);
+      return stan::math::categorical_logit_rng(theta, rng.gen());
+    case kPoissonBinomialRngVariant:
+      return stan::math::poisson_binomial_rng(theta, rng.gen());
+    default:
+      throw std::logic_error("unknown vector-to-integer RNG family");
+  }
 }
 
 void multi_normal_rng_draw(const double* location, size_t location_size,
                            const double* covariance, size_t covariance_size,
                            size_t covariance_rows, size_t covariance_cols,
-                           double* output, size_t output_size, WaRng& rng) {
+                           double* output, size_t output_size, WaRng& rng,
+                           bool cholesky) {
   if ((location_size != 0 && location == nullptr) ||
       (covariance_size != 0 && covariance == nullptr) ||
       (output_size != 0 && output == nullptr) || output_size != location_size ||
@@ -111,7 +316,8 @@ void multi_normal_rng_draw(const double* location, size_t location_size,
           covariance[j * covariance_rows + i];
 
   const Eigen::VectorXd draw =
-      stan::math::multi_normal_rng(mu, sigma, rng.gen());
+      cholesky ? stan::math::multi_normal_cholesky_rng(mu, sigma, rng.gen())
+               : stan::math::multi_normal_rng(mu, sigma, rng.gen());
   for (size_t i = 0; i < output_size; ++i)
     output[i] = draw[static_cast<Eigen::Index>(i)];
 }
@@ -141,6 +347,24 @@ double wa_probe_point(int64_t i, int variant) {
   }
 }
 
+int64_t probe_wa_columns(WaInterp& interp, const CompiledModel& cm,
+                         Executor& ex, std::string& failure) {
+  for (int variant = 0; variant < 3; ++variant) {
+    for (int64_t i = 0; i < ex.n_params(); ++i)
+      ex.params_data()[i] = wa_probe_point(i, variant);
+    try {
+      ex.run_forward_only();
+      WaRng probe(1);
+      const auto row = interp.eval(cm.constrained_env(ex), probe);
+      failure.clear();
+      return (int64_t)row.size();
+    } catch (const std::exception& e) {
+      failure = e.what();
+    }
+  }
+  return -1;
+}
+
 WaInterp::WaInterp(std::shared_ptr<const mir::Program> prog,
                    std::map<std::string, DataMap::Entry> base_env)
     : prog_(std::move(prog)), base_env_(std::move(base_env)) {
@@ -149,6 +373,14 @@ WaInterp::WaInterp(std::shared_ptr<const mir::Program> prog,
 
 std::vector<double> WaInterp::eval(
     const std::map<std::string, DataMap::Entry>& params, WaRng& rng) {
+  if (!have_cols_) {
+    // A failed discovery may have emitted a prefix. Start the next attempt
+    // afresh; otherwise retries duplicate columns before their first success.
+    cols_.clear();
+    n_tp_start_ = n_gq_start_ = 0;
+    saw_tp_ = saw_gq_ = false;
+    last_written_.clear();
+  }
   std::vector<double> row;
   MirInterp<double>* cur = nullptr;
   MirHooks h;
@@ -171,10 +403,11 @@ std::vector<double> WaInterp::eval(
     }
     return false;
   };
-  h.fun = [this, &cur, &rng](const mir::Expr& e, DataMap::Entry* out) {
-    return rng_fun(*cur, e, out, rng) ||
+  h.fun = [this, &rng](MirInterp<double>& in, const mir::Expr& e,
+                       DataMap::Entry* out) {
+    return interpreted_rng_call(in, e, out, rng) ||
            evaluate_retained_higher_order(
-               funs_, e, [&](const mir::Expr& arg) { return cur->eval(arg); },
+               funs_, e, [&in](const mir::Expr& arg) { return in.eval(arg); },
                out);
   };
   MirInterp<double> in(funs_, "write_array", std::move(h));
@@ -188,8 +421,8 @@ std::vector<double> WaInterp::eval(
     // ordered backwards.
     if (!saw_gq_) n_gq_start_ = cols_.size();
     if (!saw_tp_) n_tp_start_ = n_gq_start_;
+    have_cols_ = true;
   }
-  have_cols_ = true;
   return row;
 }
 
@@ -198,7 +431,7 @@ bool WaInterp::read_param(MirInterp<double>& in, const mir::Stmt& s,
   auto it = params.find(s.decl_id);
   if (it == params.end())
     throw CompileError(
-        "stanli write_array: no constrained value supplied "
+        "no constrained value supplied "
         "for parameter " +
         s.decl_id);
   DataMap::Entry e = it->second;
@@ -210,8 +443,7 @@ bool WaInterp::read_param(MirInterp<double>& in, const mir::Stmt& s,
       len *= dims.back();
     }
     if (len != (int64_t)std::max(e.r.size(), e.i.size()))
-      throw CompileError("stanli write_array: constrained shape mismatch for " +
-                         s.decl_id);
+      throw CompileError("constrained shape mismatch for " + s.decl_id);
     e.dims = std::move(dims);
   }
   in.env()[s.decl_id] = std::move(e);
@@ -233,7 +465,8 @@ bool WaInterp::write_param(MirInterp<double>& in, const mir::Stmt& s,
       for (size_t k = base->args.size(); k-- > 1;) {
         if (base->args[k].name != "IndexSingle")
           throw CompileError(
-              "stanli write_array: FnWriteParam under a non-scalar index");
+              "cannot name an output parameter written through a non-scalar "
+              "index");
         ixs.push_back(in.as_int(base->args[k].args[0]));
       }
       base = &base->args[0];
@@ -253,7 +486,7 @@ bool WaInterp::write_param(MirInterp<double>& in, const mir::Stmt& s,
       }
       if (idx >= ov.size())
         throw CompileError(
-            "stanli write_array: cannot name a substituted FnWriteParam");
+            "cannot name an output parameter after optimization");
       name = ov[idx];
     }
     last_written_ = name;
@@ -277,8 +510,8 @@ bool WaInterp::write_param(MirInterp<double>& in, const mir::Stmt& s,
   return true;
 }
 
-bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
-                       DataMap::Entry* out, WaRng& rng) {
+bool interpreted_rng_call(MirInterp<double>& in, const mir::Expr& e,
+                          DataMap::Entry* out, WaRng& rng) {
   stan::rng_t& g = rng.gen();
   const std::string& f = e.name;
   if (f.size() < 5 || f.compare(f.size() - 4, 4, "_rng") != 0) return false;
@@ -286,13 +519,9 @@ bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
 
   std::vector<DataMap::Entry> av;
   for (const auto& a : e.args) av.push_back(in.eval(a));
-  const auto sc = [&](size_t k, size_t i) -> double {
-    const auto& r = av[k].r;
-    return r.size() == 1 ? r[0] : r.at(i);
-  };
 
   // Vector-valued draw from a mean vector and covariance (or Cholesky
-  // factor) matrix. The covariance form shares its owning-Eigen helper with
+  // factor) matrix. Admitted shapes share their owning-Eigen helper with
   // OP_RNG so validation and engine schedules cannot drift between modes.
   if (base == "multi_normal" || base == "multi_normal_cholesky") {
     const auto& mu = av.at(0);
@@ -300,14 +529,17 @@ bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
     const int64_t K = (int64_t)mu.r.size();
     out->dims = {K};
     out->r.resize(static_cast<size_t>(K));
-    if (base == "multi_normal") {
+    if (base == "multi_normal" ||
+        (S.dims.size() == 2 && S.dims[0] == K && S.dims[1] == K)) {
       if (S.dims.size() != 2)
         throw std::logic_error("malformed multi-normal covariance shape");
-      multi_normal_rng_draw(mu.r.data(), mu.r.size(), S.r.data(), S.r.size(),
-                            static_cast<size_t>(S.dims[0]),
-                            static_cast<size_t>(S.dims[1]), out->r.data(),
-                            out->r.size(), rng);
+      multi_normal_rng_draw(
+          mu.r.data(), mu.r.size(), S.r.data(), S.r.size(),
+          static_cast<size_t>(S.dims[0]), static_cast<size_t>(S.dims[1]),
+          out->r.data(), out->r.size(), rng, base == "multi_normal_cholesky");
     } else {
+      // Preserve the legacy adapter outside the square-vector contract.
+      // Rectangular and vectorized shapes need a separate shape migration.
       Eigen::VectorXd m(K);
       for (int64_t i = 0; i < K; ++i) m[i] = mu.r[(size_t)i];
       Eigen::MatrixXd sig(K, K);
@@ -331,111 +563,54 @@ bool WaInterp::rng_fun(MirInterp<double>& in, const mir::Expr& e,
     return true;
   }
 
-  // Whole-vector argument, one categorical draw.
-  if (base == "categorical" || base == "categorical_logit") {
-    int k = 0;
-    if (base == "categorical") {
-      k = categorical_rng_draw(av.at(0).r.data(), av.at(0).r.size(), rng);
-    } else {
-      Eigen::VectorXd th((int64_t)av.at(0).r.size());
-      for (size_t i = 0; i < av[0].r.size(); ++i) th[(int64_t)i] = av[0].r[i];
-      k = stan::math::categorical_logit_rng(th, g);
-    }
+  // Whole-vector arguments with one integer draw. Use the same owning
+  // Eigen instantiation and validation in every execution path.
+  if (base == "poisson_binomial" || base == "categorical" ||
+      base == "categorical_logit") {
+    const uint8_t variant =
+        base == "poisson_binomial"    ? kPoissonBinomialRngVariant
+        : base == "categorical_logit" ? kCategoricalLogitRngVariant
+                                      : kCategoricalRngVariant;
+    const int k = vector_integer_rng_draw(av.at(0).r.data(), av.at(0).r.size(),
+                                          rng, variant);
     out->is_int = true;
     out->i = {k};
-    out->r = {(double)k};
+    out->r = {static_cast<double>(k)};
     return true;
   }
 
-  // Elementwise with scalar broadcasting: one independent draw per element,
-  // matching stan-math's vectorized rng semantics.
+  const ScalarRng* family = scalar_rng_family(f);
+  if (!family) return false;
+  const size_t arity = scalar_rng_arity(*family);
+  if (av.size() != arity)
+    throw std::logic_error("malformed scalar RNG arguments");
+
+  RngArgument args[3]{};
+  bool container = false;
   size_t n = 1;
-  for (const auto& a : av) n = std::max(n, a.r.size());
-  bool is_int = true;
-  for (size_t i = 0; i < n; ++i) {
-    double v = 0.0;
-    int vi = 0;
-    bool iv = false;
-    if (base == "normal") {
-      const double args[] = {sc(0, i), sc(1, i)};
-      v = scalar_rng_draw(ScalarRng::Normal, args, 2, rng);
-    } else if (base == "std_normal") {
-      v = stan::math::std_normal_rng(g);
-    } else if (base == "lognormal") {
-      const double args[] = {sc(0, i), sc(1, i)};
-      v = scalar_rng_draw(ScalarRng::Lognormal, args, 2, rng);
-    } else if (base == "uniform") {
-      const double args[] = {sc(0, i), sc(1, i)};
-      v = scalar_rng_draw(ScalarRng::Uniform, args, 2, rng);
-    } else if (base == "gamma") {
-      v = stan::math::gamma_rng(sc(0, i), sc(1, i), g);
-    } else if (base == "inv_gamma") {
-      v = stan::math::inv_gamma_rng(sc(0, i), sc(1, i), g);
-    } else if (base == "beta") {
-      v = stan::math::beta_rng(sc(0, i), sc(1, i), g);
-    } else if (base == "exponential") {
-      const double args[] = {sc(0, i)};
-      v = scalar_rng_draw(ScalarRng::Exponential, args, 1, rng);
-    } else if (base == "chi_square") {
-      v = stan::math::chi_square_rng(sc(0, i), g);
-    } else if (base == "cauchy") {
-      v = stan::math::cauchy_rng(sc(0, i), sc(1, i), g);
-    } else if (base == "double_exponential") {
-      v = stan::math::double_exponential_rng(sc(0, i), sc(1, i), g);
-    } else if (base == "logistic") {
-      v = stan::math::logistic_rng(sc(0, i), sc(1, i), g);
-    } else if (base == "student_t") {
-      v = stan::math::student_t_rng(sc(0, i), sc(1, i), sc(2, i), g);
-    } else if (base == "weibull") {
-      v = stan::math::weibull_rng(sc(0, i), sc(1, i), g);
-    } else if (base == "gumbel") {
-      const double args[] = {sc(0, i), sc(1, i)};
-      v = scalar_rng_draw(ScalarRng::Gumbel, args, 2, rng);
-    } else if (base == "beta_binomial") {
-      const double args[] = {sc(0, i), sc(1, i), sc(2, i)};
-      vi = static_cast<int>(
-          scalar_rng_draw(ScalarRng::BetaBinomial, args, 3, rng));
-      iv = true;
-    } else if (base == "bernoulli") {
-      const double args[] = {sc(0, i)};
-      vi =
-          static_cast<int>(scalar_rng_draw(ScalarRng::Bernoulli, args, 1, rng));
-      iv = true;
-    } else if (base == "bernoulli_logit") {
-      vi = stan::math::bernoulli_logit_rng(sc(0, i), g);
-      iv = true;
-    } else if (base == "binomial") {
-      const double args[] = {sc(0, i), sc(1, i)};
-      vi = static_cast<int>(scalar_rng_draw(ScalarRng::Binomial, args, 2, rng));
-      iv = true;
-    } else if (base == "poisson") {
-      vi = stan::math::poisson_rng(sc(0, i), g);
-      iv = true;
-    } else if (base == "poisson_log") {
-      const double args[] = {sc(0, i)};
-      vi = static_cast<int>(
-          scalar_rng_draw(ScalarRng::PoissonLog, args, 1, rng));
-      iv = true;
-    } else if (base == "neg_binomial_2") {
-      vi = stan::math::neg_binomial_2_rng(sc(0, i), sc(1, i), g);
-      iv = true;
-    } else if (base == "neg_binomial_2_log") {
-      vi = stan::math::neg_binomial_2_log_rng(sc(0, i), sc(1, i), g);
-      iv = true;
-    } else {
-      return false;
-    }
-    if (iv) {
-      out->i.push_back(vi);
-      out->r.push_back((double)vi);
-    } else {
-      is_int = false;
-      out->r.push_back(v);
-    }
+  for (size_t k = 0; k < arity; ++k) {
+    const auto& type = e.args[k].unsized;
+    const bool scalar =
+        type.depth == 0 && (type.leaf == mir::UnsizedLeaf::Real ||
+                            type.leaf == mir::UnsizedLeaf::Int);
+    args[k] = {av[k].r.data(), av[k].r.size(), scalar};
+    if (!scalar && !container) n = av[k].r.size();
+    container = container || !scalar;
   }
-  out->is_int = is_int;
-  if (!is_int) out->i.clear();
-  if (n > 1) out->dims = {(int64_t)n};
+  out->r.resize(n);
+  out->is_int = scalar_rng_is_int(*family);
+  if (container) {
+    container_rng_draw(*family, args, arity, out->r.data(), n, rng);
+    out->dims = {static_cast<int64_t>(n)};
+  } else {
+    double values[3]{};
+    for (size_t k = 0; k < arity; ++k) values[k] = av[k].r.at(0);
+    out->r[0] = scalar_rng_draw(*family, values, arity, rng);
+  }
+  if (out->is_int) {
+    out->i.resize(n);
+    for (size_t k = 0; k < n; ++k) out->i[k] = static_cast<int>(out->r[k]);
+  }
   return true;
 }
 

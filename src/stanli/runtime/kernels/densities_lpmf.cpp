@@ -77,7 +77,7 @@ inline double bernoulli_logit_partial(int y, double theta) {
   const double sign = 2.0 * y - 1.0;
   const double z = sign * theta;
   const double exp_m_z = std::exp(-z);
-  if (z > 20.0) return -exp_m_z;
+  if (z > 20.0) return sign * exp_m_z;
   if (z >= -20.0) return sign * exp_m_z / (exp_m_z + 1.0);
   return sign;
 }
@@ -130,7 +130,7 @@ void bernoulli_logit_vector_fwd(KernelCtx& ctx) {
   }
   ntheta =
       (ntheta > cutoff)
-          .select(-exp_m_ntheta,
+          .select(signs * exp_m_ntheta,
                   (ntheta >= -cutoff)
                       .select(stan::math::promote_scalar<double>(
                                   signs * exp_m_ntheta / (exp_m_ntheta + 1)),
@@ -175,7 +175,7 @@ void bernoulli_logit_elt_vector_fwd(KernelCtx& ctx) {
   if (!bernoulli_arg_active(ctx)) return;
   Eigen::Map<Eigen::ArrayXd>(ctx.scratch, n) =
       (ntheta > cutoff)
-          .select(-exp_m_ntheta,
+          .select(signs * exp_m_ntheta,
                   (ntheta >= -cutoff)
                       .select(stan::math::promote_scalar<double>(
                                   signs * exp_m_ntheta / (exp_m_ntheta + 1)),
@@ -415,6 +415,23 @@ STANLI_BINOMIAL_FWD(binomial_logit_fwd, binomial_logit_lpmf, true)
 // arguments that behave like any other density's. with_int_group unpacks
 // the [len, vals...] pairs the lowering wrote, exactly as binomial does.
 void beta_binomial_fwd(KernelCtx& ctx) {
+  if (ctx.variant & 0x40u) {
+    // One value per element, as the binomials above: partition and the
+    // observation collapse both ask for it.
+    const int* g1 = ctx.idata;
+    const int* g2 = int_group_next(g1);
+    density_fwd_elt<2, density_tier(2)>(
+        ctx,
+        [&](int64_t n, const auto&... a) {
+          return stan::math::beta_binomial_lpmf<true>(
+              int_group_elem(g1, n), int_group_elem(g2, n), a...);
+        },
+        [&](int64_t n, const auto&... a) {
+          return stan::math::beta_binomial_lpmf<false>(
+              int_group_elem(g1, n), int_group_elem(g2, n), a...);
+        });
+    return;
+  }
   with_int_group(ctx.idata, [&](const auto& n, const int* rest) {
     with_int_group(rest, [&](const auto& N, const int*) {
       density_fwd_sum<2, density_tier(2), 0>(

@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <cstdint>
 
 namespace stan {
 namespace services {
@@ -730,10 +731,10 @@ inline auto pathfinder_lbfgs_single(
 
     if (unlikely(save_iterations)) {
       diagnostic_writer.begin_record(std::to_string(lbfgs.iter_num()));
-      diagnostic_writer.write("iter", lbfgs.iter_num());
+      diagnostic_writer.write("iter", static_cast<std::uint64_t>(lbfgs.iter_num()));
       diagnostic_writer.write("unconstrained_parameters", prev_params);
       diagnostic_writer.write("grads", prev_grads);
-      diagnostic_writer.write("history_size", history_size);
+      diagnostic_writer.write("history_size", static_cast<std::uint64_t>(history_size));
     }
     // if retcode is -1, line search failed w/o updating vals/grads, so exit
     // loop
@@ -818,8 +819,8 @@ inline auto pathfinder_lbfgs_single(
       if (unlikely(save_iterations)) {
         diagnostic_writer.write("lbfgs_success", true);
         diagnostic_writer.write("pathfinder_success", false);
-        diagnostic_writer.write("history_size", history_size);
-        diagnostic_writer.write("history_size", history_size);
+        diagnostic_writer.write("history_size", static_cast<std::uint64_t>(history_size));
+        diagnostic_writer.write("history_size", static_cast<std::uint64_t>(history_size));
         diagnostic_writer.write("lbfgs_note", lbfgs_ss.str());
         diagnostic_writer.write("pathfinder_error", std::string(e.what()));
         diagnostic_writer.end_record();

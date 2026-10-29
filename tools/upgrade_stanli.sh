@@ -3,7 +3,7 @@
 # convention for bundled libraries
 set -e
 
-STANLI_REF="ff2165d"
+STANLI_REF="0a10d67279538e12133a2fb895efd96780223532"
 STANLI_TARBALL="stanli-$STANLI_REF.tar.gz"
 STANLI_URL="https://github.com/seantalts/stanli/archive/$STANLI_REF.tar.gz"
 
@@ -41,19 +41,25 @@ rm -f "$SRC/runtime/src/capi.cpp" \
       "$SRC/runtime/src/diagnose.cpp" \
       "$SRC/runtime/src/walnuts.cpp" \
       "$SRC/runtime/src/pathfinder.cpp" \
+      "$SRC/runtime/src/algorithms.cpp" \
+      "$SRC/runtime/src/pathfinder_service.cpp" \
+      "$SRC/runtime/src/isa_dispatch.cpp" \
       "$SRC/runtime/src/data.cpp" \
       "$SRC/runtime/src/README.md" \
       "$SRC/runtime/src/OPTIMIZATIONS.md"
 # Private helper for nuts.cpp/estimate.cpp/pathfinder.cpp only -- dead once
 # all three algorithm frontends above are stripped.
 rm -f "$SRC/runtime/src/initialize.hpp"
+# Private helper for algorithms.cpp/pathfinder_service.cpp only.
+rm -f "$SRC/runtime/src/service_model.hpp"
 rm -f "$SRC/runtime/include/stanli/capi.h" \
       "$SRC/runtime/include/stanli/bridgestan_internal.hpp" \
       "$SRC/runtime/include/stanli/nuts.hpp" \
       "$SRC/runtime/include/stanli/estimate.hpp" \
       "$SRC/runtime/include/stanli/diagnose.hpp" \
       "$SRC/runtime/include/stanli/walnuts.hpp" \
-      "$SRC/runtime/include/stanli/model_adapter.hpp"
+      "$SRC/runtime/include/stanli/model_adapter.hpp" \
+      "$SRC/runtime/include/stanli/algorithms.hpp"
 
 python3 - "$SRC/runtime/include/stanli/optable.hpp" "$SRC/runtime/kernels" << 'EOF'
 import glob

@@ -123,7 +123,8 @@ struct CompiledModel {
   // first-index-fast layout. Hosts must use this boundary instead of handing
   // arena storage directly to WaInterp: arrays use different physical order
   // on the two sides.
-  std::map<std::string, DataMap::Entry> constrained_env(Executor& ex) const {
+  std::map<std::string, DataMap::Entry> constrained_env(
+      const Executor& ex) const {
     std::map<std::string, DataMap::Entry> env;
     for (const auto& view : views) {
       DataMap::Entry value;
@@ -157,8 +158,7 @@ struct CompiledModel {
 
   void bind(Executor& ex) const {
     for (const auto& f : fills) {
-      double* p = ex.value_ptr(f.first);
-      for (size_t j = 0; j < f.second.size(); ++j) p[j] = f.second[j];
+      ex.set_values(f.first, f.second.data(), f.second.size());
     }
   }
 
@@ -189,11 +189,13 @@ struct CompiledModel {
     // Drivers prefer it over the truncated graph (see wa_interp.hpp);
     // the graph remains the fast path whenever lowering completes.
     std::shared_ptr<WaInterp> interp;
+    // Lowered on a second thread, beside the log_prob lowering. For tests;
+    // nothing branches on it.
+    bool lowered_in_parallel = false;
 
     void bind(Executor& ex) const {
       for (const auto& f : fills) {
-        double* p = ex.value_ptr(f.first);
-        for (size_t j = 0; j < f.second.size(); ++j) p[j] = f.second[j];
+        ex.set_values(f.first, f.second.data(), f.second.size());
       }
     }
   };
@@ -212,16 +214,55 @@ struct CompiledModel {
   // Each part of the model that has no compiled path and would run through
   // the MIR interpreter, with the lowering's reason.
   std::vector<std::string> interpreter_fallbacks;
+  // Reasons opt-in within-chain reduction sites kept ordinary lowering.
+  std::vector<std::string> reduce_sum_fallbacks;
+  // Set when a serial compile has a reduce_sum that threads_per_chain > 1
+  // might split.
+  std::string reduce_sum_notice;
+  // Transformed data drew from the construction seed, so this model is a
+  // function of that seed as well as of its data. A host that runs with one
+  // seed the way CmdStan does rebuilds under the run seed when this is set,
+  // and leaves every other model alone.
+  bool transformed_data_draws = false;
 };
 
-CompiledModel compile_model(const std::string& mir_text, const DataMap& data);
+// `seed` is the model-construction seed: transformed data's RNG calls draw
+// from create_rng(seed, 0), exactly as CmdStan's generated constructor does.
+// The section runs once here and its values are baked into both graphs, so
+// a different seed means a different compiled model. Generated-quantities
+// draws are unrelated; those streams are the caller's (see wa_interp.hpp).
+// The default matches the reference drivers and BridgeStan's convention.
+// Native opt-in. Retained fixed-shape reductions reuse caller-owned teams;
+// unsupported/small calls keep whole-slice lowering. See reduce_sum.hpp.
+struct CompileOptions {
+  int reduce_sum_threads = 1;
+  int64_t reduce_sum_min_chunk_ns = 30000;
+  int reduce_sum_max_chunks = 1024;
+  bool fast_math = false;
+};
+CompiledModel compile_model(const std::string& mir_text, const DataMap& data,
+                            unsigned seed = 1);
+CompiledModel compile_model(const std::string& mir_text, const DataMap& data,
+                            unsigned seed, const CompileOptions& options);
 
 // The warning a host shows once per model with interpreter_fallbacks, and
-// the compile error STANLI_NO_INTERPRETER turns it into. `probe_failure` is
-// what the interpreter threw when a host probed it.
+// the compile error STANLI_NO_INTERPRETER turns it into.
 std::string interpreter_error(const CompiledModel& cm);
-std::string interpreter_warning(const CompiledModel& cm,
-                                const std::string& probe_failure = "");
+std::string interpreter_warning(const CompiledModel& cm);
+// The error a host raises when the interpreter threw `failure` at every
+// probe point, leaving no columns to report.
+std::string interpreter_probe_error(const CompiledModel& cm,
+                                    const std::string& failure);
+
+// The unconstrained point for constrained `inits` keyed by parameter name,
+// written to `out` (n_unconstrained values). Throws std::runtime_error saying
+// why when the model has no usable inverse transforms. The JSON form takes a
+// null `json` as an empty document.
+void unconstrain_inits(const CompiledModel& cm,
+                       const std::map<std::string, DataMap::Entry>& inits,
+                       double* out);
+void unconstrain_inits_json(const CompiledModel& cm, const char* json,
+                            double* out);
 
 }  // namespace stanli
 

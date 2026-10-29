@@ -1,6 +1,7 @@
 // Common-subexpression elimination over the op graph. Unrolled models emit
-// the same computation many times (685 bit-identical BERNOULLI_LPMF ops in
-// Mh_model); the second and later copies become references to the first.
+// the same computation many times. Inactive duplicates become references to
+// the first. Active duplicates share only the forward value and scratch;
+// each keeps its own adjoint and its original place in the reverse sweep.
 #ifndef STANLI_CSE_HPP
 #define STANLI_CSE_HPP
 
@@ -13,21 +14,24 @@ namespace stanli {
 
 struct CseStats {
   int ops_removed = 0;
+  int primals_shared = 0;
 };
 
-// In place. `target_terms` entries naming a removed op's output are rewritten
-// to the surviving output; duplicates in that list are fine, since the term
-// reduction sums the same slot twice for the two terms it stands for.
+// In place. Only inactive target terms are renamed. Active terms retain
+// their source identity so combining their seeds cannot reassociate a VJP.
 //
 // `extra_roots` must list every slot something outside the op graph reads
 // (jacobian terms, constrained-parameter views), as reroll's must: those are
 // never renamed away. `fills` is read to keep bind-time-filled slots alive,
 // since their buffers are sized from the slot length.
 // STANLI_NO_CSE=1 disables the pass.
+//
+// `merge_active` (fast mode) also merges duplicates whose inputs depend on
+// parameters, summing their seeds before one pullback.
 CseStats cse(Graph& g,
              const std::vector<std::pair<int, std::vector<double>>>& fills,
              std::vector<int>& target_terms,
-             const std::vector<int>& extra_roots);
+             const std::vector<int>& extra_roots, bool merge_active = false);
 
 }  // namespace stanli
 

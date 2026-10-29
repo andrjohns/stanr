@@ -65,6 +65,10 @@ void print_instr(std::string& out, const Program& p, size_t i,
     case Program::CONST:
       appendf(out, " r%d <- pool[%d] (=%g)", I.dst, I.a, p.pool[(size_t)I.a]);
       break;
+    case Program::FILL:
+      appendf(out, " r%d..r%d <- repeat(pool[%d]=%g)", I.dst, I.dst + I.len - 1,
+              I.a, p.pool[(size_t)I.a]);
+      break;
     case Program::CONSTR:
       appendf(out, " r%d..r%d <- pool[%d..] (=", I.dst, I.dst + I.len - 1, I.a);
       for (int k = 0; k < I.len; ++k)
@@ -105,7 +109,7 @@ void print_instr(std::string& out, const Program& p, size_t i,
       const bool ternary = I.code == Program::LOG_MIX || I.code == Program::FMA;
       if ((I.code >= Program::ADD && I.code <= Program::FMIN) ||
           (I.code >= Program::GT && I.code <= Program::NE) ||
-          I.code == Program::LSE2 || ternary)
+          I.code == Program::LSE2 || I.code == Program::LMULTIPLY || ternary)
         appendf(out, ", r%d", I.b);
       if (ternary) appendf(out, ", r%d", I.c);
       if (I.len) appendf(out, " (len %d)", I.len);
@@ -118,9 +122,9 @@ void print_island_body(std::string& out, const Graph& g, size_t u, int n) {
   const auto& p = *static_cast<const IslandProg*>(op.udata);
   appendf(out,
           "\n== island %d (graph op %zu): %zu instrs, %d regs, "
-          "%zu calls, adjoint %zu instrs, native_adj=%d, softmax3=%d\n",
+          "%zu calls, adjoint %zu instrs, native_adj=%d\n",
           n, u, p.code.size(), p.n_regs, p.calls.size(), p.adj.code.size(),
-          (int)p.native_adj, (int)(op.variant == kIslandSoftmax3Variant));
+          (int)p.native_adj);
   appendf(out, "  live-ins:");
   for (size_t k = 0; k < p.ins.size(); ++k)
     appendf(out, " slot%d->r%d[len %d]", op.in[k], p.ins[k].reg, p.ins[k].len);
@@ -132,6 +136,11 @@ void print_island_body(std::string& out, const Graph& g, size_t u, int n) {
   appendf(out,
           "\n  ADJOINT (reverse order; dst/a/b/c are adjoint cells, "
           "va/vb/vc/vd are value registers):\n");
+  for (size_t s = 0; s < p.adj.segments.size(); ++s) {
+    const auto& segment = p.adj.segments[s];
+    appendf(out, "  when path %zu: adjoint [%d, %d)\n", s, segment.begin,
+            segment.end);
+  }
   for (size_t i = 0; i < p.adj.code.size(); ++i) {
     const AdjInstr& A = p.adj.code[i];
     appendf(out,
@@ -184,6 +193,7 @@ void print_graph(std::string& out, const Graph& g, const GraphPrintInfo& info) {
       append_slot_ref(out, g, op.in[k]);
     }
     if (op.out2 != -1) appendf(out, " out2=s%d", op.out2);
+    if (op.primal_source >= 0) appendf(out, " primal=s%d", op.primal_source);
     if (op.n_idata) {
       appendf(out, " idata=[");
       for (int64_t k = 0; k < op.n_idata && k < 8; ++k)
@@ -201,7 +211,8 @@ void print_islands(std::string& out, const Graph& g) {
   appendf(out, "graph: %zu ops, %zu slots\n", g.ops.size(), g.slots.size());
   int n = 0;
   for (size_t u = 0; u < g.ops.size(); ++u) {
-    if (g.ops[u].opcode != OP_ISLAND) continue;
+    if (g.ops[u].opcode != OP_ISLAND && g.ops[u].opcode != OP_REGION_MAP)
+      continue;
     print_island_body(out, g, u, n++);
   }
 }

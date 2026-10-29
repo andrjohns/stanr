@@ -1,11 +1,14 @@
 #include <stanli/callable_transform.hpp>
 #include <stanli/function_registry.hpp>
+#include <stanli/large_stack.hpp>
 #include <stanli/mir.hpp>
 
 #include "mir_reader_internal.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <map>
+#include <optional>
 #include <stdexcept>
 
 namespace stanli {
@@ -44,6 +47,10 @@ bool named(const Expr& e, std::initializer_list<const char*> names) {
 void validate_funapp_arity(const Expr& e) {
   if (e.fn_lib == Expr::Lib::UserDefined) return;
 
+  // log2 and log10 also have unary registry entries. Their nullary forms
+  // are language constants shared by all execution paths.
+  if (nullary_constant_kind(e)) return;
+
   // A call matching a registered overload's arity is structurally sound.
   // A registered name at another arity is not rejected here: some names have
   // legitimate arities outside the registry (one-argument log_sum_exp's
@@ -71,7 +78,7 @@ void validate_funapp_arity(const Expr& e) {
     return;
   }
 
-  if (named(e, {"pi", "e", "machine_precision", "negative_infinity",
+  if (named(e, {"pi", "e", "sqrt2", "machine_precision", "negative_infinity",
                 "positive_infinity", "not_a_number"})) {
     require_arity(e, 0);
     return;
@@ -132,12 +139,12 @@ void validate_funapp_arity(const Expr& e) {
     return;
   }
 
-  // The language has both the original five-parameter Wiener density and
-  // its seven-parameter extension. The current execution kernels implement
-  // only the five-argument form, but decoding must preserve either valid MIR
-  // shape so the normal unsupported-function path can report that boundary.
+  // The original four-parameter Wiener density, and the five- and
+  // seven-parameter forms, each with an optional precision argument.
   if (e.name == "wiener_lpdf") {
-    require_arity(e, 5, 7);
+    if (e.args.size() < 5 || e.args.size() > 9)
+      malformed(e.name + " call: expected 5 to 9 argument(s), got " +
+                std::to_string(e.args.size()));
     return;
   }
 
@@ -222,6 +229,25 @@ UnsizedView read_unsized(const Node& n) {
   if (leaf->is_atom()) out.leaf = unsized_leaf(leaf->atom);
   return out;
 }
+
+struct NestingMeter {
+  unsigned depth = 0;
+  unsigned peak = 0;
+};
+thread_local NestingMeter nesting_meter;
+
+class NestingScope {
+ public:
+  NestingScope() {
+    if (nesting_meter.depth >= nesting_limit())
+      throw NestingTooDeep("mir: nested too deeply (more than " +
+                           std::to_string(nesting_limit()) + " levels)");
+    nesting_meter.peak = std::max(nesting_meter.peak, ++nesting_meter.depth);
+  }
+  ~NestingScope() { --nesting_meter.depth; }
+  NestingScope(const NestingScope&) = delete;
+  NestingScope& operator=(const NestingScope&) = delete;
+};
 
 Expr read_expr(const Node& n);
 
@@ -339,6 +365,7 @@ Expr read_expr_pattern(const Node& p) {
 
 // n is `((pattern X) (meta ((type_ T) (loc _) (adlevel A))))`.
 Expr read_expr(const Node& n) {
+  NestingScope nesting;
   const Node* pat = field(n, "pattern");
   if (!pat) {
     Expr e;
@@ -448,6 +475,7 @@ void read_stmt_list(const Node& list, std::vector<Stmt>& out) {
 }
 
 Stmt read_stmt(const Node& n) {
+  NestingScope nesting;
   Stmt s;
   const Node* pat = field(n, "pattern");
   if (!pat) {
@@ -868,6 +896,32 @@ struct Binding {
 };
 
 using Bindings = std::map<std::string, Binding>;
+
+class BindingScope {
+ public:
+  explicit BindingScope(Bindings& bindings) : bindings_(bindings) {}
+  BindingScope(const BindingScope&) = delete;
+  BindingScope& operator=(const BindingScope&) = delete;
+  ~BindingScope() {
+    for (auto it = saved_.rbegin(); it != saved_.rend(); ++it) {
+      if (it->second)
+        bindings_[it->first] = *it->second;
+      else
+        bindings_.erase(it->first);
+    }
+  }
+  void bind(const std::string& name, const Binding& binding) {
+    const auto found = bindings_.find(name);
+    saved_.emplace_back(name, found == bindings_.end()
+                                  ? std::nullopt
+                                  : std::optional<Binding>(found->second));
+    bindings_[name] = binding;
+  }
+
+ private:
+  Bindings& bindings_;
+  std::vector<std::pair<std::string, std::optional<Binding>>> saved_;
+};
 using Functions = std::map<std::string, const FunDef*>;
 
 UnsizedView declared_view(const SizedType& type) {
@@ -903,7 +957,7 @@ UnsizedView declared_view(const SizedType& type) {
 }
 
 void validate_bindings(const std::vector<Stmt>& body, Bindings& bindings,
-                       const Functions& functions,
+                       BindingScope* scope, const Functions& functions,
                        bool strict_variable_metadata);
 
 void validate_expression(const Expr& e, const Bindings& bindings,
@@ -979,7 +1033,7 @@ void validate_expression(const Expr& e, const Bindings& bindings,
     validate_expression(arg, bindings, functions, strict_variable_metadata);
 }
 
-void validate_bindings(const Stmt& s, Bindings& bindings,
+void validate_bindings(const Stmt& s, Bindings& bindings, BindingScope* scope,
                        const Functions& functions,
                        bool strict_variable_metadata) {
   for (const Expr* e :
@@ -1054,28 +1108,35 @@ void validate_bindings(const Stmt& s, Bindings& bindings,
       throw std::runtime_error(
           "mir: declaration initializer type disagrees with its binding for " +
           s.decl_id);
-    bindings[s.decl_id] = Binding{view, s.decl_data_only};
+    const Binding declared{view, s.decl_data_only};
+    if (scope)
+      scope->bind(s.decl_id, declared);
+    else
+      bindings[s.decl_id] = declared;
   }
   if (s.kind == Stmt::SList) {
-    validate_bindings(s.body, bindings, functions, strict_variable_metadata);
+    validate_bindings(s.body, bindings, scope, functions,
+                      strict_variable_metadata);
   } else if (s.kind == Stmt::IfElse) {
     for (const auto& child : s.body) {
-      Bindings branch = bindings;
-      validate_bindings(child, branch, functions, strict_variable_metadata);
+      BindingScope branch(bindings);
+      validate_bindings(child, bindings, &branch, functions,
+                        strict_variable_metadata);
     }
   } else if (!s.body.empty()) {
-    Bindings nested = bindings;
+    BindingScope nested(bindings);
     if (s.kind == Stmt::For)
-      nested[s.loopvar] = Binding{UnsizedView{0, UnsizedLeaf::Int}, true};
-    validate_bindings(s.body, nested, functions, strict_variable_metadata);
+      nested.bind(s.loopvar, Binding{UnsizedView{0, UnsizedLeaf::Int}, true});
+    validate_bindings(s.body, bindings, &nested, functions,
+                      strict_variable_metadata);
   }
 }
 
 void validate_bindings(const std::vector<Stmt>& body, Bindings& bindings,
-                       const Functions& functions,
+                       BindingScope* scope, const Functions& functions,
                        bool strict_variable_metadata) {
   for (const auto& s : body)
-    validate_bindings(s, bindings, functions, strict_variable_metadata);
+    validate_bindings(s, bindings, scope, functions, strict_variable_metadata);
 }
 
 // stanc3 keeps every overload of a user function under one fdname, and calls
@@ -1239,29 +1300,31 @@ void detail::finalize_program(Program& prog, bool strict_variable_metadata) {
   for (const auto& [name, type] : prog.input_vars)
     inputs[name] = Binding{declared_view(type), true};
   Bindings prepare_bindings = inputs;
-  validate_bindings(prog.prepare_data, prepare_bindings, functions,
+  validate_bindings(prog.prepare_data, prepare_bindings, nullptr, functions,
                     strict_variable_metadata);
   Bindings log_prob_bindings = prepare_bindings;
-  validate_bindings(prog.log_prob, log_prob_bindings, functions,
+  validate_bindings(prog.log_prob, log_prob_bindings, nullptr, functions,
                     strict_variable_metadata);
   Bindings gq_bindings = prepare_bindings;
-  validate_bindings(prog.generate_quantities, gq_bindings, functions,
+  validate_bindings(prog.generate_quantities, gq_bindings, nullptr, functions,
                     strict_variable_metadata);
   // transform_inits sees data and transformed data and declares each
   // parameter locally, exactly like generate_quantities does.
   Bindings init_bindings = prepare_bindings;
-  validate_bindings(prog.transform_inits, init_bindings, functions,
+  validate_bindings(prog.transform_inits, init_bindings, nullptr, functions,
                     strict_variable_metadata);
   for (const auto& f : prog.fun_defs) {
     Bindings args;
     for (size_t i = 0; i < f.arg_names.size(); ++i)
       args[f.arg_names[i]] = Binding{f.arg_views[i], f.arg_data_only[i]};
-    validate_bindings(f.body, args, functions, strict_variable_metadata);
+    validate_bindings(f.body, args, nullptr, functions,
+                      strict_variable_metadata);
   }
 }
 
 Program read_program(const sexp::Node& root) {
   Program prog;
+  nesting_meter = {};
   const Node* iv = field(root, "input_vars");
   if (!iv) throw std::runtime_error("mir: no input_vars section");
   const Node& vars = (*iv)[1];
@@ -1306,6 +1369,7 @@ Program read_program(const sexp::Node& root) {
     prog.has_transform_inits = true;
     read_stmt_list((*ti)[1], prog.transform_inits);
   }
+  prog.nesting = nesting_meter.peak;
   detail::finalize_program(prog);
   if (const Node* ov = field(root, "output_vars")) {
     // ((name <opaque> (...)) ...): parameters, transformed parameters and

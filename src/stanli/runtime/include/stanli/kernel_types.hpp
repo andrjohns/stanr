@@ -8,15 +8,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 namespace stanli {
 
 class WaRng;
+class ReduceExecutionContext;
 
 // Mutable state owned by one bound Executor and one operation. Most kernels
 // need none; the retained loop keeps its tape here.
 struct KernelState {
   virtual ~KernelState() = default;
+  // Called on fresh state when copying an Executor. Reuse is optional: a
+  // refusal must leave the destination fresh and the source untouched.
+  // Implementations must relocate every mutable pointer into private storage.
+  virtual bool clone_from(const KernelState&) { return false; }
 };
 
 // Per-evaluation resources that are neither graph structure nor arena state.
@@ -24,6 +30,7 @@ struct KernelState {
 // belongs to one chain/drawing thread, never to a compiled model or executor.
 struct EvalState {
   WaRng* wa_rng = nullptr;
+  ReduceExecutionContext* reduce = nullptr;
 };
 
 // A view of one contiguous buffer. len == 1 means scalar.
@@ -35,7 +42,7 @@ struct Desc {
 // A value in the graph. Slots with is_param are the unconstrained parameter
 // vector, in declaration order; everything else is data or an intermediate.
 struct Slot {
-  int64_t offset = 0;  // into the value arena (filled at bind)
+  int64_t offset = 0;  // within its bound value buffer (filled at bind)
   int64_t len = 0;
   bool is_param = false;
 };
@@ -61,6 +68,10 @@ struct Op {
   int64_t dyn_capacity = 0;
   int8_t dyn_extent_in = -1;
   uint8_t dyn_lengths = 0;
+  // CSE may share a pure forward value and scratch while retaining each
+  // source pullback and its separate adjoint. Names the surviving output;
+  // the survivor names itself. Fits the existing tail padding of Op.
+  int32_t primal_source = -1;
 };
 
 // Bit 6 of a dynamic-length mask names the output; bits 0..5 name inputs.
@@ -110,6 +121,56 @@ inline void apply_dynamic_length(KernelCtx& c) {
   }
   c.n_in = c.dyn_extent_in;
 }
+
+enum BwdMicroKind : uint8_t {
+  kMicroAdd,
+  kMicroSub,
+  kMicroScaled,
+  kMicroFn,
+  kMicroFnNonzero,
+};
+
+struct BwdMicro {
+  double* dst;
+  const double* seed;
+  const double* a;
+  const double* b;
+  double (*fn)(double seed, double a, double b);
+  uint8_t kind;
+  uint16_t opcode;
+};
+
+inline void run_bwd_micro(const BwdMicro& m) {
+  switch (m.kind) {
+    case kMicroAdd:
+      *m.dst += *m.seed;
+      break;
+    case kMicroSub:
+      *m.dst -= *m.seed;
+      break;
+    case kMicroScaled:
+      if (m.b != nullptr && *m.b == 0.0) break;
+      *m.dst += *m.seed * *m.a;
+      break;
+    case kMicroFn:
+      *m.dst += m.fn(*m.seed, *m.a, *m.b);
+      break;
+    case kMicroFnNonzero:
+      if (*m.a != 0.0) *m.dst += m.fn(*m.seed, *m.a, *m.b);
+      break;
+  }
+}
+
+inline BwdMicro bwd_micro(uint8_t kind, double* dst, const double* seed,
+                          const double* a = nullptr, const double* b = nullptr,
+                          double (*fn)(double, double, double) = nullptr) {
+  return BwdMicro{dst, seed, a, b, fn, kind, 0};
+}
+
+// Appends the micro-ops that reproduce this context's backward exactly, in
+// its order, and returns true; returns false and appends nothing when the
+// backward is not of that form.
+using CachedMicroFn = bool (*)(const KernelCtx&, std::vector<BwdMicro>&);
 
 }  // namespace stanli
 

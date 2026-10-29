@@ -60,6 +60,7 @@ enum class BuiltinShapePolicy : uint8_t {
   // graph opcode; the shared resolver validates the square divisor and
   // conformable dividend and reports the result shape.
   Solve,
+  Ordering,
 };
 
 // Which factorization a Solve descriptor's kernel applies to the divisor.
@@ -95,6 +96,15 @@ enum class BuiltinShapeQueryKind : uint8_t {
   Size,
   NumElements,
   Dims,
+};
+
+enum class BuiltinOrdering : uint8_t {
+  None,
+  SortAsc,
+  SortDesc,
+  IndicesAsc,
+  IndicesDesc,
+  Rank,
 };
 
 // Which matrix kernel a MatrixOp descriptor drives. The kernels themselves
@@ -135,6 +145,9 @@ enum class BuiltinSlice : uint8_t {
   ToRowVector,
   ToMatrix,
   ToArray1d,
+  ToArray2d,
+  ToVectorArray,
+  ToRowVectorArray,
   // Expansions: broadcasts of one value or container, and two-container
   // concatenations mapped over the inputs' concatenated cell space.
   RepVector,
@@ -181,6 +194,9 @@ using BuiltinArgumentShape = FunctionArgumentShape;
 struct BuiltinLayout {
   int64_t lanes = 1;
   uint8_t result_argument = 0;
+  // Independent softmax leaves, -1 for ordinary ungrouped calls.
+  int64_t groups = -1;
+  int64_t group_width = 0;
   // Nonzero for the sole storage-order mismatch: an integer array paired
   // lane-wise with a real matrix (or array of matrices).
   int64_t integer_matrix_rows = 0;
@@ -220,6 +236,7 @@ struct BuiltinSpec {
   // the opcode field carries the solve kernel.
   bool solve_left = false;
   BuiltinSolveKind solve = BuiltinSolveKind::None;
+  BuiltinOrdering ordering = BuiltinOrdering::None;
 };
 
 inline bool builtin_argument_is_integer(const BuiltinSpec& spec, size_t i) {
@@ -258,6 +275,13 @@ struct ConstructorValue {
 ConstructorValue evaluate_constructor_builtin(
     const BuiltinSpec& spec, const std::vector<double>& arguments);
 
+std::vector<int> evaluate_ordering_builtin(const BuiltinSpec& spec,
+                                           const std::vector<double>& values,
+                                           int position = 0);
+std::vector<int> evaluate_ordering(BuiltinOrdering kind,
+                                   const std::vector<double>& values,
+                                   int position = 0);
+
 // One SliceView selection resolved to flat source cells: every output cell k
 // reads exactly one input cell -- offset + k (Contiguous), offset + k*stride
 // (Strided), or gather[k] (Gather) -- in the caller's declared storage order.
@@ -283,7 +307,10 @@ struct BuiltinSliceMap {
 inline bool builtin_slice_is_reshape(BuiltinSlice slice) {
   return slice == BuiltinSlice::Transpose || slice == BuiltinSlice::ToVector ||
          slice == BuiltinSlice::ToRowVector ||
-         slice == BuiltinSlice::ToMatrix || slice == BuiltinSlice::ToArray1d;
+         slice == BuiltinSlice::ToMatrix || slice == BuiltinSlice::ToArray1d ||
+         slice == BuiltinSlice::ToArray2d ||
+         slice == BuiltinSlice::ToVectorArray ||
+         slice == BuiltinSlice::ToRowVectorArray;
 }
 
 // Appends take two containers and map result cells over their concatenated
@@ -401,6 +428,22 @@ std::vector<int64_t> builtin_shape_query(const BuiltinSpec& spec,
 int evaluate_predicate_builtin(const BuiltinSpec& spec, double lhs,
                                double rhs = 0.0);
 
+// Classify a sequence of flat storage offsets, already enumerated in
+// destination order, as one affine run or an irregular gather: Contiguous
+// when consecutive offsets advance by exactly 1, Strided for any other
+// constant non-negative step, Gather when no single step accounts for
+// every consecutive pair (including a descending or repeating sequence).
+// An empty or single-offset sequence is always Contiguous. This is the one
+// place that decides what an affine window is; callers outside this file
+// build their own offset list (a lane's flat read or write positions) and
+// classify it here rather than re-deriving contiguous/strided/gather.
+struct FlatOffsetRun {
+  BuiltinSliceMap::Kind kind = BuiltinSliceMap::Kind::Contiguous;
+  int64_t offset = 0;
+  int64_t stride = 1;
+};
+FlatOffsetRun classify_flat_offsets(const std::vector<int64_t>& offsets);
+
 // One rvalue Cartesian index selection resolved to flat source cells: the
 // single statement of Stan's indexing geometry over both storage orders,
 // shared by every backend's generic Indexed path. `positions[k]` lists the
@@ -445,6 +488,8 @@ int evaluate_integer_binary_builtin(const BuiltinSpec& spec, int lhs, int rhs);
 // generated integer kernels); the descriptor form above delegates here.
 int evaluate_integer_binary_builtin(uint16_t opcode, int lhs, int rhs);
 int evaluate_integer_unary_builtin(const BuiltinSpec& spec, int value);
+// to_int on a real: Stan Math's truncation and range check.
+int evaluate_real_to_integer_builtin(const BuiltinSpec& spec, double value);
 
 }  // namespace stanli
 

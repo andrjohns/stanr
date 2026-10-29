@@ -9,8 +9,8 @@
 # Makevars and the headers are vendored into the package instead.
 set -e
 
-MATH_REF="8f326d14599d3030c626c46532d8e8534c1cdbec"
-STAN_REF="c96d04115d35cb04f42e45c5a69a82f9704798f1"
+MATH_REF="5252d51d47c1d5e78005fc043ad996fad6dd8da8"
+STAN_REF="a6806ef8477a7b5f65b27449ec33528c162bc024"
 MATH_SRC="math-$MATH_REF"
 STAN_SRC="stan-$STAN_REF"
 INC=../inst/include
@@ -36,16 +36,42 @@ fetch() { # destination repository-url ref sparse-paths...
 }
 
 fetch "$MATH_SRC" https://github.com/stan-dev/math.git "$MATH_REF" stan lib
-fetch "$STAN_SRC" https://github.com/stan-dev/stan.git "$STAN_REF" src/stan
+fetch "$STAN_SRC" https://github.com/stan-dev/stan.git "$STAN_REF" src/stan lib/rapidjson_1.1.0
 
 # --- 2. Vendor the `stan` headers ------------------------------------------
 # Makevars: cp -Rf stan/src/stan ../inst/include/stan
 rm -rf "$INC/stan"
 cp -Rf "$STAN_SRC/src/stan" "$INC/stan"
 
+# Stanli's execution report uses RapidJSON; retain the headers from the same
+# Stan revision rather than relying on a system installation.
+rm -rf "$INC/rapidjson"
+cp -Rf "$STAN_SRC/lib/rapidjson_1.1.0/rapidjson" "$INC/rapidjson"
+
 # --- 3. Vendor the `math` headers (merged into inst/include/stan) ----------
 # Makevars: cp -Rf math/stan/. ../inst/include/stan
 cp -Rf "$MATH_SRC/stan/." "$INC/stan"
+
+# libc++'s std::string_view iterators are not necessarily raw pointers, while
+# std::from_chars requires pointers. Keep the pinned Stan Math header usable
+# in webR's Emscripten/libc++ build without changing its parsing behavior.
+python3 - "$INC/stan/math/prim/core/init_threadpool_tbb.hpp" << 'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+old = """  const auto [end, error]
+      = std::from_chars(value.begin(), value.end(), num_threads);
+  if (error != std::errc() || end != value.end()
+"""
+new = """  const auto* value_end = value.data() + value.size();
+  const auto [end, error]
+      = std::from_chars(value.data(), value_end, num_threads);
+  if (error != std::errc() || end != value_end
+"""
+assert text.count(old) == 1, "Stan Math thread-count parser changed upstream"
+open(path, "w").write(text.replace(old, new, 1))
+EOF
 
 # --- 4. Vendor the OpenCL headers ------------------------------------------
 # Makevars: cp -Rf math/lib/opencl_*/CL ../inst/include/
@@ -293,8 +319,30 @@ text = text.replace(old, new, 1)
 open(path, "w").write(text)
 EOF
 }
-patch_size_t_overload "$INC/stan/callbacks/structured_writer.hpp" 0
+# structured_writer now uses uint32_t/uint64_t overloads and needs no shim.
 patch_size_t_overload "$INC/stan/callbacks/json_writer.hpp" 1
+
+# Pathfinder writes platform-sized counters through structured_writer's
+# uint64_t overload. On platforms where size_t is a different 64-bit type,
+# overload resolution is ambiguous without an explicit conversion.
+python3 - "$INC/stan/services/pathfinder/single.hpp" << 'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+old_include = "#include <atomic>\n"
+assert text.count(old_include) == 1, "atomic include changed in Pathfinder"
+text = text.replace(old_include, old_include + "#include <cstdint>\n", 1)
+for old, new, expected in (
+    ('diagnostic_writer.write("iter", lbfgs.iter_num());',
+     'diagnostic_writer.write("iter", static_cast<std::uint64_t>(lbfgs.iter_num()));', 1),
+    ('diagnostic_writer.write("history_size", history_size);',
+     'diagnostic_writer.write("history_size", static_cast<std::uint64_t>(history_size));', 3),
+):
+    assert text.count(old) == expected, f"Pathfinder write changed: {old}"
+    text = text.replace(old, new)
+open(path, "w").write(text)
+EOF
 
 # --- 7. TBB ------------------------------------------------------------
 # TBB is not vendored from the CmdStan/math bundle -- see tools/upgrade_tbb.sh,
@@ -306,6 +354,31 @@ mkdir -p "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/math "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/numeric "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/serialization "$INC/boost"
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/unordered "$INC/boost"
+
+# R CMD check warns on diagnostic-suppression pragmas in installed headers.
+# They affect warning presentation only, not Boost.Unordered's behavior. Strip
+# the GCC/Clang diagnostic pragmas while retaining MSVC pragmas and `#pragma once`.
+python3 - "$INC/boost/unordered" << 'EOF'
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+diagnostic = re.compile(
+    r"(?m)^[ \t]*#[ \t]*pragma[ \t]+"
+    r"(?:GCC|clang)[ \t]+diagnostic.*\n"
+)
+removed = 0
+for path in root.rglob("*.hpp"):
+    text, count = diagnostic.subn("", path.read_text())
+    if count:
+        path.write_text(text)
+        removed += count
+assert removed == 15, f"expected 15 Boost.Unordered diagnostic pragmas, found {removed}"
+EOF
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/container_hash "$INC/boost"
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/describe "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/preprocessor "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/mpl "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/utility "$INC/boost"
@@ -343,6 +416,8 @@ cp -Rf "$MATH_SRC"/lib/boost_*/boost/detail "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/core "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/container "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/move "$INC/boost"
+# boost::container::small_vector, which Stanli uses, needs Boost.Intrusive.
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/intrusive "$INC/boost"
 
 # Trim filename for CRAN 100-character limit
 mv "$INC/boost/math/special_functions/detail/hypergeometric_1F1_small_a_negative_b_by_ratio.hpp" \

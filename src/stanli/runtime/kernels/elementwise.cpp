@@ -1,4 +1,5 @@
 // Native elementwise / structural ops with hand-written vjps.
+#include "add_n_fold.hpp"
 #include <stanli/extrema_grouping.hpp>
 #include <stanli/graph.hpp>
 #include <stanli/optable.hpp>
@@ -16,22 +17,15 @@
 namespace stanli {
 namespace {
 
-// OP_EXP: scalar out = exp(in). Partial is the output itself; no scratch.
-void exp_fwd(KernelCtx& ctx) { ctx.out.data[0] = std::exp(ctx.in[0].data[0]); }
-void exp_bwd(KernelCtx& ctx) {
-  if (ctx.in_adj[0].data)
-    ctx.in_adj[0].data[0] += ctx.out_adj * ctx.out.data[0];
-}
+#if defined(__GNUC__) || defined(__clang__)
+#define STANLI_ALIGN_FUNCTION_64 __attribute__((aligned(64)))
+#else
+#define STANLI_ALIGN_FUNCTION_64
+#endif
 
 // OP_ADD_N: scalar out = sum of scalar inputs.
-void add_n_fwd(KernelCtx& ctx) {
-  double acc = 0;
-  for (int i = 0; i < ctx.n_in; ++i) {
-    assert(ctx.in[i].len == 1);
-    acc += ctx.in[i].data[0];
-  }
-  ctx.out.data[0] = acc;
-}
+void add_n_fwd(KernelCtx& ctx) { add_n_fold<>(ctx); }
+
 void add_n_bwd(KernelCtx& ctx) {
   for (int i = 0; i < ctx.n_in; ++i)
     if (ctx.in_adj[i].data) ctx.in_adj[i].data[0] += ctx.out_adj;
@@ -72,12 +66,28 @@ void matvec_bwd(KernelCtx& ctx) {
     Eigen::Map<const Eigen::MatrixXd> Xm(ctx.in[0].data, rows, cols);
     Eigen::Map<const Eigen::VectorXd> doutm(ctx.out_adj_vec.data, rows);
     Eigen::Map<Eigen::VectorXd> adjm(ctx.in_adj[1].data, cols);
-    adjm.noalias() += Xm.transpose() * doutm;
+    // CmdStan's Matrix<var> exposes a scalar adjoint expression to Eigen.
+    // A plain double Map selects a different, packetized reduction; severe
+    // cancellation can turn that reassociation into thousands of ULP.
+    adjm +=
+        Xm.transpose() * doutm.unaryExpr([](double value) { return value; });
   }
 }
 
-// OP_SUM_VEC: scalar out = sum(x), ascending like Eigen's redux.
+// OP_SUM_VEC: scalar out = sum(x). Matrix<var> and std::vector use scalar
+// traversal. Data Eigen expressions retain their packet/offset grouping.
 void sum_vec_fwd(KernelCtx& ctx) {
+  if (ctx.in[0].len && ctx.variant) {
+    using Vec = Eigen::Matrix<double, Eigen::Dynamic, 1>;
+    const Eigen::Map<const Vec> input(ctx.in[0].data, ctx.in[0].len);
+    ctx.out.data[0] =
+        ctx.variant == 2
+            ? reduce_phased(ctx.in[0].data, ctx.in[0].len, ctx.idata[0],
+                            Eigen::internal::scalar_sum_op<double>())
+            : input.unaryExpr(Eigen::internal::core_cast_op<double, double>())
+                  .sum();
+    return;
+  }
   double acc = 0;
   for (int64_t i = 0; i < ctx.in[0].len; ++i) acc += ctx.in[0].data[i];
   ctx.out.data[0] = acc;
@@ -86,6 +96,25 @@ void sum_vec_bwd(KernelCtx& ctx) {
   if (ctx.in_adj[0].data)
     for (int64_t i = 0; i < ctx.in[0].len; ++i)
       ctx.in_adj[0].data[i] += ctx.out_adj;
+}
+
+// OP_SEGMENT_SUM: out[r] = sum of in[idata[r] .. idata[r+1]), ascending from
+// zero, so an empty segment is 0.0. idata holds out.len + 1 offsets.
+void segment_sum_fwd(KernelCtx& ctx) {
+  for (int64_t r = 0; r < ctx.out.len; ++r) {
+    double acc = 0;
+    for (int64_t k = ctx.idata[r]; k < ctx.idata[r + 1]; ++k)
+      acc += ctx.in[0].data[k];
+    ctx.out.data[r] = acc;
+  }
+}
+void segment_sum_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data) return;
+  const double* dout =
+      ctx.out_adj_vec.data != nullptr ? ctx.out_adj_vec.data : &ctx.out_adj;
+  for (int64_t r = 0; r < ctx.out.len; ++r)
+    for (int64_t k = ctx.idata[r]; k < ctx.idata[r + 1]; ++k)
+      ctx.in_adj[0].data[k] += dout[r];
 }
 
 // OP_PROD_VEC: product of a vector/row-vector.
@@ -219,6 +248,13 @@ void index_fwd(KernelCtx& ctx) {
 void index_bwd(KernelCtx& ctx) {
   if (ctx.in_adj[0].data) ctx.in_adj[0].data[ctx.idata[0]] += ctx.out_adj;
 }
+bool index_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1) return false;
+  if (ctx.in_adj[0].data)
+    out.push_back(bwd_micro(kMicroAdd, ctx.in_adj[0].data + ctx.idata[0],
+                            ctx.out_adj_vec.data));
+  return true;
+}
 
 // OP_SET_INDEX: out = copy(in[0]) with out[flat] = in[1] (scalar).
 void set_index_fwd(KernelCtx& ctx) {
@@ -310,7 +346,7 @@ void gather_fwd(KernelCtx& ctx) {
   for (int64_t k = 0; k < ctx.out.len; ++k)
     ctx.out.data[k] = ctx.in[0].data[ctx.idata[k]];
 }
-void gather_bwd(KernelCtx& ctx) {
+STANLI_ALIGN_FUNCTION_64 void gather_bwd(KernelCtx& ctx) {
   if (!ctx.in_adj[0].data) return;
   double* in_adj = ctx.in_adj[0].data;
   const double* out_adj = ctx.out_adj_vec.data;
@@ -451,18 +487,25 @@ void set_slice_strided_inplace_bwd(KernelCtx& ctx) {
 
 }  // namespace
 
+// Stable identity for late binding; custom kernel registrations retain
+// their own callback.
+extern void (*const canonical_add_n_forward)(KernelCtx&) = add_n_fwd;
+
 // Called from Executor's constructor path; a static registrar object in a
 // static library dropped by the linker.
 void register_elementwise_kernels() {
-  register_kernel(OP_EXP, Kernel{exp_fwd, exp_bwd, nullptr});
   register_kernel(OP_ADD_N, Kernel{add_n_fwd, add_n_bwd, nullptr});
   register_kernel(OP_BCAST_FMA, Kernel{fma_fwd, fma_bwd, nullptr});
   register_kernel(OP_MATVEC, Kernel{matvec_fwd, matvec_bwd, nullptr});
   register_kernel(OP_SUM_VEC, Kernel{sum_vec_fwd, sum_vec_bwd, nullptr});
+  register_kernel(OP_SEGMENT_SUM,
+                  Kernel{segment_sum_fwd, segment_sum_bwd, nullptr});
   register_kernel(OP_PROD_VEC, Kernel{prod_vec_fwd, prod_vec_bwd, nullptr});
   register_kernel(OP_EXTREMA_VEC,
                   Kernel{extrema_vec_fwd, extrema_vec_bwd, extrema_scratch});
-  register_kernel(OP_INDEX, Kernel{index_fwd, index_bwd, nullptr});
+  register_kernel(
+      OP_INDEX,
+      with_cached_micro(Kernel{index_fwd, index_bwd, nullptr}, index_micro));
   register_kernel(OP_SET_INDEX, Kernel{set_index_fwd, set_index_bwd, nullptr});
   register_kernel(OP_SET_INDEX_INPLACE, Kernel{set_index_inplace_fwd,
                                                set_index_inplace_bwd, nullptr});
